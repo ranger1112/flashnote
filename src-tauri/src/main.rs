@@ -121,6 +121,7 @@ fn main() {
                 message: notices.join("；"),
                 open_settings,
             });
+            let first_run = !settings.onboarded;
 
             handle.manage(AppState {
                 settings: Mutex::new(settings),
@@ -132,7 +133,7 @@ fn main() {
             commands::apply_initial_geometry(&handle);
             tray::create(app)?;
 
-            if open_settings {
+            if open_settings || first_run {
                 commands::show_window_impl(&handle);
             }
 
@@ -167,6 +168,11 @@ fn main() {
             commands::open_notes_dir,
             commands::hide_window,
             commands::take_startup_notice,
+            commands::load_draft,
+            commands::save_draft,
+            commands::clear_draft,
+            commands::complete_onboarding,
+            commands::update_history_preview,
         ])
         .build(tauri::generate_context!())
         .expect("启动闪记失败")

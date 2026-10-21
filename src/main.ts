@@ -10,6 +10,8 @@ interface Settings {
   pinned: boolean;
   captureSource: boolean;
   markdownMode: boolean;
+  historyPreview: boolean;
+  onboarded: boolean;
   window: unknown;
 }
 
@@ -67,6 +69,11 @@ const autostartCheck = el<HTMLInputElement>("autostart");
 const sourceLabel = el<HTMLSpanElement>("source");
 const toastEl = el<HTMLDivElement>("toast");
 const resizeGrip = el<HTMLDivElement>("resize-grip");
+const welcomePanel = el<HTMLElement>("welcome");
+const welcomeHotkey = el<HTMLSpanElement>("welcome-hotkey");
+const welcomeDir = el<HTMLElement>("welcome-dir");
+const welcomeStart = el<HTMLButtonElement>("welcome-start");
+const welcomeSettings = el<HTMLButtonElement>("welcome-settings");
 
 let settings: Settings = {
   notesDir: "",
@@ -74,11 +81,15 @@ let settings: Settings = {
   pinned: false,
   captureSource: true,
   markdownMode: false,
+  historyPreview: false,
+  onboarded: true,
   window: null,
 };
 let pinned = false;
 let recording = false;
 let toastTimer: number | undefined;
+let draftTimer: number | undefined;
+let appReady = false;
 let notes: NoteEntry[] = [];
 
 function formatAccel(accel: string): string {
@@ -121,11 +132,71 @@ function accelFromEvent(event: KeyboardEvent): string | null {
 }
 
 function toast(message: string, error = false, duration = 1600): void {
+  toastEl.setAttribute("role", error ? "alert" : "status");
+  toastEl.setAttribute("aria-live", error ? "assertive" : "polite");
   toastEl.textContent = message;
   toastEl.classList.toggle("error", error);
   toastEl.classList.add("show");
   if (toastTimer !== undefined) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), duration);
+}
+
+function scheduleDraftSave(): void {
+  if (draftTimer !== undefined) window.clearTimeout(draftTimer);
+  draftTimer = window.setTimeout(() => {
+    draftTimer = undefined;
+    void persistDraft();
+  }, 500);
+}
+
+async function persistDraft(): Promise<void> {
+  try {
+    await invoke("save_draft", { content: textarea.value });
+  } catch {
+    // 草稿写入失败不打断输入，下一次输入会重试
+  }
+}
+
+async function flushDraft(): Promise<void> {
+  if (draftTimer !== undefined) {
+    window.clearTimeout(draftTimer);
+    draftTimer = undefined;
+  }
+  await persistDraft();
+}
+
+/** 面板打开时让背景不可聚焦，关闭后恢复。 */
+function setBackgroundInert(inert: boolean): void {
+  for (const selector of ["header", "main", "footer", "#toast", "#resize-grip"]) {
+    const node = document.querySelector<HTMLElement>(selector);
+    if (node) node.inert = inert;
+  }
+}
+
+/** 把 Tab 焦点限制在当前打开的面板内。 */
+function trapFocus(event: KeyboardEvent): void {
+  if (event.key !== "Tab") return;
+  const panel = [welcomePanel, settingsPanel, historyPanel].find(
+    (node) => !node.classList.contains("hidden"),
+  );
+  if (!panel) return;
+
+  const focusables = Array.from(
+    panel.querySelectorAll<HTMLElement>(
+      'button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((node) => !node.hasAttribute("disabled"));
+  if (focusables.length === 0) return;
+
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function paintPin(): void {
@@ -151,6 +222,9 @@ async function refreshSettings(): Promise<void> {
 async function hideWindow(): Promise<void> {
   closeSettings();
   closeHistory();
+  closeWelcome();
+  setBackgroundInert(false);
+  await flushDraft();
   await invoke("hide_window");
 }
 
@@ -164,7 +238,12 @@ async function saveNote(): Promise<void> {
   try {
     const saved = await invoke<SavedNote>("save_note", { content });
     textarea.value = "";
+    if (draftTimer !== undefined) {
+      window.clearTimeout(draftTimer);
+      draftTimer = undefined;
+    }
     localStorage.removeItem(DRAFT_KEY);
+    void invoke("clear_draft").catch(() => {});
     toast(`已保存 · ${saved.time}`);
     if (!pinned) {
       window.setTimeout(() => {
@@ -178,12 +257,15 @@ async function saveNote(): Promise<void> {
 
 function openSettings(): void {
   closeHistory();
+  closeWelcome();
   hotkeyInput.value = formatAccel(settings.hotkey);
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
   markdownModeCheck.checked = settings.markdownMode;
   hotkeyError.textContent = "";
   settingsPanel.classList.remove("hidden");
+  setBackgroundInert(true);
+  settingsClose.focus();
 }
 
 function stopRecording(): void {
@@ -193,8 +275,14 @@ function stopRecording(): void {
 }
 
 function closeSettings(): void {
+  if (settingsPanel.classList.contains("hidden")) return;
   settingsPanel.classList.add("hidden");
   stopRecording();
+  if (!historyPanel.classList.contains("hidden") || !welcomePanel.classList.contains("hidden")) {
+    return;
+  }
+  setBackgroundInert(false);
+  settingsButton.focus();
 }
 
 function dateLabel(date: string): string {
@@ -208,7 +296,43 @@ function dateLabel(date: string): string {
 }
 
 function closeHistory(): void {
+  if (historyPanel.classList.contains("hidden")) return;
   historyPanel.classList.add("hidden");
+  if (!settingsPanel.classList.contains("hidden") || !welcomePanel.classList.contains("hidden")) {
+    return;
+  }
+  setBackgroundInert(false);
+  notesButton.focus();
+}
+
+function showWelcome(): void {
+  welcomeHotkey.textContent = formatAccel(settings.hotkey);
+  welcomeDir.textContent = settings.notesDir;
+  welcomePanel.classList.remove("hidden");
+  setBackgroundInert(true);
+  welcomeStart.focus();
+}
+
+function closeWelcome(): void {
+  if (welcomePanel.classList.contains("hidden")) return;
+  welcomePanel.classList.add("hidden");
+  settings.onboarded = true;
+  void invoke("complete_onboarding").catch(() => {
+    // 下次启动时重新展示引导
+  });
+  if (!settingsPanel.classList.contains("hidden") || !historyPanel.classList.contains("hidden")) {
+    return;
+  }
+  setBackgroundInert(false);
+}
+
+async function dismissWelcome(openSettingsAfter = false): Promise<void> {
+  closeWelcome();
+  if (openSettingsAfter) {
+    openSettings();
+  } else {
+    textarea.focus();
+  }
 }
 
 function renderNotes(): void {
@@ -296,7 +420,9 @@ async function loadNotes(): Promise<void> {
 
 function openHistory(): void {
   closeSettings();
+  closeWelcome();
   historyPanel.classList.remove("hidden");
+  setBackgroundInert(true);
   historySearch.value = "";
   notes = [];
   entryList.replaceChildren();
@@ -349,17 +475,37 @@ async function init(): Promise<void> {
       autostartCheck.disabled = true;
     }
 
-    textarea.value = localStorage.getItem(DRAFT_KEY) ?? "";
+    // 草稿优先读磁盘；首次升级时把 localStorage 中的旧草稿迁移过来
+    const legacyDraft = localStorage.getItem(DRAFT_KEY);
+    const draft = await invoke<string>("load_draft");
+    if (draft) {
+      textarea.value = draft;
+    } else if (legacyDraft) {
+      textarea.value = legacyDraft;
+      await invoke("save_draft", { content: legacyDraft }).catch(() => {});
+    }
+    if (legacyDraft !== null) localStorage.removeItem(DRAFT_KEY);
 
-    // 窗口在启动时就可见（例如快捷键冲突）时立即提示；否则留到第一次唤起时再提示
+    appReady = true;
+
+    // 窗口在启动时就可见（首次运行、快捷键冲突）时立即提示；否则留到第一次唤起
     if (await getCurrentWindow().isVisible()) {
-      if (await showStartupNotice()) return;
+      if (await handleFirstShow()) return;
     }
 
     textarea.focus();
   } catch (error) {
     toast(String(error), true);
   }
+}
+
+async function handleFirstShow(): Promise<boolean> {
+  if (await showStartupNotice()) return true;
+  if (!settings.onboarded) {
+    showWelcome();
+    return true;
+  }
+  return false;
 }
 
 let startupNoticeShown = false;
@@ -377,9 +523,10 @@ async function showStartupNotice(): Promise<boolean> {
   return true;
 }
 
-textarea.addEventListener("input", () => {
-  localStorage.setItem(DRAFT_KEY, textarea.value);
-});
+textarea.addEventListener("input", scheduleDraftSave);
+
+welcomeStart.addEventListener("click", () => void dismissWelcome());
+welcomeSettings.addEventListener("click", () => void dismissWelcome(true));
 
 pinButton.addEventListener("click", async () => {
   pinned = !pinned;
@@ -475,9 +622,13 @@ window.addEventListener(
       return;
     }
 
+    trapFocus(event);
+
     if (event.key === "Escape") {
       event.preventDefault();
-      if (!historyPanel.classList.contains("hidden")) {
+      if (!welcomePanel.classList.contains("hidden")) {
+        void dismissWelcome();
+      } else if (!historyPanel.classList.contains("hidden")) {
         closeHistory();
       } else if (!settingsPanel.classList.contains("hidden")) {
         closeSettings();
@@ -508,13 +659,14 @@ resizeGrip.addEventListener("pointerdown", (event) => {
 
 void listen<ShowPayload>("window-shown", (event) => {
   setSource(event.payload.source);
+  if (!appReady) return;
   if (!historyPanel.classList.contains("hidden")) {
     void loadNotes();
     return;
   }
   if (!settingsPanel.classList.contains("hidden")) return;
-  void showStartupNotice().then((shown) => {
-    if (!shown) textarea.focus();
+  void handleFirstShow().then((handled) => {
+    if (!handled) textarea.focus();
   });
 });
 

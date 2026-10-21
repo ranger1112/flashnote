@@ -44,6 +44,7 @@
       <main>
         <textarea
           id="note"
+          aria-label="速记内容"
           placeholder="想到什么就写什么…"
           spellcheck="false"
           autofocus
@@ -55,12 +56,18 @@
         <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 收起</span>
       </footer>
 
-      <div id="toast" class="toast"></div>
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
       <div id="resize-grip" title="拖动调整大小"></div>
 
-      <section id="settings" class="settings hidden">
+      <section
+        id="settings"
+        class="settings hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+      >
         <div class="settings-head">
-          <span>设置</span>
+          <span id="settings-title">设置</span>
           <button id="settings-close" class="icon-btn" aria-label="关闭设置">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M18 6 6 18" />
@@ -104,9 +111,15 @@
         <p class="tip">笔记按日期保存为本地 Markdown 文件。</p>
       </section>
 
-      <section id="history" class="history hidden">
+      <section
+        id="history"
+        class="history hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="history-title"
+      >
         <div class="settings-head">
-          <span>笔记</span>
+          <span id="history-title">笔记</span>
           <button id="history-close" class="icon-btn" aria-label="关闭笔记">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M18 6 6 18" />
@@ -119,6 +132,8 @@
           id="history-search"
           class="search-input"
           type="search"
+          aria-label="搜索笔记"
+          aria-controls="entry-list"
           placeholder="搜索笔记…"
           spellcheck="false"
         />
@@ -126,8 +141,30 @@
         <div id="entry-list" class="entry-list"></div>
 
         <div class="history-foot">
-          <span id="history-count"></span>
+          <span id="history-count" aria-live="polite"></span>
           <button id="history-folder" class="btn">打开文件夹</button>
+        </div>
+      </section>
+
+      <section
+        id="welcome"
+        class="welcome hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="welcome-title"
+      >
+        <div class="settings-head">
+          <span id="welcome-title">欢迎使用闪记</span>
+        </div>
+        <p class="welcome-lead">按一下快捷键，就能在任何窗口上方随手记一笔。</p>
+        <ul class="welcome-list">
+          <li><span class="welcome-key" id="welcome-hotkey">Ctrl + Alt + N</span> 唤起 / 收起</li>
+          <li>笔记保存在 <code id="welcome-dir"></code></li>
+          <li>点图钉可切换「保存后不收起」</li>
+        </ul>
+        <div class="welcome-actions">
+          <button id="welcome-settings" class="btn">调整快捷键</button>
+          <button id="welcome-start" class="btn primary">开始使用</button>
         </div>
       </section>
     </div>

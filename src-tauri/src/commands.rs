@@ -317,6 +317,15 @@ fn open_with_explorer(path: &Path) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// 交给系统默认关联程序打开（Markdown 文件通常是编辑器）。
+fn open_with_default_app(path: &Path) -> Result<(), String> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", path.to_string_lossy().as_ref()])
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
     let notes_dir = app
         .state::<AppState>()
@@ -332,7 +341,7 @@ pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
     if !path.exists() {
         std::fs::write(&path, format!("# {date}\n")).map_err(|err| err.to_string())?;
     }
-    open_with_explorer(&path)
+    open_with_default_app(&path)
 }
 
 pub fn open_notes_dir_impl(app: &AppHandle) -> Result<(), String> {
@@ -537,6 +546,57 @@ pub fn open_log_dir_impl(app: &AppHandle) -> Result<(), String> {
     let dir = app.path().app_log_dir().map_err(|err| err.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     open_with_explorer(&dir)
+}
+
+fn draft_path(app: &AppHandle) -> PathBuf {
+    settings::settings_path(app).with_file_name("draft.txt")
+}
+
+#[tauri::command]
+pub fn load_draft(app: AppHandle) -> Result<String, String> {
+    match std::fs::read_to_string(draft_path(&app)) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!("读取草稿失败：{err}")),
+    }
+}
+
+#[tauri::command]
+pub fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
+    let path = draft_path(&app);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("保存草稿失败：{err}"))?;
+    }
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::write(&tmp, content.as_bytes()).map_err(|err| format!("保存草稿失败：{err}"))?;
+    std::fs::rename(&tmp, &path).map_err(|err| format!("保存草稿失败：{err}"))
+}
+
+#[tauri::command]
+pub fn clear_draft(app: AppHandle) -> Result<(), String> {
+    match std::fs::remove_file(draft_path(&app)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("清除草稿失败：{err}")),
+    }
+}
+
+#[tauri::command]
+pub fn complete_onboarding(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.settings.lock().unwrap().onboarded = true;
+    persist(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_history_preview(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.settings.lock().unwrap().history_preview = enabled;
+    persist(&app);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -15,6 +15,10 @@ pub struct WindowGeometry {
     pub h: u32,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -23,6 +27,10 @@ pub struct Settings {
     pub pinned: bool,
     pub capture_source: bool,
     pub markdown_mode: bool,
+    pub history_preview: bool,
+    /// 旧版本没有这个字段，缺省视为已完成引导；只有全新安装才会看到引导。
+    #[serde(default = "default_true")]
+    pub onboarded: bool,
     pub window: Option<WindowGeometry>,
 }
 
@@ -34,6 +42,8 @@ impl Default for Settings {
             pinned: false,
             capture_source: true,
             markdown_mode: false,
+            history_preview: false,
+            onboarded: false,
             window: None,
         }
     }
@@ -87,17 +97,25 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
                     ),
                     None => "设置文件损坏，已恢复默认设置".to_string(),
                 });
-                Settings::default()
+                recovered_default()
             }
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Settings::default(),
         Err(err) => {
             log::warn!("读取设置文件失败（{}）：{err}", path.display());
-            Settings::default()
+            recovered_default()
         }
     };
 
     LoadedSettings { settings, warning }
+}
+
+/// 配置文件存在但不可用时使用：不再重复触发首次运行引导。
+fn recovered_default() -> Settings {
+    Settings {
+        onboarded: true,
+        ..Settings::default()
+    }
 }
 
 fn backup_corrupt(path: &Path) -> Option<PathBuf> {
@@ -151,6 +169,8 @@ mod tests {
         assert!(loaded.warning.is_none());
         assert_eq!(loaded.settings.hotkey, "ctrl+alt+n");
         assert!(loaded.settings.capture_source);
+        // 文件不存在 = 全新安装，需要展示引导
+        assert!(!loaded.settings.onboarded);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -173,6 +193,8 @@ mod tests {
         assert!(loaded.settings.pinned);
         assert!(!loaded.settings.capture_source);
         assert!(loaded.settings.markdown_mode);
+        // 旧配置文件没有 onboarded 字段，不应再次弹出引导
+        assert!(loaded.settings.onboarded);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -187,6 +209,7 @@ mod tests {
 
         assert!(loaded.warning.is_some());
         assert_eq!(loaded.settings.hotkey, "ctrl+alt+n");
+        assert!(loaded.settings.onboarded, "损坏恢复不应触发首次引导");
         assert!(!path.exists(), "损坏的原文件应被移走");
 
         let backups: Vec<_> = fs::read_dir(&dir)
