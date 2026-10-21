@@ -99,6 +99,17 @@ header {
   transition: background 0.12s ease, color 0.12s ease;
 }
 
+.icon-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
 .icon-btn:hover {
   background: var(--hover);
   color: var(--text);
@@ -107,6 +118,10 @@ header {
 .icon-btn.active {
   color: var(--accent);
   background: rgba(245, 165, 36, 0.16);
+}
+
+.icon-btn.active svg {
+  stroke-width: 2;
 }
 
 @media (prefers-color-scheme: light) {
