@@ -30,6 +30,11 @@ interface NoteEntry {
   path: string;
 }
 
+interface StartupNotice {
+  message: string;
+  openSettings: boolean;
+}
+
 const DRAFT_KEY = "flashnote.draft";
 
 function el<T extends HTMLElement>(id: string): T {
@@ -115,12 +120,12 @@ function accelFromEvent(event: KeyboardEvent): string | null {
   return [...mods, key].join("+");
 }
 
-function toast(message: string, error = false): void {
+function toast(message: string, error = false, duration = 1600): void {
   toastEl.textContent = message;
   toastEl.classList.toggle("error", error);
   toastEl.classList.add("show");
   if (toastTimer !== undefined) window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), 1600);
+  toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), duration);
 }
 
 function paintPin(): void {
@@ -345,10 +350,31 @@ async function init(): Promise<void> {
     }
 
     textarea.value = localStorage.getItem(DRAFT_KEY) ?? "";
+
+    // 窗口在启动时就可见（例如快捷键冲突）时立即提示；否则留到第一次唤起时再提示
+    if (await getCurrentWindow().isVisible()) {
+      if (await showStartupNotice()) return;
+    }
+
     textarea.focus();
   } catch (error) {
     toast(String(error), true);
   }
+}
+
+let startupNoticeShown = false;
+
+/** 取出启动提示并展示；没有提示或已经展示过则返回 false。 */
+async function showStartupNotice(): Promise<boolean> {
+  if (startupNoticeShown) return false;
+
+  const notice = await invoke<StartupNotice | null>("take_startup_notice");
+  if (!notice) return false;
+
+  startupNoticeShown = true;
+  toast(notice.message, true, 5000);
+  if (notice.openSettings) openSettings();
+  return true;
 }
 
 textarea.addEventListener("input", () => {
@@ -390,6 +416,7 @@ chooseDirButton.addEventListener("click", async () => {
       directory: true,
       multiple: false,
       title: "选择笔记目录",
+      defaultPath: settings.notesDir || undefined,
     });
     if (typeof selected === "string") {
       await invoke("update_notes_dir", { path: selected });
@@ -486,7 +513,9 @@ void listen<ShowPayload>("window-shown", (event) => {
     return;
   }
   if (!settingsPanel.classList.contains("hidden")) return;
-  textarea.focus();
+  void showStartupNotice().then((shown) => {
+    if (!shown) textarea.focus();
+  });
 });
 
 void listen("open-settings", () => {

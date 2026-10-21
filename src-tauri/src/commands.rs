@@ -24,7 +24,9 @@ pub struct SavedNote {
 pub fn persist(app: &AppHandle) {
     let state = app.state::<AppState>();
     let snapshot = state.settings.lock().unwrap().clone();
-    let _ = settings::save(&state.settings_path, &snapshot);
+    if let Err(err) = settings::save(&state.settings_path, &snapshot) {
+        log::error!("保存设置失败：{err}");
+    }
 }
 
 fn persist_geometry(app: &AppHandle, window: &WebviewWindow) {
@@ -42,31 +44,157 @@ fn persist_geometry(app: &AppHandle, window: &WebviewWindow) {
 
 fn top_right_position(window: &WebviewWindow) -> Option<(i32, i32)> {
     let monitor = window.primary_monitor().ok().flatten()?;
-    let pos = monitor.position();
-    let size = monitor.size();
+    let area = monitor.work_area();
     let window_size = window.inner_size().unwrap_or(PhysicalSize::new(480, 360));
     let margin = (24.0 * monitor.scale_factor()) as i32;
     Some((
-        pos.x + size.width as i32 - window_size.width as i32 - margin,
-        pos.y + margin,
+        area.position.x + area.size.width as i32 - window_size.width as i32 - margin,
+        area.position.y + margin,
     ))
 }
 
-fn clamp_position(window: &WebviewWindow, x: i32, y: i32) -> (i32, i32) {
-    if let Ok(monitors) = window.available_monitors() {
-        for monitor in &monitors {
-            let pos = monitor.position();
-            let size = monitor.size();
-            let inside = x >= pos.x - 40
-                && x < pos.x + size.width as i32 - 80
-                && y >= pos.y - 40
-                && y < pos.y + size.height as i32 - 80;
-            if inside {
-                return (x, y);
-            }
+/// 物理像素矩形，用于窗口与显示器工作区之间的夹取计算。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Rect {
+    fn right(self) -> i32 {
+        self.x.saturating_add(self.w as i32)
+    }
+
+    fn bottom(self) -> i32 {
+        self.y.saturating_add(self.h as i32)
+    }
+}
+
+fn overlap_area(a: Rect, b: Rect) -> i64 {
+    let left = a.x.max(b.x) as i64;
+    let top = a.y.max(b.y) as i64;
+    let right = a.right().min(b.right()) as i64;
+    let bottom = a.bottom().min(b.bottom()) as i64;
+    if right <= left || bottom <= top {
+        0
+    } else {
+        (right - left) * (bottom - top)
+    }
+}
+
+fn monitor_rects(window: &WebviewWindow) -> Vec<Rect> {
+    window
+        .available_monitors()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(|monitor| {
+                    let area = monitor.work_area();
+                    Rect {
+                        x: area.position.x,
+                        y: area.position.y,
+                        w: area.size.width,
+                        h: area.size.height,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把窗口位置夹回某块显示器的工作区：优先选择与保存位置重叠面积最大的屏幕，
+/// 完全不相交时退到中心点最近的一块。
+pub(crate) fn clamp_rect(rect: Rect, monitors: &[Rect]) -> (i32, i32) {
+    let Some(first) = monitors.first() else {
+        return (rect.x, rect.y);
+    };
+
+    let mut best = *first;
+    let mut best_area = overlap_area(rect, best);
+    for monitor in monitors.iter().skip(1) {
+        let area = overlap_area(rect, *monitor);
+        if area > best_area {
+            best = *monitor;
+            best_area = area;
         }
     }
-    top_right_position(window).unwrap_or((x, y))
+
+    if best_area == 0 {
+        let center_x = rect.x.saturating_add(rect.w as i32 / 2);
+        let center_y = rect.y.saturating_add(rect.h as i32 / 2);
+        best = *monitors
+            .iter()
+            .min_by_key(|monitor| {
+                let dx = monitor.x.saturating_add(monitor.w as i32 / 2) - center_x;
+                let dy = monitor.y.saturating_add(monitor.h as i32 / 2) - center_y;
+                dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+            })
+            .unwrap_or(first);
+    }
+
+    // 至少保留左侧 120px、顶部 40px（标题栏）可见，保证窗口可以被拖回来
+    let visible_x = 120.min(rect.w as i32);
+    let visible_y = 40.min(rect.h as i32);
+    let min_x = best.x - (rect.w as i32 - visible_x);
+    let max_x = best.x + best.w as i32 - visible_x;
+    let min_y = best.y;
+    let max_y = best.y + best.h as i32 - visible_y;
+
+    let x = if min_x <= max_x {
+        rect.x.clamp(min_x, max_x)
+    } else {
+        best.x
+    };
+    let y = if min_y <= max_y {
+        rect.y.clamp(min_y, max_y)
+    } else {
+        best.y
+    };
+
+    (x, y)
+}
+
+/// 尺寸限制在最小窗口尺寸与所在显示器工作区之间。
+pub(crate) fn clamp_size(w: u32, h: u32, x: i32, y: i32, monitors: &[Rect]) -> (u32, u32) {
+    const MIN_W: u32 = 380;
+    const MIN_H: u32 = 240;
+
+    let monitor = monitors
+        .iter()
+        .find(|monitor| {
+            x >= monitor.x
+                && x < monitor.x.saturating_add(monitor.w as i32)
+                && y >= monitor.y
+                && y < monitor.y.saturating_add(monitor.h as i32)
+        })
+        .or_else(|| monitors.first());
+
+    match monitor {
+        Some(monitor) => (
+            w.clamp(MIN_W, monitor.w.max(MIN_W)),
+            h.clamp(MIN_H, monitor.h.max(MIN_H)),
+        ),
+        None => (w.max(MIN_W), h.max(MIN_H)),
+    }
+}
+
+fn clamp_position(window: &WebviewWindow, x: i32, y: i32) -> (i32, i32) {
+    let monitors = monitor_rects(window);
+    if monitors.is_empty() {
+        return top_right_position(window).unwrap_or((x, y));
+    }
+    let size = window.inner_size().unwrap_or(PhysicalSize::new(480, 360));
+    clamp_rect(
+        Rect {
+            x,
+            y,
+            w: size.width,
+            h: size.height,
+        },
+        &monitors,
+    )
 }
 
 pub fn apply_initial_geometry(app: &AppHandle) {
@@ -83,14 +211,46 @@ pub fn apply_initial_geometry(app: &AppHandle) {
 
     match saved {
         Some(geometry) => {
-            let (x, y) = clamp_position(&window, geometry.x, geometry.y);
-            let _ = window.set_position(PhysicalPosition::new(x, y));
-            let _ = window.set_size(PhysicalSize::new(geometry.w.max(380), geometry.h.max(240)));
+            let monitors = monitor_rects(&window);
+            let (x, y) = clamp_rect(
+                Rect {
+                    x: geometry.x,
+                    y: geometry.y,
+                    w: geometry.w,
+                    h: geometry.h,
+                },
+                &monitors,
+            );
+            let (w, h) = clamp_size(geometry.w, geometry.h, x, y, &monitors);
+            if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
+                log::warn!("恢复窗口位置失败：{err}");
+            }
+            if let Err(err) = window.set_size(PhysicalSize::new(w, h)) {
+                log::warn!("恢复窗口尺寸失败：{err}");
+            }
         }
         None => {
             if let Some((x, y)) = top_right_position(&window) {
-                let _ = window.set_position(PhysicalPosition::new(x, y));
+                if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
+                    log::warn!("设置窗口初始位置失败：{err}");
+                }
             }
+        }
+    }
+}
+
+/// 系统缩放比例变化（切换显示器、修改缩放）后重新夹取窗口位置。
+pub fn reclamp_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(position) = window.outer_position() else {
+        return;
+    };
+    let (x, y) = clamp_position(&window, position.x, position.y);
+    if (x, y) != (position.x, position.y) {
+        if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
+            log::warn!("缩放变化后调整窗口位置失败：{err}");
         }
     }
 }
@@ -113,10 +273,19 @@ pub fn show_window_impl(app: &AppHandle) {
     };
 
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        let _ = app.emit("window-shown", ShowPayload { source });
+        if let Err(err) = window.show() {
+            log::error!("显示窗口失败：{err}");
+            return;
+        }
+        if let Err(err) = window.unminimize() {
+            log::warn!("取消最小化失败：{err}");
+        }
+        if let Err(err) = window.set_focus() {
+            log::warn!("聚焦窗口失败：{err}");
+        }
+        if let Err(err) = app.emit("window-shown", ShowPayload { source }) {
+            log::warn!("发送 window-shown 事件失败：{err}");
+        }
     }
 }
 
@@ -124,7 +293,9 @@ pub fn hide_window_impl(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         persist_geometry(app, &window);
         persist(app);
-        let _ = window.hide();
+        if let Err(err) = window.hide() {
+            log::error!("隐藏窗口失败：{err}");
+        }
     }
 }
 
@@ -225,19 +396,38 @@ pub fn set_pinned(app: AppHandle, state: State<'_, AppState>, pinned: bool) -> R
     Ok(())
 }
 
+/// 校验目录存在且可写，返回创建好的路径。
+pub(crate) fn ensure_writable_dir(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("目录不能为空".to_string());
+    }
+
+    let dir = PathBuf::from(trimmed);
+    if dir.exists() && !dir.is_dir() {
+        return Err("所选路径不是文件夹".to_string());
+    }
+    std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建目录：{err}"))?;
+
+    let probe = dir.join(format!(".flashnote-write-test-{}", std::process::id()));
+    std::fs::write(&probe, b"flashnote").map_err(|err| format!("该目录不可写：{err}"))?;
+    if let Err(err) = std::fs::remove_file(&probe) {
+        log::warn!("清理写入测试文件失败（{}）：{err}", probe.display());
+    }
+
+    Ok(dir)
+}
+
 #[tauri::command]
 pub fn update_notes_dir(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    let dir = PathBuf::from(path.trim());
-    if dir.as_os_str().is_empty() {
-        return Err("目录不能为空".to_string());
-    }
-    std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建目录：{err}"))?;
+    let dir = ensure_writable_dir(&path)?;
     state.settings.lock().unwrap().notes_dir = dir.to_string_lossy().to_string();
     persist(&app);
+    log::info!("笔记目录已更新为 {}", dir.display());
     Ok(())
 }
 
@@ -250,17 +440,23 @@ pub fn update_hotkey(
     let shortcut: Shortcut = accel.parse().map_err(|_| "快捷键格式无效".to_string())?;
 
     let old = state.settings.lock().unwrap().hotkey.clone();
-    let _ = app.global_shortcut().unregister_all();
+    if let Err(err) = app.global_shortcut().unregister_all() {
+        log::warn!("取消旧快捷键失败：{err}");
+    }
 
     match app.global_shortcut().register(shortcut) {
         Ok(()) => {
-            state.settings.lock().unwrap().hotkey = accel;
+            state.settings.lock().unwrap().hotkey = accel.clone();
             persist(&app);
+            log::info!("全局热键已更新为 {accel}");
             Ok(())
         }
         Err(err) => {
+            log::warn!("注册新快捷键 {accel} 失败：{err}");
             if let Ok(previous) = old.parse::<Shortcut>() {
-                let _ = app.global_shortcut().register(previous);
+                if let Err(rollback_err) = app.global_shortcut().register(previous) {
+                    log::error!("恢复旧快捷键 {old} 失败：{rollback_err}");
+                }
             }
             Err(format!("注册失败（可能被其他程序占用）：{err}"))
         }
@@ -330,4 +526,170 @@ pub fn open_notes_dir(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn hide_window(app: AppHandle) {
     hide_window_impl(&app);
+}
+
+#[tauri::command]
+pub fn take_startup_notice(state: State<'_, AppState>) -> Option<crate::StartupNotice> {
+    state.startup_notice.lock().unwrap().take()
+}
+
+pub fn open_log_dir_impl(app: &AppHandle) -> Result<(), String> {
+    let dir = app.path().app_log_dir().map_err(|err| err.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    open_with_explorer(&dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-commands-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clamp_rect_keeps_window_in_place_when_visible() {
+        let monitors = [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1040,
+            },
+            Rect {
+                x: 1920,
+                y: 0,
+                w: 1920,
+                h: 1040,
+            },
+        ];
+
+        assert_eq!(
+            clamp_rect(
+                Rect {
+                    x: 100,
+                    y: 100,
+                    w: 480,
+                    h: 360
+                },
+                &monitors
+            ),
+            (100, 100)
+        );
+        assert_eq!(
+            clamp_rect(
+                Rect {
+                    x: 2000,
+                    y: 200,
+                    w: 480,
+                    h: 360
+                },
+                &monitors
+            ),
+            (2000, 200)
+        );
+    }
+
+    #[test]
+    fn clamp_rect_pulls_back_offscreen_window() {
+        let monitors = [Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        }];
+
+        let (x, y) = clamp_rect(
+            Rect {
+                x: 5000,
+                y: 5000,
+                w: 480,
+                h: 360,
+            },
+            &monitors,
+        );
+
+        assert_eq!(x, 1920 - 120);
+        assert_eq!(y, 1040 - 40);
+    }
+
+    #[test]
+    fn clamp_rect_falls_back_to_nearest_monitor_after_unplug() {
+        let monitors = [Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        }];
+
+        let (x, y) = clamp_rect(
+            Rect {
+                x: 2500,
+                y: 100,
+                w: 480,
+                h: 360,
+            },
+            &monitors,
+        );
+
+        assert!(x <= 1920 - 120);
+        assert!(y >= 0);
+    }
+
+    #[test]
+    fn clamp_rect_without_monitors_is_a_no_op() {
+        let rect = Rect {
+            x: 123,
+            y: 456,
+            w: 480,
+            h: 360,
+        };
+        assert_eq!(clamp_rect(rect, &[]), (123, 456));
+    }
+
+    #[test]
+    fn clamp_size_respects_minimum_and_monitor_bounds() {
+        let monitors = [Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        }];
+
+        assert_eq!(clamp_size(100, 100, 10, 10, &monitors), (380, 240));
+        assert_eq!(clamp_size(4000, 3000, 10, 10, &monitors), (1920, 1040));
+    }
+
+    #[test]
+    fn ensure_writable_dir_creates_and_accepts_directory() {
+        let dir = temp_dir("writable");
+        let target = dir.join("notes");
+
+        let result = ensure_writable_dir(target.to_str().unwrap()).unwrap();
+
+        assert!(result.is_dir());
+        assert!(std::fs::read_dir(&result).unwrap().next().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_writable_dir_rejects_file_path() {
+        let dir = temp_dir("file-path");
+        let file = dir.join("not-a-dir.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        assert!(ensure_writable_dir(file.to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_writable_dir_rejects_empty_path() {
+        assert!(ensure_writable_dir("   ").is_err());
+    }
 }

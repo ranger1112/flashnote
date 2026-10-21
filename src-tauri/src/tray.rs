@@ -11,6 +11,7 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
     let today_item = MenuItem::with_id(app, "today", "打开今日笔记", true, None::<&str>)?;
     let folder_item = MenuItem::with_id(app, "folder", "打开笔记文件夹", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
+    let logs_item = MenuItem::with_id(app, "logs", "打开日志文件夹", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -21,6 +22,7 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
             &today_item,
             &folder_item,
             &settings_item,
+            &logs_item,
             &quit_item,
         ],
     )?;
@@ -38,12 +40,17 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
             }
             "today" => {
                 if let Err(err) = commands::open_today_note_impl(app) {
-                    eprintln!("打开今日笔记失败: {err}");
+                    log::error!("打开今日笔记失败：{err}");
                 }
             }
             "folder" => {
                 if let Err(err) = commands::open_notes_dir_impl(app) {
-                    eprintln!("打开笔记目录失败: {err}");
+                    log::error!("打开笔记目录失败：{err}");
+                }
+            }
+            "logs" => {
+                if let Err(err) = commands::open_log_dir_impl(app) {
+                    log::error!("打开日志目录失败：{err}");
                 }
             }
             "settings" => {
