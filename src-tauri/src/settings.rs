@@ -21,6 +21,7 @@ pub struct Settings {
     pub hotkey: String,
     pub pinned: bool,
     pub capture_source: bool,
+    pub markdown_mode: bool,
     pub window: Option<WindowGeometry>,
 }
 
@@ -31,6 +32,7 @@ impl Default for Settings {
             hotkey: "ctrl+alt+n".to_string(),
             pinned: false,
             capture_source: true,
+            markdown_mode: false,
             window: None,
         }
     }

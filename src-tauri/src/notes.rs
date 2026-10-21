@@ -5,6 +5,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+fn normalized_source(source: Option<&str>) -> Option<String> {
+    source
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty())
+}
+
 /// 把一条速记渲染成 Markdown 列表项。
 /// 多行内容缩进两格，来源作为斜体续行。
 pub fn format_entry(time: &str, content: &str, source: Option<&str>) -> String {
@@ -21,13 +27,23 @@ pub fn format_entry(time: &str, content: &str, source: Option<&str>) -> String {
         }
     }
 
-    if let Some(source) = source {
-        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !normalized.is_empty() {
-            out.push_str("\n  _来源：");
-            out.push_str(&normalized);
-            out.push('_');
-        }
+    if let Some(source) = normalized_source(source) {
+        out.push_str("\n  _来源：");
+        out.push_str(&source);
+        out.push('_');
+    }
+
+    out
+}
+
+/// Markdown 模式：时间作为三级标题，原文不做缩进，来源写成 HTML 注释。
+pub fn format_entry_markdown(time: &str, content: &str, source: Option<&str>) -> String {
+    let mut out = format!("### {time}\n{}", content.trim());
+
+    if let Some(source) = normalized_source(source) {
+        out.push_str("\n\n<!-- 来源：");
+        out.push_str(&source);
+        out.push_str(" -->");
     }
 
     out
@@ -72,6 +88,26 @@ mod tests {
         assert_eq!(
             format_entry("14:32", "第一行\n第二行", Some("Chrome — 文章")),
             "- 14:32 第一行\n  第二行\n  _来源：Chrome — 文章_"
+        );
+    }
+
+    #[test]
+    fn formats_markdown_block_with_source() {
+        assert_eq!(
+            format_entry_markdown(
+                "14:32",
+                "## 小标题\n\n```js\nconst a = 1;\n```",
+                Some("Chrome — 文章")
+            ),
+            "### 14:32\n## 小标题\n\n```js\nconst a = 1;\n```\n\n<!-- 来源：Chrome — 文章 -->"
+        );
+    }
+
+    #[test]
+    fn formats_markdown_block_without_source() {
+        assert_eq!(
+            format_entry_markdown("09:05", "  第一行\n第二行  ", None),
+            "### 09:05\n第一行\n第二行"
         );
     }
 

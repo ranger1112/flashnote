@@ -75,6 +75,7 @@ fn main() {
             commands::update_notes_dir,
             commands::update_hotkey,
             commands::update_capture_source,
+            commands::update_markdown_mode,
             commands::open_today_note,
             commands::open_notes_dir,
             commands::hide_window,

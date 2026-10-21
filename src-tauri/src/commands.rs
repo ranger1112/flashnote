@@ -199,7 +199,11 @@ pub fn save_note(
     };
 
     let (date, time) = notes::now_parts();
-    let entry = notes::format_entry(&time, content, source_title.as_deref());
+    let entry = if settings.markdown_mode {
+        notes::format_entry_markdown(&time, content, source_title.as_deref())
+    } else {
+        notes::format_entry(&time, content, source_title.as_deref())
+    };
     let dir = PathBuf::from(&settings.notes_dir);
     let path = notes::append_note(&dir, &date, &entry)
         .map_err(|err| format!("写入失败：{err}"))?;
@@ -271,6 +275,17 @@ pub fn update_capture_source(
     if !enabled {
         *state.last_source.lock().unwrap() = None;
     }
+    persist(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_markdown_mode(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.settings.lock().unwrap().markdown_mode = enabled;
     persist(&app);
     Ok(())
 }

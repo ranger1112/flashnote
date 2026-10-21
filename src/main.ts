@@ -9,6 +9,7 @@ interface Settings {
   hotkey: string;
   pinned: boolean;
   captureSource: boolean;
+  markdownMode: boolean;
   window: unknown;
 }
 
@@ -41,6 +42,7 @@ const hotkeyError = el<HTMLParagraphElement>("hotkey-error");
 const notesDirInput = el<HTMLInputElement>("notes-dir");
 const chooseDirButton = el<HTMLButtonElement>("choose-dir");
 const captureSourceCheck = el<HTMLInputElement>("capture-source");
+const markdownModeCheck = el<HTMLInputElement>("markdown-mode");
 const autostartCheck = el<HTMLInputElement>("autostart");
 const sourceLabel = el<HTMLSpanElement>("source");
 const toastEl = el<HTMLDivElement>("toast");
@@ -51,6 +53,7 @@ let settings: Settings = {
   hotkey: "ctrl+alt+n",
   pinned: false,
   captureSource: true,
+  markdownMode: false,
   window: null,
 };
 let pinned = false;
@@ -121,6 +124,7 @@ async function refreshSettings(): Promise<void> {
   hotkeyInput.value = formatAccel(settings.hotkey);
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
+  markdownModeCheck.checked = settings.markdownMode;
 }
 
 async function hideWindow(): Promise<void> {
@@ -154,6 +158,7 @@ function openSettings(): void {
   hotkeyInput.value = formatAccel(settings.hotkey);
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
+  markdownModeCheck.checked = settings.markdownMode;
   hotkeyError.textContent = "";
   settingsPanel.classList.remove("hidden");
 }
@@ -272,6 +277,19 @@ captureSourceCheck.addEventListener("change", async () => {
     await refreshSettings();
   } catch (error) {
     captureSourceCheck.checked = !captureSourceCheck.checked;
+    toast(String(error), true);
+  }
+});
+
+markdownModeCheck.addEventListener("change", async () => {
+  try {
+    await invoke("update_markdown_mode", {
+      enabled: markdownModeCheck.checked,
+    });
+    await refreshSettings();
+    toast(markdownModeCheck.checked ? "已开启 Markdown 模式" : "已关闭 Markdown 模式");
+  } catch (error) {
+    markdownModeCheck.checked = !markdownModeCheck.checked;
     toast(String(error), true);
   }
 });

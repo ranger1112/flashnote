@@ -173,6 +173,7 @@ kbd {
 
 .toast {
   position: absolute;
+  z-index: 20;
   left: 50%;
   bottom: 46px;
   transform: translate(-50%, 8px);
@@ -226,8 +227,9 @@ kbd {
   z-index: 10;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 14px 16px 16px;
+  gap: 10px;
+  padding: 12px 16px 14px;
+  overflow-y: auto;
   background: var(--bg-solid);
 }
 
