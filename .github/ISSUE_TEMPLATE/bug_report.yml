@@ -1,0 +1,61 @@
+name: Bug 报告
+description: 闪记运行异常、数据格式不对或界面错乱
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先确认最新版本是否仍然存在该问题。涉及隐私的内容（笔记正文、窗口标题、用户名路径）请打码。
+  - type: input
+    id: version
+    attributes:
+      label: 闪记版本
+      description: 设置面板或安装包文件名里的版本号，例如 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows 版本
+      placeholder: Windows 11 23H2 / Windows 10 22H2
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: 运行方式
+      options:
+        - 安装版（Releases 安装包）
+        - 从源码 `npm run tauri dev`
+        - 从源码 `npm run tauri build`
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 按 Ctrl+Alt+N 唤起
+        2. 输入内容后 Ctrl+Enter
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果 vs 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: notes-format
+    attributes:
+      label: 相关笔记文件片段（可选，请打码）
+      description: 涉及写入格式时贴一小段当天 Markdown，便于定位解析问题。
+      render: markdown
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志（可选）
+      description: 托盘菜单 →「打开日志文件夹」里的内容，不要贴笔记正文。
+      render: text

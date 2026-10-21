@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题
+    url: https://github.com/ranger1112/flashnote/security/advisories/new
+    about: 请勿用公开 Issue 报告漏洞，走 GitHub 私下报告流程。
+  - name: 使用说明
+    url: https://github.com/ranger1112/flashnote#使用
+    about: 快捷键、设置项、数据格式与已知限制都在 README 里。

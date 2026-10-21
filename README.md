@@ -228,11 +228,13 @@ flashnote/
 
 ## 参与贡献
 
-欢迎提交 Issue 和 Pull Request。提交前请确认：
+欢迎提交 Issue 和 Pull Request，具体流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。提交前请确认：
 
 - `npm run build`（类型检查 + 前端构建）通过；
 - `cd src-tauri && cargo test` 通过；
 - 不提交 `node_modules/`、`dist/`、`src-tauri/target/` 等生成目录。
+
+版本变更见 [CHANGELOG.md](CHANGELOG.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 Issue。
 
 ## 许可证
 
