@@ -5,9 +5,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow,
-};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
 #[derive(Clone, Serialize)]
@@ -46,9 +44,7 @@ fn top_right_position(window: &WebviewWindow) -> Option<(i32, i32)> {
     let monitor = window.primary_monitor().ok().flatten()?;
     let pos = monitor.position();
     let size = monitor.size();
-    let window_size = window
-        .inner_size()
-        .unwrap_or(PhysicalSize::new(480, 360));
+    let window_size = window.inner_size().unwrap_or(PhysicalSize::new(480, 360));
     let margin = (24.0 * monitor.scale_factor()) as i32;
     Some((
         pos.x + size.width as i32 - window_size.width as i32 - margin,
@@ -89,10 +85,7 @@ pub fn apply_initial_geometry(app: &AppHandle) {
         Some(geometry) => {
             let (x, y) = clamp_position(&window, geometry.x, geometry.y);
             let _ = window.set_position(PhysicalPosition::new(x, y));
-            let _ = window.set_size(PhysicalSize::new(
-                geometry.w.max(380),
-                geometry.h.max(240),
-            ));
+            let _ = window.set_size(PhysicalSize::new(geometry.w.max(380), geometry.h.max(240)));
         }
         None => {
             if let Some((x, y)) = top_right_position(&window) {
@@ -154,7 +147,13 @@ fn open_with_explorer(path: &Path) -> Result<(), String> {
 }
 
 pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
-    let notes_dir = app.state::<AppState>().settings.lock().unwrap().notes_dir.clone();
+    let notes_dir = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .notes_dir
+        .clone();
     let (date, _) = notes::now_parts();
     let dir = PathBuf::from(notes_dir);
     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
@@ -166,7 +165,13 @@ pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn open_notes_dir_impl(app: &AppHandle) -> Result<(), String> {
-    let notes_dir = app.state::<AppState>().settings.lock().unwrap().notes_dir.clone();
+    let notes_dir = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .notes_dir
+        .clone();
     let dir = PathBuf::from(notes_dir);
     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     open_with_explorer(&dir)
@@ -205,8 +210,7 @@ pub fn save_note(
         notes::format_entry(&time, content, source_title.as_deref())
     };
     let dir = PathBuf::from(&settings.notes_dir);
-    let path = notes::append_note(&dir, &date, &entry)
-        .map_err(|err| format!("写入失败：{err}"))?;
+    let path = notes::append_note(&dir, &date, &entry).map_err(|err| format!("写入失败：{err}"))?;
 
     Ok(SavedNote {
         path: path.to_string_lossy().to_string(),
@@ -243,9 +247,7 @@ pub fn update_hotkey(
     state: State<'_, AppState>,
     accel: String,
 ) -> Result<(), String> {
-    let shortcut: Shortcut = accel
-        .parse()
-        .map_err(|_| "快捷键格式无效".to_string())?;
+    let shortcut: Shortcut = accel.parse().map_err(|_| "快捷键格式无效".to_string())?;
 
     let old = state.settings.lock().unwrap().hotkey.clone();
     let _ = app.global_shortcut().unregister_all();

@@ -1,0 +1,15 @@
+# 仓库内统一使用 LF；Windows 脚本在检出时转换为 CRLF。
+* text=auto eol=lf
+
+# cmd.exe 对 LF 结尾的批处理兼容性较差，这些文件必须保持 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源：禁止换行转换与文本 diff
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.zip binary

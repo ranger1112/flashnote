@@ -166,7 +166,11 @@ pub fn parse_entries(text: &str) -> Vec<(String, String, Option<String>)> {
             current = Some(ParsedEntry {
                 markdown: false,
                 time,
-                content: if first.is_empty() { Vec::new() } else { vec![first] },
+                content: if first.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![first]
+                },
                 source: None,
             });
             continue;
@@ -256,7 +260,7 @@ pub fn append_note(dir: &Path, date: &str, entry: &str) -> std::io::Result<PathB
     if existing.is_empty() {
         write!(file, "# {date}\n\n")?;
     } else if !existing.ends_with("\n\n") {
-        write!(file, "\n")?;
+        writeln!(file)?;
     }
     writeln!(file, "{entry}")?;
 
@@ -310,7 +314,8 @@ mod tests {
 
     #[test]
     fn parses_list_entries() {
-        let text = "# 2026-10-21\n\n- 14:32 first\n  second\n  _来源：Chrome — 文章_\n\n- 15:02 next\n";
+        let text =
+            "# 2026-10-21\n\n- 14:32 first\n  second\n  _来源：Chrome — 文章_\n\n- 15:02 next\n";
         let entries = parse_entries(text);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "14:32");
@@ -334,15 +339,13 @@ mod tests {
         let text = "### 10:00\n```\n### 11:00\n- 12:00 not an entry\n```\n";
         let entries = parse_entries(text);
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].1,
-            "```\n### 11:00\n- 12:00 not an entry\n```"
-        );
+        assert_eq!(entries[0].1, "```\n### 11:00\n- 12:00 not an entry\n```");
     }
 
     #[test]
     fn loads_recent_entries_newest_first() {
-        let dir = std::env::temp_dir().join(format!("flashnote-test-recent-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-recent-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
         append_note(&dir, "2026-10-20", "- 10:00 older").unwrap();
