@@ -291,6 +291,31 @@ pub fn update_markdown_mode(
 }
 
 #[tauri::command]
+pub fn list_notes(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<notes::NoteEntry>, String> {
+    let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    notes::load_recent(&dir, limit.unwrap_or(200).clamp(1, 1000) as usize)
+        .map_err(|err| format!("读取笔记失败：{err}"))
+}
+
+#[tauri::command]
+pub fn open_note_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let dir = notes_dir
+        .canonicalize()
+        .map_err(|err| format!("笔记目录不可用：{err}"))?;
+    let target = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|err| format!("文件不存在：{err}"))?;
+    if !target.starts_with(&dir) {
+        return Err("文件不在笔记目录中".to_string());
+    }
+    open_with_explorer(&target)
+}
+
+#[tauri::command]
 pub fn open_today_note(app: AppHandle) -> Result<(), String> {
     open_today_note_impl(&app)
 }

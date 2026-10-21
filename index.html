@@ -14,6 +14,7 @@
           <span>闪记</span>
         </div>
         <div class="actions">
+          <button id="notes-btn" class="icon-btn" title="查看笔记" aria-label="查看笔记">📖</button>
           <button id="pin" class="icon-btn" title="常驻模式：保存后保持打开" aria-label="常驻模式">📌</button>
           <button id="settings-btn" class="icon-btn" title="设置" aria-label="设置">⚙</button>
           <button id="close-btn" class="icon-btn" title="收起 (Esc)" aria-label="收起">✕</button>
@@ -76,6 +77,28 @@
         </label>
 
         <p class="tip">笔记按日期保存为本地 Markdown 文件。</p>
+      </section>
+
+      <section id="history" class="history hidden">
+        <div class="settings-head">
+          <span>笔记</span>
+          <button id="history-close" class="icon-btn" aria-label="关闭笔记">✕</button>
+        </div>
+
+        <input
+          id="history-search"
+          class="search-input"
+          type="search"
+          placeholder="搜索笔记…"
+          spellcheck="false"
+        />
+
+        <div id="entry-list" class="entry-list"></div>
+
+        <div class="history-foot">
+          <span id="history-count"></span>
+          <button id="history-folder" class="btn">打开文件夹</button>
+        </div>
       </section>
     </div>
     <script type="module" src="/src/main.ts"></script>

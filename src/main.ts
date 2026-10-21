@@ -22,6 +22,14 @@ interface ShowPayload {
   source: string | null;
 }
 
+interface NoteEntry {
+  date: string;
+  time: string;
+  content: string;
+  source: string | null;
+  path: string;
+}
+
 const DRAFT_KEY = "flashnote.draft";
 
 function el<T extends HTMLElement>(id: string): T {
@@ -34,6 +42,13 @@ const textarea = el<HTMLTextAreaElement>("note");
 const pinButton = el<HTMLButtonElement>("pin");
 const settingsButton = el<HTMLButtonElement>("settings-btn");
 const closeButton = el<HTMLButtonElement>("close-btn");
+const notesButton = el<HTMLButtonElement>("notes-btn");
+const historyPanel = el<HTMLElement>("history");
+const historyClose = el<HTMLButtonElement>("history-close");
+const historySearch = el<HTMLInputElement>("history-search");
+const historyCount = el<HTMLSpanElement>("history-count");
+const historyFolder = el<HTMLButtonElement>("history-folder");
+const entryList = el<HTMLDivElement>("entry-list");
 const settingsPanel = el<HTMLElement>("settings");
 const settingsClose = el<HTMLButtonElement>("settings-close");
 const hotkeyInput = el<HTMLInputElement>("hotkey-input");
@@ -59,6 +74,7 @@ let settings: Settings = {
 let pinned = false;
 let recording = false;
 let toastTimer: number | undefined;
+let notes: NoteEntry[] = [];
 
 function formatAccel(accel: string): string {
   return accel
@@ -129,6 +145,7 @@ async function refreshSettings(): Promise<void> {
 
 async function hideWindow(): Promise<void> {
   closeSettings();
+  closeHistory();
   await invoke("hide_window");
 }
 
@@ -155,6 +172,7 @@ async function saveNote(): Promise<void> {
 }
 
 function openSettings(): void {
+  closeHistory();
   hotkeyInput.value = formatAccel(settings.hotkey);
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
@@ -172,6 +190,114 @@ function stopRecording(): void {
 function closeSettings(): void {
   settingsPanel.classList.add("hidden");
   stopRecording();
+}
+
+function dateLabel(date: string): string {
+  const now = new Date();
+  const today = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+  return date === today ? `今天 · ${date}` : date;
+}
+
+function closeHistory(): void {
+  historyPanel.classList.add("hidden");
+}
+
+function renderNotes(): void {
+  const term = historySearch.value.trim().toLowerCase();
+  const filtered = term
+    ? notes.filter((note) =>
+        [note.date, note.time, note.content, note.source ?? ""].some((value) =>
+          value.toLowerCase().includes(term),
+        ),
+      )
+    : notes;
+
+  entryList.replaceChildren();
+
+  if (filtered.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "history-empty";
+    empty.textContent = notes.length === 0 ? "还没有记录" : "没有匹配的笔记";
+    entryList.append(empty);
+  } else {
+    let lastDate = "";
+    for (const note of filtered) {
+      if (note.date !== lastDate) {
+        lastDate = note.date;
+        const date = document.createElement("div");
+        date.className = "entry-date";
+        date.textContent = dateLabel(note.date);
+        entryList.append(date);
+      }
+
+      const entry = document.createElement("article");
+      entry.className = "entry";
+
+      const head = document.createElement("div");
+      head.className = "entry-head";
+
+      const time = document.createElement("span");
+      time.className = "entry-time";
+      time.textContent = note.time;
+      head.append(time);
+
+      if (note.source) {
+        const source = document.createElement("span");
+        source.className = "entry-source";
+        source.textContent = `来源：${note.source}`;
+        head.append(source);
+      }
+
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "entry-open";
+      openButton.title = "在资源管理器中定位";
+      openButton.setAttribute("aria-label", "在资源管理器中定位");
+      openButton.textContent = "↗";
+      openButton.addEventListener("click", () => {
+        void invoke("open_note_file", { path: note.path }).catch((error) =>
+          toast(String(error), true),
+        );
+      });
+      head.append(openButton);
+
+      const content = document.createElement("div");
+      content.className = "entry-content";
+      content.textContent = note.content;
+
+      entry.append(head, content);
+      entryList.append(entry);
+    }
+  }
+
+  historyCount.textContent = term
+    ? `${filtered.length} / ${notes.length} 条`
+    : `共 ${notes.length} 条`;
+}
+
+async function loadNotes(): Promise<void> {
+  try {
+    notes = await invoke<NoteEntry[]>("list_notes", { limit: 200 });
+  } catch (error) {
+    notes = [];
+    toast(String(error), true);
+  }
+  renderNotes();
+}
+
+function openHistory(): void {
+  closeSettings();
+  historyPanel.classList.remove("hidden");
+  historySearch.value = "";
+  notes = [];
+  entryList.replaceChildren();
+  historyCount.textContent = "";
+  historySearch.focus();
+  void loadNotes();
 }
 
 function startRecording(): void {
@@ -242,6 +368,12 @@ pinButton.addEventListener("click", async () => {
 
 settingsButton.addEventListener("click", openSettings);
 settingsClose.addEventListener("click", closeSettings);
+notesButton.addEventListener("click", openHistory);
+historyClose.addEventListener("click", closeHistory);
+historySearch.addEventListener("input", renderNotes);
+historyFolder.addEventListener("click", () => {
+  void invoke("open_notes_dir").catch((error) => toast(String(error), true));
+});
 closeButton.addEventListener("click", () => void hideWindow());
 
 hotkeyRecord.addEventListener("click", () => {
@@ -318,7 +450,9 @@ window.addEventListener(
 
     if (event.key === "Escape") {
       event.preventDefault();
-      if (!settingsPanel.classList.contains("hidden")) {
+      if (!historyPanel.classList.contains("hidden")) {
+        closeHistory();
+      } else if (!settingsPanel.classList.contains("hidden")) {
         closeSettings();
       } else {
         void hideWindow();
@@ -347,11 +481,20 @@ resizeGrip.addEventListener("pointerdown", (event) => {
 
 void listen<ShowPayload>("window-shown", (event) => {
   setSource(event.payload.source);
+  if (!historyPanel.classList.contains("hidden")) {
+    void loadNotes();
+    return;
+  }
+  if (!settingsPanel.classList.contains("hidden")) return;
   textarea.focus();
 });
 
 void listen("open-settings", () => {
   openSettings();
+});
+
+void listen("open-history", () => {
+  openHistory();
 });
 
 void init();

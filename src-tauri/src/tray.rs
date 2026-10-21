@@ -7,6 +7,7 @@ use tauri::{
 
 pub fn create(app: &mut App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "显示速记", true, None::<&str>)?;
+    let history_item = MenuItem::with_id(app, "history", "查看笔记", true, None::<&str>)?;
     let today_item = MenuItem::with_id(app, "today", "打开今日笔记", true, None::<&str>)?;
     let folder_item = MenuItem::with_id(app, "folder", "打开笔记文件夹", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
@@ -16,6 +17,7 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
         app,
         &[
             &show_item,
+            &history_item,
             &today_item,
             &folder_item,
             &settings_item,
@@ -30,6 +32,10 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => commands::show_window_impl(app),
+            "history" => {
+                commands::show_window_impl(app);
+                let _ = app.emit("open-history", ());
+            }
             "today" => {
                 if let Err(err) = commands::open_today_note_impl(app) {
                     eprintln!("打开今日笔记失败: {err}");
