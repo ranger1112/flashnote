@@ -1,0 +1,9 @@
+@echo off
+rem Copy to _env.local.cmd (gitignored) and adjust for your machine.
+rem Used by _env.cmd when vcvars64.bat lives somewhere non-standard.
+
+set "VCVARS=D:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+
+rem Optional: move the Rust toolchain off the system drive.
+rem set "RUSTUP_HOME=D:\dev\rust\rustup"
+rem set "CARGO_HOME=D:\dev\rust\cargo"

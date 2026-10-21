@@ -1,6 +1,7 @@
 @echo off
-set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"
-call "D:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+setlocal
+call "%~dp0_env.cmd" || exit /b 1
 where link
+where cargo
 echo INCLUDE=%INCLUDE%
 echo LIB=%LIB%

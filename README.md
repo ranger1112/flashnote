@@ -152,14 +152,19 @@ npm install
 npm run tauri dev
 ```
 
-Windows 下也可以使用封装脚本，它会自动加载 MSVC 环境：
+Windows 下也可以使用封装脚本，它会自动找到 Rust 与 MSVC（`vswhere` + 常见安装路径）并加载环境：
 
 ```bat
 scripts\dev.cmd
 scripts\build.cmd
+scripts\cargo.cmd test      :: 等价于 cargo test，但环境已就绪
 ```
 
-脚本里的工具链路径是示例，请按本机安装位置修改 `scripts\cargo.cmd` 等文件。
+工具链装在非默认位置（例如 `D:\BuildTools`、自定义 `CARGO_HOME`）时，把示例复制成 `scripts\_env.local.cmd` 并填写路径即可，该文件已被 `.gitignore` 忽略：
+
+```bat
+copy scripts\_env.local.cmd.example scripts\_env.local.cmd
+```
 
 ### 构建安装包
 
