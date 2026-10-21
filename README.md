@@ -4,6 +4,8 @@
 
 按一下全局快捷键，小窗浮在当前窗口上方；写下想法，`Ctrl+Enter` 保存，窗口自动收起，焦点回到原来的文章或播放器。内容按日期追加到本地 Markdown 文件，不注册账号、不上传云端。
 
+**下载**：[最新版本](https://github.com/ranger1112/flashnote/releases/latest)
+
 ## 特性
 
 - **全局唤起**：默认 `Ctrl+Alt+N`，在任何程序里都能叫出小窗，再按一次收起。
@@ -104,15 +106,21 @@ const a = 1;
 
 ## 安装
 
-目前尚未发布 Release，需要从源码构建（见下文）。构建完成后安装包位于：
+从 [Releases](https://github.com/ranger1112/flashnote/releases/latest) 下载最新安装包：
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.1.0_x64-setup.exe
+FlashNote_0.1.0_x64-setup.exe
 ```
 
 双击安装即可。安装器按当前用户安装，无需管理员权限；安装包未签名，首次运行可能触发 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
 
 卸载：Windows「设置 → 应用」，或运行安装目录下的 `uninstall.exe`。
+
+从源码构建的安装包位于：
+
+```
+src-tauri\target\release\bundle\nsis\闪记_0.1.0_x64-setup.exe
+```
 
 ## 开发
 
