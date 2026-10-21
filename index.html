@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>闪记</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="card">
+      <header data-tauri-drag-region>
+        <div class="brand" data-tauri-drag-region>
+          <span class="dot"></span>
+          <span>闪记</span>
+        </div>
+        <div class="actions">
+          <button id="pin" class="icon-btn" title="常驻模式：保存后保持打开" aria-label="常驻模式">📌</button>
+          <button id="settings-btn" class="icon-btn" title="设置" aria-label="设置">⚙</button>
+          <button id="close-btn" class="icon-btn" title="收起 (Esc)" aria-label="收起">✕</button>
+        </div>
+      </header>
+
+      <main>
+        <textarea
+          id="note"
+          placeholder="想到什么就写什么…"
+          spellcheck="false"
+          autofocus
+        ></textarea>
+      </main>
+
+      <footer>
+        <span id="source" class="source"></span>
+        <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 收起</span>
+      </footer>
+
+      <div id="toast" class="toast"></div>
+      <div id="resize-grip" title="拖动调整大小"></div>
+
+      <section id="settings" class="settings hidden">
+        <div class="settings-head">
+          <span>设置</span>
+          <button id="settings-close" class="icon-btn" aria-label="关闭设置">✕</button>
+        </div>
+
+        <div class="field">
+          <label for="hotkey-input">唤起快捷键</label>
+          <div class="row">
+            <input id="hotkey-input" readonly />
+            <button id="hotkey-record" class="btn">录制</button>
+          </div>
+          <p id="hotkey-error" class="error"></p>
+        </div>
+
+        <div class="field">
+          <label for="notes-dir">笔记目录</label>
+          <div class="row">
+            <input id="notes-dir" readonly />
+            <button id="choose-dir" class="btn">选择</button>
+          </div>
+        </div>
+
+        <label class="check">
+          <input id="capture-source" type="checkbox" />
+          自动记录来源窗口
+        </label>
+
+        <label class="check">
+          <input id="autostart" type="checkbox" />
+          开机自启
+        </label>
+
+        <p class="tip">
+          笔记按日期保存为本地 Markdown 文件。<br />
+          保存：Ctrl+Enter　收起：Esc
+        </p>
+      </section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
