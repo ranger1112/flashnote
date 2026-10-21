@@ -187,3 +187,7 @@ flashnote/
 - `npm run build`（类型检查 + 前端构建）通过；
 - `cd src-tauri && cargo test` 通过；
 - 不提交 `node_modules/`、`dist/`、`src-tauri/target/` 等生成目录。
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
