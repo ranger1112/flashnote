@@ -17,7 +17,7 @@
 
 ## 数据
 
-默认保存到系统「文档」目录下的 `FlashNote\YYYY-MM-DD.md`（本机文档目录被重定向，实际为 `D:\Users\Phoebe\FlashNote`），可在设置里更换目录。
+默认保存到系统「文档」目录下的 `FlashNote\YYYY-MM-DD.md`，可在设置里更换目录。
 每条速记包含时间，以及（可选的）来源窗口标题：
 
 ```markdown
@@ -41,12 +41,14 @@ npm run tauri dev
 npm run tauri build
 ```
 
-本机已把 Rust 装在 `D:\dev\rust`、Build Tools 装在 `D:\BuildTools`，直接用封装脚本即可（会自动加载 MSVC 环境）：
+Windows 下可直接使用封装脚本（会自动加载 MSVC 环境）：
 
 ```bat
 scripts\dev.cmd
 scripts\build.cmd
 ```
+
+脚本里的工具链路径是示例，请按本机安装位置修改 `scripts\cargo.cmd` 等文件。
 
 ### 环境要求
 

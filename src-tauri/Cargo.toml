@@ -2,7 +2,7 @@
 name = "flashnote"
 version = "0.1.0"
 description = "不打断阅读的速记小窗"
-authors = ["Phoebe"]
+authors = ["ranger"]
 edition = "2021"
 rust-version = "1.77"
 
