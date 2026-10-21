@@ -427,6 +427,169 @@ kbd {
   user-select: text;
 }
 
+.history-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn.tiny {
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.entry-actions {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.entry:hover .entry-actions,
+.entry:focus-within .entry-actions {
+  opacity: 1;
+}
+
+.entry-action {
+  padding: 0 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+.entry-action:hover {
+  background: var(--bg-solid);
+  color: var(--text);
+}
+
+.entry-action.danger:hover,
+.entry-action.confirm {
+  color: #f87171;
+}
+
+.entry-edit-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.entry-edit {
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid var(--muted);
+  border-radius: 8px;
+  outline: none;
+  background: var(--hover);
+  color: var(--text);
+  font: 12.5px/1.55 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  user-select: text;
+}
+
+.entry-edit:focus {
+  border-color: var(--accent);
+}
+
+.entry-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.load-more {
+  display: block;
+  width: 100%;
+  margin: 8px 0 4px;
+  padding: 6px 0;
+}
+
+.entry-content.markdown {
+  white-space: normal;
+}
+
+.entry-content.markdown > :first-child {
+  margin-top: 0;
+}
+
+.entry-content.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.entry-content.markdown h1,
+.entry-content.markdown h2,
+.entry-content.markdown h3,
+.entry-content.markdown h4 {
+  margin: 8px 0 4px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.entry-content.markdown p,
+.entry-content.markdown ul,
+.entry-content.markdown ol,
+.entry-content.markdown blockquote,
+.entry-content.markdown pre,
+.entry-content.markdown table {
+  margin: 4px 0;
+}
+
+.entry-content.markdown ul,
+.entry-content.markdown ol {
+  padding-left: 18px;
+}
+
+.entry-content.markdown code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--hover);
+  font: 11.5px/1.5 Consolas, monospace;
+}
+
+.entry-content.markdown pre {
+  padding: 8px 10px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--hover);
+}
+
+.entry-content.markdown pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.entry-content.markdown blockquote {
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+
+.entry-content.markdown table {
+  border-collapse: collapse;
+}
+
+.entry-content.markdown th,
+.entry-content.markdown td {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+}
+
+.entry-content.markdown a {
+  color: var(--accent);
+}
+
+.entry-content.markdown img {
+  max-width: 100%;
+}
+
 .history-empty {
   margin: 24px 0 0;
   text-align: center;

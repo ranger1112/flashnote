@@ -501,10 +501,114 @@ pub fn update_markdown_mode(
 pub fn list_notes(
     state: State<'_, AppState>,
     limit: Option<u32>,
+    offset: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
     let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
-    notes::load_recent(&dir, limit.unwrap_or(200).clamp(1, 1000) as usize)
-        .map_err(|err| format!("读取笔记失败：{err}"))
+    notes::load_recent(
+        &dir,
+        limit.unwrap_or(200).clamp(1, 1000) as usize,
+        offset.unwrap_or(0) as usize,
+    )
+    .map_err(|err| format!("读取笔记失败：{err}"))
+}
+
+#[tauri::command]
+pub fn search_notes(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<notes::NoteEntry>, String> {
+    let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    notes::search_entries(&dir, &query, limit.unwrap_or(200).clamp(1, 1000) as usize)
+        .map_err(|err| format!("搜索笔记失败：{err}"))
+}
+
+/// 在笔记目录内改写单个文件：先备份，再原子替换。
+fn rewrite_note<F>(state: &AppState, path: &str, update: F) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let dir = notes_dir
+        .canonicalize()
+        .map_err(|err| format!("笔记目录不可用：{err}"))?;
+    let target = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|err| format!("文件不存在：{err}"))?;
+    if !target.starts_with(&dir) {
+        return Err("文件不在笔记目录中".to_string());
+    }
+
+    let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
+    let updated =
+        update(&text).ok_or_else(|| "没有找到这条笔记，可能已被其他程序修改".to_string())?;
+
+    let stem = target
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("notes");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let backup = target.with_file_name(format!("{stem}.md.bak-{stamp}"));
+    std::fs::copy(&target, &backup).map_err(|err| format!("备份失败：{err}"))?;
+
+    let tmp = target.with_extension("md.tmp");
+    std::fs::write(&tmp, updated.as_bytes()).map_err(|err| format!("写入失败：{err}"))?;
+    std::fs::rename(&tmp, &target).map_err(|err| format!("写入失败：{err}"))?;
+
+    prune_backups(&dir, stem);
+    Ok(())
+}
+
+/// 每个日期文件最多保留 5 份备份，避免长期使用后目录膨胀。
+fn prune_backups(dir: &Path, stem: &str) {
+    let prefix = format!("{stem}.md.bak-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut backups: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect();
+    backups.sort();
+    while backups.len() > 5 {
+        let oldest = backups.remove(0);
+        let _ = std::fs::remove_file(oldest);
+    }
+}
+
+#[tauri::command]
+pub fn delete_note_entry(
+    state: State<'_, AppState>,
+    path: String,
+    date: String,
+    time: String,
+    content: String,
+) -> Result<(), String> {
+    rewrite_note(&state, &path, |text| {
+        notes::remove_entry(text, &date, &time, &content)
+    })
+}
+
+#[tauri::command]
+pub fn update_note_entry(
+    state: State<'_, AppState>,
+    path: String,
+    date: String,
+    time: String,
+    content: String,
+    new_content: String,
+) -> Result<(), String> {
+    if new_content.trim().is_empty() {
+        return Err("内容不能为空".to_string());
+    }
+    rewrite_note(&state, &path, |text| {
+        notes::replace_entry(text, &date, &time, &content, &new_content)
+    })
 }
 
 #[tauri::command]

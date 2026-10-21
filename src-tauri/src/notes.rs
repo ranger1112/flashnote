@@ -60,26 +60,104 @@ pub struct NoteEntry {
     pub path: String,
 }
 
-struct ParsedEntry {
-    markdown: bool,
-    time: String,
-    content: Vec<String>,
-    source: Option<String>,
+/// 文件中的一个原始条目块，保留原始行，便于删除 / 编辑后重建。
+pub(crate) struct RawEntry {
+    pub time: String,
+    pub lines: Vec<String>,
 }
 
-impl ParsedEntry {
-    fn finish(self) -> Option<(String, String, Option<String>)> {
-        let content = self
-            .content
-            .join("\n")
-            .trim_matches('\n')
-            .trim_end()
-            .to_string();
-        if content.is_empty() {
-            return None;
+/// 把文件拆成「头部 + 条目块」。代码围栏内的标题行不会被当作新条目。
+pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
+    let mut header = Vec::new();
+    let mut blocks: Vec<RawEntry> = Vec::new();
+    let mut current: Option<RawEntry> = None;
+    let mut in_fence = false;
+
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r').to_string();
+
+        if in_fence {
+            if let Some(entry) = current.as_mut() {
+                entry.lines.push(line.clone());
+                if fence_marker(&line) {
+                    in_fence = false;
+                }
+            }
+            continue;
         }
-        Some((self.time, content, self.source))
+
+        if let Some(time) = markdown_time(&line).or_else(|| list_time(&line).map(|(time, _)| time))
+        {
+            if let Some(done) = current.take() {
+                blocks.push(done);
+            }
+            current = Some(RawEntry {
+                time,
+                lines: vec![line],
+            });
+            continue;
+        }
+
+        match current.as_mut() {
+            Some(entry) => {
+                if fence_marker(&line) {
+                    in_fence = true;
+                }
+                entry.lines.push(line);
+            }
+            None => header.push(line),
+        }
     }
+
+    if let Some(done) = current {
+        blocks.push(done);
+    }
+
+    for block in &mut blocks {
+        while block.lines.last().is_some_and(|line| line.is_empty()) {
+            block.lines.pop();
+        }
+    }
+    while header.last().is_some_and(|line| line.is_empty()) {
+        header.pop();
+    }
+
+    (header, blocks)
+}
+
+fn parse_block(block: &RawEntry) -> Option<(String, String, Option<String>)> {
+    let first = block.lines.first()?;
+    let mut content: Vec<String> = Vec::new();
+    let mut source = None;
+
+    if let Some((_, head)) = list_time(first) {
+        if !head.is_empty() {
+            content.push(head);
+        }
+        for line in &block.lines[1..] {
+            if let Some(value) = source_line(line) {
+                source = Some(value);
+                continue;
+            }
+            content.push(line.strip_prefix("  ").unwrap_or(line).to_string());
+        }
+    } else if markdown_time(first).is_some() {
+        for line in &block.lines[1..] {
+            if let Some(value) = source_line(line) {
+                source = Some(value);
+                continue;
+            }
+            content.push(line.clone());
+        }
+    } else {
+        return None;
+    }
+
+    let content = content.join("\n").trim_matches('\n').trim_end().to_string();
+    if content.is_empty() {
+        return None;
+    }
+    Some((block.time.clone(), content, source))
 }
 
 fn is_hhmm(value: &str) -> bool {
@@ -124,90 +202,71 @@ fn fence_marker(line: &str) -> bool {
 
 /// 解析单个日期文件，兼容紧凑列表与 Markdown 两种格式。
 pub fn parse_entries(text: &str) -> Vec<(String, String, Option<String>)> {
-    let mut entries = Vec::new();
-    let mut current: Option<ParsedEntry> = None;
-    let mut in_fence = false;
-
-    for raw in text.lines() {
-        let line = raw.trim_end_matches('\r');
-
-        if in_fence {
-            if let Some(entry) = current.as_mut() {
-                let content_line = if entry.markdown {
-                    line
-                } else {
-                    line.strip_prefix("  ").unwrap_or(line)
-                };
-                if fence_marker(content_line) {
-                    in_fence = false;
-                }
-                entry.content.push(content_line.to_string());
-            }
-            continue;
-        }
-
-        if let Some(time) = markdown_time(line) {
-            if let Some(done) = current.take().and_then(ParsedEntry::finish) {
-                entries.push(done);
-            }
-            current = Some(ParsedEntry {
-                markdown: true,
-                time,
-                content: Vec::new(),
-                source: None,
-            });
-            continue;
-        }
-
-        if let Some((time, first)) = list_time(line) {
-            if let Some(done) = current.take().and_then(ParsedEntry::finish) {
-                entries.push(done);
-            }
-            current = Some(ParsedEntry {
-                markdown: false,
-                time,
-                content: if first.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![first]
-                },
-                source: None,
-            });
-            continue;
-        }
-
-        let Some(entry) = current.as_mut() else {
-            continue;
-        };
-
-        if let Some(source) = source_line(line) {
-            entry.source = Some(source);
-            continue;
-        }
-
-        let content_line = if entry.markdown {
-            line
-        } else {
-            line.strip_prefix("  ").unwrap_or(line)
-        };
-        if fence_marker(content_line) {
-            in_fence = true;
-        }
-        entry.content.push(content_line.to_string());
-    }
-
-    if let Some(done) = current.and_then(ParsedEntry::finish) {
-        entries.push(done);
-    }
-    entries
+    split_entries(text)
+        .1
+        .iter()
+        .filter_map(parse_block)
+        .collect()
 }
 
-/// 读取最近的笔记，按日期与写入顺序倒序返回。
-pub fn load_recent(dir: &Path, limit: usize) -> std::io::Result<Vec<NoteEntry>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
+/// 用头部与条目块重建整个文件。
+fn render_file(date: &str, header: &[String], blocks: &[RawEntry]) -> String {
+    let head = if header.is_empty() {
+        format!("# {date}")
+    } else {
+        header.join("\n")
+    };
+    if blocks.is_empty() {
+        return format!("{head}\n");
     }
+    let body = blocks
+        .iter()
+        .map(|block| block.lines.join("\n"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("{head}\n\n{body}\n")
+}
 
+fn find_block(blocks: &[RawEntry], time: &str, content: &str) -> Option<usize> {
+    blocks.iter().position(|block| {
+        block.time == time && parse_block(block).is_some_and(|(_, value, _)| value == content)
+    })
+}
+
+/// 删除一条笔记；找不到时返回 `None`，调用方不应改写文件。
+pub fn remove_entry(text: &str, date: &str, time: &str, content: &str) -> Option<String> {
+    let (header, mut blocks) = split_entries(text);
+    let index = find_block(&blocks, time, content)?;
+    blocks.remove(index);
+    Some(render_file(date, &header, &blocks))
+}
+
+/// 原地替换一条笔记的内容，保留原有格式与来源。
+pub fn replace_entry(
+    text: &str,
+    date: &str,
+    time: &str,
+    content: &str,
+    new_content: &str,
+) -> Option<String> {
+    let (header, mut blocks) = split_entries(text);
+    let index = find_block(&blocks, time, content)?;
+    let markdown = markdown_time(&blocks[index].lines[0]).is_some();
+    let source = parse_block(&blocks[index]).and_then(|(_, _, source)| source);
+    let rendered = if markdown {
+        format_entry_markdown(time, new_content, source.as_deref())
+    } else {
+        format_entry(time, new_content, source.as_deref())
+    };
+    blocks[index] = RawEntry {
+        time: time.to_string(),
+        lines: rendered.lines().map(str::to_string).collect(),
+    };
+    Some(render_file(date, &header, &blocks))
+}
+
+/// 列出笔记目录中的日期文件，按日期倒序。
+fn note_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|item| item.ok())
         .map(|item| item.path())
@@ -221,9 +280,34 @@ pub fn load_recent(dir: &Path, limit: usize) -> std::io::Result<Vec<NoteEntry>> 
         })
         .collect();
     files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(files)
+}
 
+fn entry_for(
+    path: &Path,
+    date: &str,
+    time: String,
+    content: String,
+    source: Option<String>,
+) -> NoteEntry {
+    NoteEntry {
+        date: date.to_string(),
+        time,
+        content,
+        source,
+        path: path.to_string_lossy().to_string(),
+    }
+}
+
+/// 读取笔记，按日期与写入顺序倒序返回；`offset` 用于分页。
+pub fn load_recent(dir: &Path, limit: usize, offset: usize) -> std::io::Result<Vec<NoteEntry>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut skipped = 0usize;
     let mut result = Vec::new();
-    for path in files {
+    for path in note_files(dir)? {
         let date = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -235,15 +319,49 @@ pub fn load_recent(dir: &Path, limit: usize) -> std::io::Result<Vec<NoteEntry>> 
         let mut parsed = parse_entries(&text);
         parsed.reverse();
         for (time, content, source) in parsed {
-            result.push(NoteEntry {
-                date: date.clone(),
-                time,
-                content,
-                source,
-                path: path.to_string_lossy().to_string(),
-            });
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            result.push(entry_for(&path, &date, time, content, source));
             if result.len() >= limit {
                 return Ok(result);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// 全文搜索（不区分大小写），按日期与写入顺序倒序返回，最多 `limit` 条。
+pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<Vec<NoteEntry>> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    for path in note_files(dir)? {
+        let date = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("")
+            .to_string();
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut parsed = parse_entries(&text);
+        parsed.reverse();
+        for (time, content, source) in parsed {
+            let haystack = format!(
+                "{date} {time} {content} {}",
+                source.as_deref().unwrap_or("")
+            )
+            .to_lowercase();
+            if haystack.contains(&needle) {
+                result.push(entry_for(&path, &date, time, content, source));
+                if result.len() >= limit {
+                    return Ok(result);
+                }
             }
         }
     }
@@ -351,11 +469,95 @@ mod tests {
         append_note(&dir, "2026-10-20", "- 10:00 older").unwrap();
         append_note(&dir, "2026-10-21", "- 09:00 newer").unwrap();
 
-        let entries = load_recent(&dir, 10).unwrap();
+        let entries = load_recent(&dir, 10, 0).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].date, "2026-10-21");
         assert_eq!(entries[0].time, "09:00");
         assert_eq!(entries[1].date, "2026-10-20");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_recent_honors_offset() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-offset-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        append_note(&dir, "2026-10-21", "- 09:00 a\n\n- 10:00 b\n\n- 11:00 c").unwrap();
+
+        let first = load_recent(&dir, 1, 0).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].time, "11:00");
+
+        let second = load_recent(&dir, 1, 1).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].time, "10:00");
+
+        assert!(load_recent(&dir, 10, 5).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removes_entry_and_keeps_others() {
+        let text = "# 2026-10-21\n\n- 10:00 a\n\n- 11:00 b\n";
+        let updated = remove_entry(text, "2026-10-21", "10:00", "a").unwrap();
+        assert_eq!(updated, "# 2026-10-21\n\n- 11:00 b\n");
+    }
+
+    #[test]
+    fn remove_returns_none_when_entry_missing() {
+        let text = "# 2026-10-21\n\n- 10:00 a\n";
+        assert!(remove_entry(text, "2026-10-21", "10:00", "other").is_none());
+        assert!(remove_entry(text, "2026-10-21", "11:00", "a").is_none());
+    }
+
+    #[test]
+    fn removes_last_entry_leaving_header() {
+        let text = "# 2026-10-21\n\n- 10:00 a\n";
+        let updated = remove_entry(text, "2026-10-21", "10:00", "a").unwrap();
+        assert_eq!(updated, "# 2026-10-21\n");
+    }
+
+    #[test]
+    fn replaces_entry_content_in_place() {
+        let text = "# 2026-10-21\n\n- 10:00 old\n  _来源：Chrome_\n\n- 11:00 b\n";
+        let updated = replace_entry(text, "2026-10-21", "10:00", "old", "new line").unwrap();
+        assert_eq!(
+            updated,
+            "# 2026-10-21\n\n- 10:00 new line\n  _来源：Chrome_\n\n- 11:00 b\n"
+        );
+    }
+
+    #[test]
+    fn replace_keeps_markdown_format() {
+        let text = "# 2026-10-21\n\n### 10:00\n## 标题\n\n<!-- 来源：VS Code -->\n";
+        let updated = replace_entry(text, "2026-10-21", "10:00", "## 标题", "## 新标题").unwrap();
+        assert_eq!(
+            updated,
+            "# 2026-10-21\n\n### 10:00\n## 新标题\n\n<!-- 来源：VS Code -->\n"
+        );
+    }
+
+    #[test]
+    fn searches_all_files_case_insensitively() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-search-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        append_note(&dir, "2026-10-20", "- 10:00 Rust 所有权\n  _来源：Chrome_").unwrap();
+        append_note(&dir, "2026-10-21", "- 09:00 无关键词").unwrap();
+
+        let hits = search_entries(&dir, "rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].date, "2026-10-20");
+        assert_eq!(hits[0].content, "Rust 所有权");
+
+        let by_source = search_entries(&dir, "chrome", 10).unwrap();
+        assert_eq!(by_source.len(), 1);
+
+        assert!(search_entries(&dir, "  ", 10).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 
 interface Settings {
   notesDir: string;
@@ -55,6 +57,7 @@ const historyClose = el<HTMLButtonElement>("history-close");
 const historySearch = el<HTMLInputElement>("history-search");
 const historyCount = el<HTMLSpanElement>("history-count");
 const historyFolder = el<HTMLButtonElement>("history-folder");
+const historyPreview = el<HTMLButtonElement>("history-preview");
 const entryList = el<HTMLDivElement>("entry-list");
 const settingsPanel = el<HTMLElement>("settings");
 const settingsClose = el<HTMLButtonElement>("settings-close");
@@ -89,8 +92,16 @@ let pinned = false;
 let recording = false;
 let toastTimer: number | undefined;
 let draftTimer: number | undefined;
+let searchTimer: number | undefined;
 let appReady = false;
 let notes: NoteEntry[] = [];
+let noteOffset = 0;
+let hasMoreNotes = false;
+let serverFiltered = false;
+let searchSeq = 0;
+
+const PAGE_SIZE = 100;
+const SEARCH_LIMIT = 200;
 
 function formatAccel(accel: string): string {
   return accel
@@ -335,22 +346,153 @@ async function dismissWelcome(openSettingsAfter = false): Promise<void> {
   }
 }
 
+function matchesTerm(note: NoteEntry, term: string): boolean {
+  return [note.date, note.time, note.content, note.source ?? ""].some((value) =>
+    value.toLowerCase().includes(term),
+  );
+}
+
+function markdownHtml(markdown: string): string {
+  const html = marked.parse(markdown, { async: false });
+  return DOMPurify.sanitize(String(html));
+}
+
+function paintPreviewButton(): void {
+  historyPreview.setAttribute("aria-pressed", String(settings.historyPreview));
+  historyPreview.textContent = settings.historyPreview ? "原文" : "预览";
+}
+
+function bindDelete(button: HTMLButtonElement, note: NoteEntry): void {
+  let confirmTimer: number | undefined;
+  const reset = (): void => {
+    if (confirmTimer !== undefined) window.clearTimeout(confirmTimer);
+    confirmTimer = undefined;
+    button.dataset.confirm = "";
+    button.textContent = "删除";
+    button.classList.remove("confirm");
+  };
+
+  button.addEventListener("click", () => {
+    if (button.dataset.confirm === "1") {
+      reset();
+      void deleteEntry(note);
+      return;
+    }
+    button.dataset.confirm = "1";
+    button.textContent = "确认";
+    button.classList.add("confirm");
+    confirmTimer = window.setTimeout(reset, 3000);
+  });
+}
+
+async function deleteEntry(note: NoteEntry): Promise<void> {
+  try {
+    await invoke("delete_note_entry", {
+      path: note.path,
+      date: note.date,
+      time: note.time,
+      content: note.content,
+    });
+    toast("已删除");
+    refreshNotes();
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButtonElement): void {
+  if (contentEl.dataset.editing === "1") return;
+  contentEl.dataset.editing = "1";
+
+  const wrap = document.createElement("div");
+  wrap.className = "entry-edit-wrap";
+
+  const editor = document.createElement("textarea");
+  editor.className = "entry-edit";
+  editor.value = note.content;
+  editor.rows = Math.min(10, Math.max(2, note.content.split("\n").length + 1));
+  editor.setAttribute("aria-label", "编辑笔记内容");
+
+  const actions = document.createElement("div");
+  actions.className = "entry-edit-actions";
+
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn tiny primary";
+  save.textContent = "保存";
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn tiny";
+  cancel.textContent = "取消";
+
+  const close = (): void => {
+    wrap.replaceWith(contentEl);
+    contentEl.dataset.editing = "";
+    editButton.focus();
+  };
+
+  cancel.addEventListener("click", close);
+
+  const commit = async (): Promise<void> => {
+    const value = editor.value.trim();
+    if (!value) {
+      toast("内容不能为空", true);
+      return;
+    }
+    if (value === note.content) {
+      close();
+      return;
+    }
+    save.disabled = true;
+    try {
+      await invoke("update_note_entry", {
+        path: note.path,
+        date: note.date,
+        time: note.time,
+        content: note.content,
+        newContent: value,
+      });
+      toast("已更新");
+      refreshNotes();
+    } catch (error) {
+      save.disabled = false;
+      toast(String(error), true);
+    }
+  };
+
+  save.addEventListener("click", () => void commit());
+  editor.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      void commit();
+    }
+  });
+
+  actions.append(save, cancel);
+  wrap.append(editor, actions);
+  contentEl.replaceWith(wrap);
+  editor.focus();
+  editor.setSelectionRange(editor.value.length, editor.value.length);
+}
+
 function renderNotes(): void {
-  const term = historySearch.value.trim().toLowerCase();
-  const filtered = term
-    ? notes.filter((note) =>
-        [note.date, note.time, note.content, note.source ?? ""].some((value) =>
-          value.toLowerCase().includes(term),
-        ),
-      )
-    : notes;
+  const term = serverFiltered ? "" : historySearch.value.trim().toLowerCase();
+  const filtered = term ? notes.filter((note) => matchesTerm(note, term)) : notes;
 
   entryList.replaceChildren();
 
   if (filtered.length === 0) {
     const empty = document.createElement("p");
     empty.className = "history-empty";
-    empty.textContent = notes.length === 0 ? "还没有记录" : "没有匹配的笔记";
+    empty.textContent =
+      notes.length === 0 && !serverFiltered ? "还没有记录" : "没有匹配的笔记";
     entryList.append(empty);
   } else {
     let lastDate = "";
@@ -381,6 +523,23 @@ function renderNotes(): void {
         head.append(source);
       }
 
+      const actions = document.createElement("div");
+      actions.className = "entry-actions";
+
+      const editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.className = "entry-action";
+      editButton.textContent = "编辑";
+      editButton.title = "编辑这条笔记";
+
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "entry-action danger";
+      deleteButton.textContent = "删除";
+      deleteButton.title = "删除这条笔记";
+
+      actions.append(editButton, deleteButton);
+
       const openButton = document.createElement("button");
       openButton.type = "button";
       openButton.className = "entry-open";
@@ -392,30 +551,125 @@ function renderNotes(): void {
           toast(String(error), true),
         );
       });
-      head.append(openButton);
+
+      head.append(actions, openButton);
 
       const content = document.createElement("div");
       content.className = "entry-content";
-      content.textContent = note.content;
+      if (settings.historyPreview) {
+        content.classList.add("markdown");
+        content.innerHTML = markdownHtml(note.content);
+      } else {
+        content.textContent = note.content;
+      }
+
+      editButton.addEventListener("click", () => startEdit(note, content, editButton));
+      bindDelete(deleteButton, note);
 
       entry.append(head, content);
       entryList.append(entry);
     }
+
+    if (!serverFiltered && hasMoreNotes) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "btn load-more";
+      more.textContent = "加载更多";
+      more.addEventListener("click", () => {
+        more.disabled = true;
+        more.textContent = "加载中…";
+        void loadNotes(false);
+      });
+      entryList.append(more);
+    }
   }
 
-  historyCount.textContent = term
-    ? `${filtered.length} / ${notes.length} 条`
-    : `共 ${notes.length} 条`;
+  if (serverFiltered) {
+    historyCount.textContent =
+      filtered.length >= SEARCH_LIMIT
+        ? `前 ${filtered.length} 条结果`
+        : `${filtered.length} 条结果`;
+  } else if (term) {
+    historyCount.textContent = `${filtered.length} / ${notes.length} 条`;
+  } else {
+    historyCount.textContent = hasMoreNotes ? `已显示 ${notes.length} 条` : `共 ${notes.length} 条`;
+  }
 }
 
-async function loadNotes(): Promise<void> {
+async function loadNotes(reset = true): Promise<void> {
+  const seq = ++searchSeq;
+  if (reset) noteOffset = 0;
+
   try {
-    notes = await invoke<NoteEntry[]>("list_notes", { limit: 200 });
+    const batch = await invoke<NoteEntry[]>("list_notes", {
+      limit: PAGE_SIZE,
+      offset: noteOffset,
+    });
+    if (seq !== searchSeq) return;
+    notes = reset ? batch : [...notes, ...batch];
+    noteOffset = notes.length;
+    hasMoreNotes = batch.length === PAGE_SIZE;
+    serverFiltered = false;
   } catch (error) {
-    notes = [];
+    if (seq !== searchSeq) return;
+    if (reset) notes = [];
+    hasMoreNotes = false;
     toast(String(error), true);
   }
   renderNotes();
+  if (reset) entryList.scrollTop = 0;
+}
+
+async function runSearch(): Promise<void> {
+  const seq = ++searchSeq;
+  const term = historySearch.value.trim();
+  if (!term) {
+    serverFiltered = false;
+    await loadNotes(true);
+    return;
+  }
+
+  try {
+    const results = await invoke<NoteEntry[]>("search_notes", {
+      query: term,
+      limit: SEARCH_LIMIT,
+    });
+    if (seq !== searchSeq) return;
+    notes = results;
+    noteOffset = 0;
+    hasMoreNotes = false;
+    serverFiltered = true;
+  } catch (error) {
+    if (seq !== searchSeq) return;
+    notes = [];
+    serverFiltered = true;
+    toast(String(error), true);
+  }
+  renderNotes();
+  entryList.scrollTop = 0;
+}
+
+function refreshNotes(): void {
+  if (historySearch.value.trim()) {
+    void runSearch();
+  } else {
+    void loadNotes(true);
+  }
+}
+
+async function toggleHistoryPreview(): Promise<void> {
+  const next = !settings.historyPreview;
+  settings.historyPreview = next;
+  paintPreviewButton();
+  renderNotes();
+  try {
+    await invoke("update_history_preview", { enabled: next });
+  } catch (error) {
+    settings.historyPreview = !next;
+    paintPreviewButton();
+    renderNotes();
+    toast(String(error), true);
+  }
 }
 
 function openHistory(): void {
@@ -425,10 +679,14 @@ function openHistory(): void {
   setBackgroundInert(true);
   historySearch.value = "";
   notes = [];
+  serverFiltered = false;
+  noteOffset = 0;
+  hasMoreNotes = false;
+  paintPreviewButton();
   entryList.replaceChildren();
   historyCount.textContent = "";
   historySearch.focus();
-  void loadNotes();
+  void loadNotes(true);
 }
 
 function startRecording(): void {
@@ -468,6 +726,7 @@ async function init(): Promise<void> {
     await refreshSettings();
     pinned = settings.pinned;
     paintPin();
+    paintPreviewButton();
 
     try {
       autostartCheck.checked = await isEnabled();
@@ -543,7 +802,14 @@ settingsButton.addEventListener("click", openSettings);
 settingsClose.addEventListener("click", closeSettings);
 notesButton.addEventListener("click", openHistory);
 historyClose.addEventListener("click", closeHistory);
-historySearch.addEventListener("input", renderNotes);
+historyPreview.addEventListener("click", () => void toggleHistoryPreview());
+historySearch.addEventListener("input", () => {
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => {
+    searchTimer = undefined;
+    void runSearch();
+  }, 250);
+});
 historyFolder.addEventListener("click", () => {
   void invoke("open_notes_dir").catch((error) => toast(String(error), true));
 });
@@ -624,6 +890,9 @@ window.addEventListener(
 
     trapFocus(event);
 
+    // 条目编辑框自己处理 Esc / Ctrl+Enter，避免误关整个面板
+    if ((event.target as HTMLElement | null)?.closest(".entry-edit")) return;
+
     if (event.key === "Escape") {
       event.preventDefault();
       if (!welcomePanel.classList.contains("hidden")) {
@@ -661,7 +930,7 @@ void listen<ShowPayload>("window-shown", (event) => {
   setSource(event.payload.source);
   if (!appReady) return;
   if (!historyPanel.classList.contains("hidden")) {
-    void loadNotes();
+    refreshNotes();
     return;
   }
   if (!settingsPanel.classList.contains("hidden")) return;

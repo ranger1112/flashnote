@@ -120,12 +120,23 @@
       >
         <div class="settings-head">
           <span id="history-title">笔记</span>
-          <button id="history-close" class="icon-btn" aria-label="关闭笔记">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M18 6 6 18" />
-              <path d="m6 6 12 12" />
-            </svg>
-          </button>
+          <div class="history-tools">
+            <button
+              id="history-preview"
+              class="btn tiny"
+              type="button"
+              aria-pressed="false"
+              title="切换 Markdown 渲染预览"
+            >
+              预览
+            </button>
+            <button id="history-close" class="icon-btn" aria-label="关闭笔记">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         <input
