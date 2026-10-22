@@ -1,10 +1,17 @@
 # 闪记 FlashNote
 
+**中文** | [English](README.en.md)
+
 > 看文章、看视频时不打断思路的桌面速记小窗。
 
 按一下全局快捷键，小窗浮在当前窗口上方；写下想法，`Ctrl+Enter` 保存，窗口自动收起，焦点回到原来的文章或播放器。内容按日期追加到本地 Markdown 文件，不注册账号、不上传云端。
 
 **下载**：[最新版本](https://github.com/ranger1112/flashnote/releases/latest)
+
+| 小窗（浅色） | 小窗（深色） |
+| --- | --- |
+| ![浅色主题小窗](docs/screenshot-light.png) | ![深色主题小窗](docs/screenshot-dark.png) |
+| ![笔记历史](docs/history.png) | ![设置面板](docs/settings.png) |
 
 ## 特性
 
@@ -260,6 +267,32 @@ flashnote/
 - 全局快捷键被其他程序占用时需要在设置里更换。
 - 笔记文件只追加不轮转，长期使用后单日文件会逐渐变大。
 - 安装包未做代码签名。
+
+## 常见问题
+
+**按了快捷键没反应？**
+
+多半是被其他程序占用了。启动时如果默认快捷键注册失败，闪记会依次尝试 `Ctrl+Alt+M`、`Ctrl+Shift+Alt+N`，并在窗口里提示。也可以右键托盘图标 → 设置，点「录制」换一个组合；快捷键必须包含 Ctrl / Alt / Shift / Win 中的至少一个。
+
+**笔记存在哪里？**
+
+默认在 `%USERPROFILE%\Documents\FlashNote`，每个日期一个 Markdown 文件；设置里可以改目录，托盘菜单可直接打开。草稿和设置存放在 `%APPDATA%\com.phoebe.flashnote`，日志在 `%LOCALAPPDATA%\com.phoebe.flashnote\logs`。
+
+**怎么卸载？**
+
+Windows「设置 → 应用」里卸载「闪记」，或运行安装目录（`%LOCALAPPDATA%\闪记`）下的 `uninstall.exe`。笔记目录不会被删除，需要时手动清理即可。
+
+**为什么 Windows 提示「Windows 已保护你的电脑」？**
+
+安装包没有做代码签名，SmartScreen 对下载量少的新程序会拦截：点「更多信息」→「仍要运行」即可。也可以用 Release 里的 `SHA256SUMS.txt` 校验文件完整性。
+
+**升级会动我的笔记吗？**
+
+不会。自动更新只替换程序文件；笔记、设置和草稿都在用户目录下，升级和卸载都不会碰它们。
+
+**关闭「自动检查更新」后还会联网吗？**
+
+不会主动联网。关闭后只有手动点「检查更新」时才会访问 GitHub Releases。
 
 ## 参与贡献
 
