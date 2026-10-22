@@ -784,6 +784,54 @@ kbd {
   color: var(--text);
   font: 12px/1.4 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
   cursor: pointer;
+  /* 用 Chromium 的可定制下拉（WebView2 135+），避免原生弹层不跟随深浅色 */
+  appearance: base-select;
+}
+
+.select::picker-icon {
+  margin-left: 4px;
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.select:open::picker-icon {
+  transform: rotate(180deg);
+}
+
+.select::picker(select) {
+  appearance: base-select;
+  margin-top: 6px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  font: 12px/1.4 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+}
+
+.select option {
+  padding: 6px 8px;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.select option:hover,
+.select option:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.select option:checked {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.select option::checkmark {
+  color: var(--accent);
 }
 
 input[type="range"] {
