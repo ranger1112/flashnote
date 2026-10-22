@@ -134,6 +134,14 @@ function hideUpdateBanner(): void {
 
 async function checkForUpdate(manual: boolean): Promise<void> {
   if (updating) return;
+  // 已下载安装但尚未重启时，再查一次仍会返回同一版本，直接提示重启即可
+  if (updateReady) {
+    if (manual) {
+      updateStatus.textContent = "更新已安装，重启后生效";
+      showUpdateBanner("更新已安装，重启后生效", "重启");
+    }
+    return;
+  }
   if (manual) {
     checkUpdateButton.disabled = true;
     updateStatus.textContent = "正在检查更新…";
