@@ -280,14 +280,25 @@ kbd {
   z-index: 10;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px 16px 14px;
-  overflow-y: auto;
+  padding: 12px 16px 4px;
+  overflow: hidden;
   background: var(--bg-solid);
 }
 
 .settings.hidden {
   display: none;
+}
+
+/* 标题固定，只有下面的功能区滚动 */
+.settings-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .history {
@@ -313,12 +324,23 @@ kbd {
   flex-direction: column;
   gap: 12px;
   padding: 16px 20px 18px;
-  overflow-y: auto;
+  overflow: hidden;
   background: var(--bg-solid);
 }
 
 .welcome.hidden {
   display: none;
+}
+
+/* 引导文案滚动，底部按钮固定 */
+.welcome-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .welcome-lead {
@@ -639,6 +661,7 @@ kbd {
 }
 
 .settings-head {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;

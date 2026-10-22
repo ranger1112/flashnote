@@ -87,52 +87,54 @@
           </button>
         </div>
 
-        <div class="field">
-          <label for="hotkey-input">唤起快捷键</label>
-          <div class="row">
-            <input id="hotkey-input" readonly />
-            <button id="hotkey-record" class="btn">录制</button>
+        <div class="settings-body">
+          <div class="field">
+            <label for="hotkey-input">唤起快捷键</label>
+            <div class="row">
+              <input id="hotkey-input" readonly />
+              <button id="hotkey-record" class="btn">录制</button>
+            </div>
+            <p id="hotkey-error" class="error"></p>
           </div>
-          <p id="hotkey-error" class="error"></p>
-        </div>
 
-        <div class="field">
-          <label for="notes-dir">笔记目录</label>
-          <div class="row">
-            <input id="notes-dir" readonly />
-            <button id="choose-dir" class="btn">选择</button>
+          <div class="field">
+            <label for="notes-dir">笔记目录</label>
+            <div class="row">
+              <input id="notes-dir" readonly />
+              <button id="choose-dir" class="btn">选择</button>
+            </div>
           </div>
-        </div>
 
-        <label class="check">
-          <input id="capture-source" type="checkbox" />
-          自动记录来源窗口
-        </label>
+          <label class="check">
+            <input id="capture-source" type="checkbox" />
+            自动记录来源窗口
+          </label>
 
-        <label class="check" title="每条写成 ### 时间 + 原文，代码块、表格、标题可正常渲染">
-          <input id="markdown-mode" type="checkbox" />
-          Markdown 模式
-        </label>
+          <label class="check" title="每条写成 ### 时间 + 原文，代码块、表格、标题可正常渲染">
+            <input id="markdown-mode" type="checkbox" />
+            Markdown 模式
+          </label>
 
-        <label class="check">
-          <input id="autostart" type="checkbox" />
-          开机自启
-        </label>
+          <label class="check">
+            <input id="autostart" type="checkbox" />
+            开机自启
+          </label>
 
-        <label class="check">
-          <input id="auto-update" type="checkbox" />
-          自动检查更新
-        </label>
+          <label class="check">
+            <input id="auto-update" type="checkbox" />
+            自动检查更新
+          </label>
 
-        <div class="field">
-          <div class="row">
-            <span class="tip">当前版本 <span id="app-version">—</span></span>
-            <button id="check-update" class="btn" type="button">检查更新</button>
+          <div class="field">
+            <div class="row">
+              <span class="tip">当前版本 <span id="app-version">—</span></span>
+              <button id="check-update" class="btn" type="button">检查更新</button>
+            </div>
+            <p id="update-status" class="tip" aria-live="polite"></p>
           </div>
-          <p id="update-status" class="tip" aria-live="polite"></p>
-        </div>
 
-        <p class="tip">笔记按日期保存为本地 Markdown 文件。</p>
+          <p class="tip">笔记按日期保存为本地 Markdown 文件。</p>
+        </div>
       </section>
 
       <section
@@ -191,12 +193,14 @@
         <div class="settings-head">
           <span id="welcome-title">欢迎使用闪记</span>
         </div>
-        <p class="welcome-lead">按一下快捷键，就能在任何窗口上方随手记一笔。</p>
-        <ul class="welcome-list">
-          <li><span class="welcome-key" id="welcome-hotkey">Ctrl + Alt + N</span> 唤起 / 收起</li>
-          <li>笔记保存在 <code id="welcome-dir"></code></li>
-          <li>点图钉可切换「保存后不收起」</li>
-        </ul>
+        <div class="welcome-body">
+          <p class="welcome-lead">按一下快捷键，就能在任何窗口上方随手记一笔。</p>
+          <ul class="welcome-list">
+            <li><span class="welcome-key" id="welcome-hotkey">Ctrl + Alt + N</span> 唤起 / 收起</li>
+            <li>笔记保存在 <code id="welcome-dir"></code></li>
+            <li>点图钉可切换「保存后不收起」</li>
+          </ul>
+        </div>
         <div class="welcome-actions">
           <button id="welcome-settings" class="btn">调整快捷键</button>
           <button id="welcome-start" class="btn primary">开始使用</button>
