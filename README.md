@@ -162,7 +162,7 @@ src-tauri\target\release\bundle\nsis\闪记_0.3.0_x64-setup.exe
 ### 环境要求
 
 - Windows 10 / 11
-- Node.js 20+
+- Node.js 22.12+ 或 24 LTS
 - Rust stable（MSVC 工具链）
 - Visual Studio Build Tools 2022，勾选「使用 C++ 的桌面开发」
 - WebView2 运行时（Windows 10 1803+ 一般已自带）
@@ -213,13 +213,13 @@ Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件
 把 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 三处版本改成同一个值后打 tag：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v<version>
+git push origin v<version>
 ```
 
 `.github/workflows/release.yml` 会自动构建 NSIS 安装包与便携版 zip、生成 `SHA256SUMS.txt`，并创建一个 **draft** Release；检查无误后在 GitHub 上点发布。版本号不一致时工作流会直接失败，避免发出 tag 与安装包版本不符的包。
 
-自动更新依赖仓库的两个 Actions secret：`TAURI_SIGNING_PRIVATE_KEY`（minisign 私钥全文）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会用它们生成 `.sig` 与 `latest.json`；缺少时构建出来的包无法通过更新校验。私钥只在本地备份，不要提交进仓库。发布后 `latest.json` 的地址是：
+自动更新依赖仓库的两个 Actions secret：`TAURI_SIGNING_PRIVATE_KEY`（minisign 私钥全文）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会用它们生成 `.sig` 与 `latest.json`；缺少时 Tauri 会直接中止构建，不会产出安装包。私钥只在本地备份，不要提交进仓库。发布后 `latest.json` 的地址是：
 
 ```
 https://github.com/ranger1112/flashnote/releases/latest/download/latest.json
@@ -234,6 +234,8 @@ flashnote/
 ├─ index.html                  # 小窗与设置面板的 DOM 结构
 ├─ src/
 │  ├─ main.ts                  # 前端状态与交互（保存、热键录制、草稿）
+│  ├─ lib.ts                   # 纯函数：快捷键解析、搜索匹配、分页偏移
+│  ├─ lib.test.ts              # 前端单元测试（Vitest）
 │  └─ styles.css               # 深/浅色主题、悬浮卡片样式
 ├─ src-tauri/
 │  ├─ src/
@@ -303,6 +305,7 @@ Windows「设置 → 应用」里卸载「闪记」，或运行安装目录（`%
 欢迎提交 Issue 和 Pull Request，具体流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。提交前请确认：
 
 - `npm run build`（类型检查 + 前端构建）通过；
+- `npm test`（前端单元测试）通过；
 - `cd src-tauri && cargo test` 通过；
 - 不提交 `node_modules/`、`dist/`、`src-tauri/target/` 等生成目录。
 
