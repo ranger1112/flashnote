@@ -94,3 +94,26 @@ export function matchesTerm(
     value.toLowerCase().includes(term),
   );
 }
+
+/** 两条笔记是否同一条：与后端 delete_note_entry 的定位参数保持一致。 */
+export function sameEntry(left: NoteEntry, right: NoteEntry): boolean {
+  return (
+    left.path === right.path &&
+    left.date === right.date &&
+    left.time === right.time &&
+    left.content === right.content
+  );
+}
+
+/** 从列表里剔掉指定条目，用于过滤服务端返回的、尚未落盘的待删除项。 */
+export function withoutEntry<T extends NoteEntry>(list: T[], target: NoteEntry): T[] {
+  return list.filter((note) => !sameEntry(note, target));
+}
+
+/**
+ * 分页偏移推进：reset 时等于本批行数，否则累加。
+ * 用服务端返回的行数而不是渲染后的条数，避免客户端过滤把偏移算小、导致重复拉取。
+ */
+export function nextOffset(previous: number, batchLength: number, reset: boolean): number {
+  return reset ? batchLength : previous + batchLength;
+}

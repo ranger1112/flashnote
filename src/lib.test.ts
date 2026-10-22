@@ -4,9 +4,13 @@ import {
   clampOpacity,
   formatAccel,
   matchesTerm,
+  nextOffset,
   normalizeTheme,
   resolveTheme,
+  sameEntry,
+  withoutEntry,
   type AccelEvent,
+  type NoteEntry,
 } from "./lib";
 
 function key(partial: Partial<AccelEvent>): AccelEvent {
@@ -141,5 +145,59 @@ describe("matchesTerm", () => {
 
   it("不匹配时返回 false", () => {
     expect(matchesTerm(note, "不存在")).toBe(false);
+  });
+});
+
+function note(overrides: Partial<NoteEntry> = {}): NoteEntry {
+  return {
+    date: "2026-10-22",
+    time: "10:00",
+    content: "记一笔",
+    source: null,
+    path: "2026-10-22.md",
+    ...overrides,
+  };
+}
+
+describe("sameEntry", () => {
+  it("定位参数全一致时认为是同一条", () => {
+    expect(sameEntry(note(), note())).toBe(true);
+  });
+
+  it("时间或正文不同即不是同一条", () => {
+    expect(sameEntry(note(), note({ time: "10:01" }))).toBe(false);
+    expect(sameEntry(note(), note({ content: "另一条" }))).toBe(false);
+  });
+
+  it("来源不影响身份判断（后端删除时也不看来源）", () => {
+    expect(sameEntry(note(), note({ source: "https://example.com" }))).toBe(true);
+  });
+});
+
+describe("withoutEntry", () => {
+  it("剔除匹配的条目并保留其余顺序", () => {
+    const list = [note({ time: "09:00" }), note({ time: "10:00" }), note({ time: "11:00" })];
+    expect(withoutEntry(list, note({ time: "10:00" })).map((item) => item.time)).toEqual([
+      "09:00",
+      "11:00",
+    ]);
+  });
+
+  it("没有匹配时原样返回内容，不修改入参", () => {
+    const list = [note({ time: "09:00" })];
+    expect(withoutEntry(list, note({ time: "10:00" }))).toEqual(list);
+    expect(list).toHaveLength(1);
+  });
+});
+
+describe("nextOffset", () => {
+  it("重置时取本批行数", () => {
+    expect(nextOffset(0, 100, true)).toBe(100);
+    expect(nextOffset(500, 30, true)).toBe(30);
+  });
+
+  it("追加时累加，即使本批有被客户端过滤掉的行也不回退", () => {
+    expect(nextOffset(100, 100, false)).toBe(200);
+    expect(nextOffset(200, 35, false)).toBe(235);
   });
 });
