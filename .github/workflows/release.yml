@@ -147,7 +147,13 @@ jobs:
             "$hash  $($entry.Name)"
           }
 
-          $lines | Set-Content -Path SHA256SUMS.txt -Encoding ascii
+          # 统一用 LF 换行，方便在 Git Bash / WSL 里直接 `sha256sum -c SHA256SUMS.txt`
+          $content = ($lines -join "`n") + "`n"
+          [System.IO.File]::WriteAllText(
+            "SHA256SUMS.txt",
+            $content,
+            (New-Object System.Text.UTF8Encoding($false))
+          )
           Get-Content SHA256SUMS.txt
 
       - name: 上传便携版与校验和
