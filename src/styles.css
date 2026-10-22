@@ -411,6 +411,16 @@ kbd {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* 兜底：toast、图标、下拉箭头等所有散落的 transition 一并关掉 */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
   .panel-enter,
   .panel-leave {
     animation: none;
@@ -783,6 +793,12 @@ kbd {
   background: var(--hover);
   color: var(--text);
   font: 12px/1.4 Consolas, monospace;
+}
+
+/* 只读框也要能被键盘看见焦点；上面的 outline: none 优先级更高，这里补回来 */
+.row input[readonly]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .select {
