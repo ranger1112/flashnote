@@ -733,11 +733,7 @@ pub fn update_auto_hide(
 }
 
 #[tauri::command]
-pub fn update_background_opacity(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    opacity: f64,
-) -> f64 {
+pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opacity: f64) -> f64 {
     let applied = settings::clamp_opacity(opacity);
     state.settings.lock().unwrap().background_opacity = applied;
     persist(&app);

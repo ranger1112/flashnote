@@ -2,14 +2,85 @@ use chrono::{DateTime, Local, NaiveDate};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 
-fn normalized_source(source: Option<&str>) -> Option<String> {
-    source
-        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|value| !value.is_empty())
+/// 来源标题来自前台窗口，属于外部不可信数据：写入 Markdown 前压平空白、限长，
+/// 并消除会破坏斜体包裹或 HTML 注释的序列。
+fn sanitize_source(source: Option<&str>) -> Option<String> {
+    let flat = source.map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))?;
+    if flat.is_empty() {
+        return None;
+    }
+
+    let limited: String = flat.chars().take(200).collect();
+    let mut out = String::with_capacity(limited.len());
+    let mut chars = limited.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\\' => out.push_str("\\\\"),
+            '_' => out.push_str("\\_"),
+            '*' => out.push_str("\\*"),
+            '`' => out.push_str("\\`"),
+            '-' if chars.peek() == Some(&'-') => {
+                // HTML 注释内不能出现连续的 `--`
+                out.push_str("- -");
+                chars.next();
+            }
+            _ => out.push(ch),
+        }
+    }
+    Some(out)
+}
+
+fn decode_entities(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        if let Some(after) = tail.strip_prefix("&amp;") {
+            out.push('&');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&lt;") {
+            out.push('<');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&gt;") {
+            out.push('>');
+            rest = after;
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `sanitize_source` 的逆操作，保证来源字段读写 round-trip 一致。
+fn decode_source(raw: &str) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(normalized.len());
+    let mut chars = normalized.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek().copied() {
+                Some(next) if matches!(next, '\\' | '_' | '*' | '`') => {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    decode_entities(&out).replace("- -", "--")
 }
 
 /// 把一条速记渲染成 Markdown 列表项。
@@ -28,7 +99,7 @@ pub fn format_entry(time: &str, content: &str, source: Option<&str>) -> String {
         }
     }
 
-    if let Some(source) = normalized_source(source) {
+    if let Some(source) = sanitize_source(source) {
         out.push_str("\n  _来源：");
         out.push_str(&source);
         out.push('_');
@@ -41,7 +112,7 @@ pub fn format_entry(time: &str, content: &str, source: Option<&str>) -> String {
 pub fn format_entry_markdown(time: &str, content: &str, source: Option<&str>) -> String {
     let mut out = format!("### {time}\n{}", content.trim());
 
-    if let Some(source) = normalized_source(source) {
+    if let Some(source) = sanitize_source(source) {
         out.push_str("\n\n<!-- 来源：");
         out.push_str(&source);
         out.push_str(" -->");
@@ -71,42 +142,51 @@ pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
     let mut header = Vec::new();
     let mut blocks: Vec<RawEntry> = Vec::new();
     let mut current: Option<RawEntry> = None;
-    let mut in_fence = false;
+    let mut open_fence: Option<Fence> = None;
+    let mut previous_blank = true;
 
     for raw in text.lines() {
         let line = raw.trim_end_matches('\r').to_string();
+        let is_blank = line.trim().is_empty();
 
-        if in_fence {
+        if let Some(open) = open_fence {
             if let Some(entry) = current.as_mut() {
                 entry.lines.push(line.clone());
-                if fence_marker(&line) {
-                    in_fence = false;
-                }
             }
+            if closes_fence(&line, open) {
+                open_fence = None;
+            }
+            previous_blank = is_blank;
             continue;
         }
 
-        if let Some(time) = markdown_time(&line).or_else(|| list_time(&line).map(|(time, _)| time))
-        {
+        let current_is_markdown = current
+            .as_ref()
+            .and_then(|entry| entry.lines.first())
+            .is_some_and(|line| markdown_time(line).is_some());
+
+        if let Some((time, head)) = entry_header(&line, current_is_markdown, previous_blank) {
             if let Some(done) = current.take() {
                 blocks.push(done);
             }
+            // 紧凑列表的围栏可能直接写在条目头里：`- 10:00 ```js`
+            open_fence = fence_marker(&head);
             current = Some(RawEntry {
                 time,
                 lines: vec![line],
             });
+            previous_blank = is_blank;
             continue;
         }
 
         match current.as_mut() {
             Some(entry) => {
-                if fence_marker(&line) {
-                    in_fence = true;
-                }
+                open_fence = fence_marker(&line);
                 entry.lines.push(line);
             }
             None => header.push(line),
         }
+        previous_blank = is_blank;
     }
 
     if let Some(done) = current {
@@ -125,32 +205,48 @@ pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
     (header, blocks)
 }
 
+fn content_line(line: &str, compact: bool) -> String {
+    if compact {
+        line.strip_prefix("  ").unwrap_or(line).to_string()
+    } else {
+        line.to_string()
+    }
+}
+
 fn parse_block(block: &RawEntry) -> Option<(String, String, Option<String>)> {
     let first = block.lines.first()?;
     let mut content: Vec<String> = Vec::new();
     let mut source = None;
 
-    if let Some((_, head)) = list_time(first) {
-        if !head.is_empty() {
-            content.push(head);
-        }
-        for line in &block.lines[1..] {
-            if let Some(value) = source_line(line) {
-                source = Some(value);
-                continue;
-            }
-            content.push(line.strip_prefix("  ").unwrap_or(line).to_string());
-        }
+    let (compact, first_head) = if let Some((_, head)) = list_time(first) {
+        (true, head)
     } else if markdown_time(first).is_some() {
-        for line in &block.lines[1..] {
-            if let Some(value) = source_line(line) {
-                source = Some(value);
-                continue;
-            }
-            content.push(line.clone());
-        }
+        (false, String::new())
     } else {
         return None;
+    };
+
+    if compact && !first_head.is_empty() {
+        content.push(first_head.clone());
+    }
+    // 紧凑模式的围栏可能直接写在条目头里：`- 10:00 ```js`
+    let mut open_fence = fence_marker(&first_head);
+
+    for line in &block.lines[1..] {
+        if let Some(open) = open_fence {
+            // 围栏内的内容原样保留，`<!-- 来源：… -->` 只是正文
+            content.push(content_line(line, compact));
+            if closes_fence(line, open) {
+                open_fence = None;
+            }
+            continue;
+        }
+        if let Some(value) = source_line(line) {
+            source = Some(value);
+            continue;
+        }
+        open_fence = fence_marker(line);
+        content.push(content_line(line, compact));
     }
 
     let content = content.join("\n").trim_matches('\n').trim_end().to_string();
@@ -191,13 +287,47 @@ fn source_line(line: &str) -> Option<String> {
                 .strip_prefix("<!-- 来源：")
                 .and_then(|rest| rest.strip_suffix("-->"))
         })?;
-    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!normalized.is_empty()).then_some(normalized)
+    let decoded = decode_source(raw);
+    (!decoded.is_empty()).then_some(decoded)
 }
 
-fn fence_marker(line: &str) -> bool {
+/// 围栏的开标记：字符（` 或 ~）与长度。闭合标记必须同字符且不短于它。
+#[derive(Clone, Copy)]
+struct Fence {
+    marker: char,
+    len: usize,
+}
+
+fn entry_header(
+    line: &str,
+    current_is_markdown: bool,
+    previous_blank: bool,
+) -> Option<(String, String)> {
+    if let Some(time) = markdown_time(line) {
+        // Markdown 条目的正文从下一行开始，标题行本身不带内容。
+        return Some((time, String::new()));
+    }
+    // Markdown 块正文里的 `- HH:MM` 是普通内容；只有空行之后的列表行才视为新条目（兼容混用格式）。
+    if current_is_markdown && !previous_blank {
+        return None;
+    }
+    list_time(line)
+}
+
+fn fence_marker(line: &str) -> Option<Fence> {
     let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (len >= 3).then_some(Fence { marker, len })
+}
+
+fn closes_fence(line: &str, open: Fence) -> bool {
+    let trimmed = line.trim_start();
+    let len = trimmed.chars().take_while(|ch| *ch == open.marker).count();
+    len >= open.len && trimmed.chars().skip(len).all(|ch| ch.is_whitespace())
 }
 
 /// 解析单个日期文件，兼容紧凑列表与 Markdown 两种格式。
@@ -299,6 +429,12 @@ fn entry_for(
     }
 }
 
+/// 笔记文件可能是非 UTF-8（例如被 ANSI 编辑器改写过）：有损解码，保证内容仍可见。
+fn read_note(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// 读取笔记，按日期与写入顺序倒序返回；`offset` 用于分页。
 pub fn load_recent(dir: &Path, limit: usize, offset: usize) -> std::io::Result<Vec<NoteEntry>> {
     if !dir.exists() {
@@ -313,8 +449,12 @@ pub fn load_recent(dir: &Path, limit: usize, offset: usize) -> std::io::Result<V
             .and_then(|stem| stem.to_str())
             .unwrap_or("")
             .to_string();
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
+        let text = match read_note(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!("读取笔记文件失败 {}：{error}", path.display());
+                continue;
+            }
         };
         let mut parsed = parse_entries(&text);
         parsed.reverse();
@@ -346,8 +486,12 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
             .and_then(|stem| stem.to_str())
             .unwrap_or("")
             .to_string();
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
+        let text = match read_note(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!("读取笔记文件失败 {}：{error}", path.display());
+                continue;
+            }
         };
         let mut parsed = parse_entries(&text);
         parsed.reverse();
@@ -372,7 +516,12 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
 pub fn append_note(dir: &Path, date: &str, entry: &str) -> std::io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join(format!("{date}.md"));
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    // 只有文件确实不存在时才按空文件处理；读取失败必须上抛，否则会重复写入日期标题。
+    let existing = match read_note(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
 
     if existing.is_empty() {
@@ -466,6 +615,70 @@ mod tests {
         let entries = parse_entries(text);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "```js\n- 11:00 看起来像条目");
+    }
+
+    #[test]
+    fn entry_starting_with_fence_does_not_swallow_following_entries() {
+        let text = "# 2026-10-21\n\n- 10:00 ```js\n  const a = 1;\n  ```\n\n- 11:00 b\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "10:00");
+        assert_eq!(entries[0].1, "```js\nconst a = 1;\n```");
+        assert_eq!(entries[1].0, "11:00");
+        assert_eq!(entries[1].1, "b");
+    }
+
+    #[test]
+    fn fence_char_must_match_to_close() {
+        let text = "### 10:00\n~~~\n```js\n~~~\n### 11:00\nb\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "~~~\n```js\n~~~");
+        assert_eq!(entries[1].1, "b");
+    }
+
+    #[test]
+    fn fence_line_with_info_string_does_not_close() {
+        let text = "### 10:00\n```js\nx\n```js\n### 11:00\nb\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "```js\nx\n```js\n### 11:00\nb");
+    }
+
+    #[test]
+    fn markdown_body_list_like_line_is_not_a_new_entry() {
+        let text = "### 10:00\n- 14:00 评审\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "- 14:00 评审");
+    }
+
+    #[test]
+    fn list_entry_after_markdown_block_and_blank_line() {
+        let text = "### 10:00\n正文\n\n- 14:00 新条目\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "正文");
+        assert_eq!(entries[1].0, "14:00");
+        assert_eq!(entries[1].1, "新条目");
+    }
+
+    #[test]
+    fn source_like_line_inside_fence_is_kept_as_content() {
+        let text = "### 10:00\n```html\n<!-- 来源：百度 -->\n```\n\n<!-- 来源：VS Code -->\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "```html\n<!-- 来源：百度 -->\n```");
+        assert_eq!(entries[0].2.as_deref(), Some("VS Code"));
+    }
+
+    #[test]
+    fn compact_source_like_line_inside_fence_is_kept_as_content() {
+        let text = "- 10:00 ```html\n  <!-- 来源：百度 -->\n  ```\n  _来源：Chrome_\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "```html\n<!-- 来源：百度 -->\n```");
+        assert_eq!(entries[0].2.as_deref(), Some("Chrome"));
     }
 
     #[test]
@@ -605,6 +818,76 @@ mod tests {
             format_entry("09:05", "x", Some("  A \n  B  ")),
             "- 09:05 x\n  _来源：A B_"
         );
+    }
+
+    #[test]
+    fn loads_entries_from_non_utf8_file() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-ansi-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("2026-10-21.md"),
+            b"# 2026-10-21\n\n- 10:00 \xff legacy\n",
+        )
+        .unwrap();
+
+        let entries = load_recent(&dir, 10, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.ends_with("legacy"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_does_not_duplicate_header_for_non_utf8_file() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-ansi-append-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-21.md");
+        fs::write(&path, b"# 2026-10-21\n\n- 10:00 \xff legacy\n").unwrap();
+
+        append_note(&dir, "2026-10-21", "- 11:00 b").unwrap();
+
+        let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+        assert_eq!(text.matches("# 2026-10-21").count(), 1);
+        assert!(text.contains("- 11:00 b"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitizes_source_in_markdown_mode_and_round_trips() {
+        let source = r#"evil --> <img src=x onerror=1> _*` & \ end"#;
+        let formatted = format_entry_markdown("10:00", "x", Some(source));
+        assert!(!formatted.contains("<img"));
+        // 来源体里的 `-->` 必须被打断，不能提前闭合注释（末尾的 `-->` 是正常包装）
+        assert!(formatted.contains("- -&gt;"));
+
+        let text = format!("# 2026-10-21\n\n{formatted}\n");
+        let entries = parse_entries(&text);
+        assert_eq!(entries[0].2.as_deref(), Some(source));
+    }
+
+    #[test]
+    fn sanitizes_source_in_compact_mode_and_round_trips() {
+        let source = "a --> b <c> _d_";
+        let formatted = format_entry("10:00", "x", Some(source));
+        assert!(!formatted.contains("-->"));
+
+        let text = format!("# 2026-10-21\n\n{formatted}\n");
+        let entries = parse_entries(&text);
+        assert_eq!(entries[0].2.as_deref(), Some(source));
+    }
+
+    #[test]
+    fn truncates_long_source_to_200_chars() {
+        let source = "a".repeat(300);
+        let formatted = format_entry("10:00", "x", Some(&source));
+        let text = format!("# 2026-10-21\n\n{formatted}\n");
+        let entries = parse_entries(&text);
+        assert_eq!(entries[0].2.as_deref().unwrap().chars().count(), 200);
     }
 
     #[test]

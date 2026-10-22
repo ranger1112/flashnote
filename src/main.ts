@@ -119,6 +119,7 @@ let pinned = false;
 let recording = false;
 let toastTimer: number | undefined;
 let draftTimer: number | undefined;
+let saving = false;
 let searchTimer: number | undefined;
 let appReady = false;
 let notes: NoteEntry[] = [];
@@ -491,29 +492,40 @@ async function hideWindow(): Promise<void> {
 }
 
 async function saveNote(): Promise<void> {
+  if (saving) return;
+
   const content = textarea.value.trim();
   if (!content) {
     await hideWindow();
     return;
   }
 
+  saving = true;
   try {
     const saved = await invoke<SavedNote>("save_note", { content });
-    textarea.value = "";
-    if (draftTimer !== undefined) {
-      window.clearTimeout(draftTimer);
-      draftTimer = undefined;
-    }
-    localStorage.removeItem(DRAFT_KEY);
-    void invoke("clear_draft").catch(() => {});
-    toast(`已保存 · ${saved.time}`);
-    if (!pinned) {
-      window.setTimeout(() => {
-        void invoke("hide_window");
-      }, 380);
+    // 保存期间用户可能继续输入：只有内容没变时才清空，否则保留新内容并补一次草稿
+    if (textarea.value.trim() === content) {
+      textarea.value = "";
+      if (draftTimer !== undefined) {
+        window.clearTimeout(draftTimer);
+        draftTimer = undefined;
+      }
+      localStorage.removeItem(DRAFT_KEY);
+      void invoke("clear_draft").catch(() => {});
+      toast(`已保存 · ${saved.time}`);
+      if (!pinned) {
+        window.setTimeout(() => {
+          void invoke("hide_window");
+        }, 380);
+      }
+    } else {
+      scheduleDraftSave();
+      toast(`已保存 · ${saved.time}（新输入尚未保存）`);
     }
   } catch (error) {
     toast(String(error), true);
+  } finally {
+    saving = false;
   }
 }
 
@@ -608,6 +620,10 @@ function bindDelete(button: HTMLButtonElement, note: NoteEntry): void {
 
 /** 先从列表移除并给 5 秒撤销窗口，到期才真正写盘。 */
 function requestDelete(note: NoteEntry): void {
+  if (hasOpenEditor()) {
+    toast("请先保存或取消正在编辑的笔记", true);
+    return;
+  }
   // 同时只保留一条待删除记录，前一条立即落盘
   if (pendingDelete) void commitPendingDelete();
 
@@ -711,6 +727,8 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
         content: note.content,
         newContent: value,
       });
+      // 先收起编辑器再刷新，否则重渲染保护会挡住列表更新
+      close();
       toast("已更新");
       refreshNotes();
     } catch (error) {
@@ -721,6 +739,8 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
 
   save.addEventListener("click", () => void commit());
   editor.addEventListener("keydown", (event) => {
+    // 输入法组合期间（如中文候选框）不处理快捷键，Esc 只应取消候选
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -740,7 +760,14 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
   editor.setSelectionRange(editor.value.length, editor.value.length);
 }
 
+/** 列表里是否有尚未提交的条目编辑器；重建列表会连同输入内容一起丢掉。 */
+function hasOpenEditor(): boolean {
+  return entryList.querySelector(".entry-edit") !== null;
+}
+
 function renderNotes(): void {
+  if (hasOpenEditor()) return;
+
   const term = serverFiltered ? "" : historySearch.value.trim().toLowerCase();
   const filtered = term ? notes.filter((note) => matchesTerm(note, term)) : notes;
 
@@ -855,6 +882,7 @@ function renderNotes(): void {
 }
 
 async function loadNotes(reset = true): Promise<void> {
+  if (hasOpenEditor()) return;
   await flushPendingDelete();
   const seq = ++searchSeq;
   if (reset) noteOffset = 0;
@@ -880,6 +908,10 @@ async function loadNotes(reset = true): Promise<void> {
 }
 
 async function runSearch(): Promise<void> {
+  if (hasOpenEditor()) {
+    toast("请先保存或取消正在编辑的笔记", true);
+    return;
+  }
   // 重新查询前先提交待删除项，否则磁盘上的旧条目会重新出现
   await flushPendingDelete();
   const seq = ++searchSeq;
@@ -911,6 +943,7 @@ async function runSearch(): Promise<void> {
 }
 
 function refreshNotes(): void {
+  if (hasOpenEditor()) return;
   if (historySearch.value.trim()) {
     void runSearch();
   } else {
@@ -919,6 +952,10 @@ function refreshNotes(): void {
 }
 
 async function toggleHistoryPreview(): Promise<void> {
+  if (hasOpenEditor()) {
+    toast("请先保存或取消正在编辑的笔记", true);
+    return;
+  }
   const next = !settings.historyPreview;
   settings.historyPreview = next;
   paintPreviewButton();
@@ -1235,6 +1272,9 @@ autostartCheck.addEventListener("change", async () => {
 window.addEventListener(
   "keydown",
   (event) => {
+    // 输入法组合期间不处理任何全局快捷键：Esc 应只取消候选，Ctrl+S 也不该落盘
+    if (event.isComposing || event.keyCode === 229) return;
+
     if (recording) {
       handleRecording(event);
       return;
