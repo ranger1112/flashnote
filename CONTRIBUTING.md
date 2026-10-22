@@ -5,7 +5,7 @@
 ## 开发环境
 
 - Windows 10 / 11
-- Node.js 20+
+- Node.js 22.12+ 或 24 LTS
 - Rust stable（MSVC 工具链）+ Visual Studio Build Tools 2022 的「使用 C++ 的桌面开发」
 - WebView2 运行时
 
@@ -26,6 +26,7 @@ CI 会在 Windows 上跑同样的检查，本地先跑一遍可以少一轮往�
 
 ```bash
 npm run build                          # 类型检查 + 前端构建
+npm test                               # 前端单元测试
 cd src-tauri
 cargo fmt --all -- --check             # 格式
 cargo clippy --all-targets -- -D warnings
@@ -35,7 +36,7 @@ cargo test
 ## 代码约定
 
 - **前端**：原生 TypeScript，不引入前端框架。用 `el()` 取 DOM、`invoke()` 调后端，不直接在 WebView 里读写文件。
-- **后端**：文件读写集中在 `notes.rs` / `settings.rs`，命令层只做校验与调度。写入一律「临时文件 + 重命名」。
+- **后端**：文件读写集中在 `notes.rs` / `settings.rs`，命令层只做校验与调度。设置与草稿用「临时文件 + 重命名」原子写入；笔记是追加写，编辑/删除会先备份再原子替换。
 - **测试**：涉及解析、格式化、文件重建的逻辑都要有单元测试，放在同一文件的 `mod tests` 里，不依赖真实用户目录。
 - **UI 文案**：界面为简体中文，注释也用中文。
 - **格式**：Rust 交给 `cargo fmt`；前端没有格式化工具链，请保持与现有文件一致（缩进 2 空格、双引号、语句带分号），类型检查由 `tsc --noEmit` 把关。
@@ -61,12 +62,12 @@ chore(ci): 缓存 Rust 构建产物
 
 ## 发版流程
 
-1. 把 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的版本改成同一个值（如 `0.2.0`），在 `CHANGELOG.md` 补上对应条目，提交并推 `main`。
-2. 打 tag 并推送：`git tag v0.2.0 && git push origin v0.2.0`。
+1. 把 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的版本改成同一个值（如 `0.3.1`），在 `CHANGELOG.md` 补上对应条目，提交并推 `main`。
+2. 打 tag 并推送：`git tag v<version> && git push origin v<version>`。
 3. `.github/workflows/release.yml` 会构建安装包与便携版、生成校验和，并创建 **draft** Release。
 4. 下载 draft 里的安装包试用一遍，确认无误后在 GitHub 上发布。
 
-预发布版本直接用 `v0.2.0-beta.1` 这样的 tag，三处版本也要写成 `0.2.0-beta.1`；tag 里带 `-` 时工作流会自动标记为 prerelease。重跑同一 tag 会覆盖同名 asset，不会产生重复文件。
+预发布版本直接用 `v0.3.1-beta.1` 这样的 tag，四处版本也要写成 `0.3.1-beta.1`；tag 里带 `-` 时工作流会自动标记为 prerelease。重跑同一 tag 会覆盖同名 asset，不会产生重复文件。
 
 自动更新所需的两个仓库 secret（`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`）由维护者在本地生成并配置：
 

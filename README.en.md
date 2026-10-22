@@ -162,7 +162,7 @@ src-tauri\target\release\bundle\nsis\闪记_0.3.0_x64-setup.exe
 ### Requirements
 
 - Windows 10 / 11
-- Node.js 20+
+- Node.js 22.12+ or 24 LTS
 - Rust stable (MSVC toolchain)
 - Visual Studio Build Tools 2022 with the "Desktop development with C++" workload selected
 - WebView2 Runtime (usually already included on Windows 10 1803+)
@@ -213,8 +213,8 @@ Rust unit tests cover entry formatting, multi-line indentation, source-title nor
 Set the version to the same value in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`, then tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v<version>
+git push origin v<version>
 ```
 
 The `.github/workflows/release.yml` workflow builds the NSIS installer and portable zip, generates `SHA256SUMS.txt`, and creates a **draft** Release; review it and publish from GitHub. If the version numbers don't match, the workflow fails immediately, preventing a tagged release whose installer version differs.
@@ -234,6 +234,8 @@ flashnote/
 ├─ index.html                  # DOM structure for the popover and settings panel
 ├─ src/
 │  ├─ main.ts                  # Frontend state and interaction (saving, hotkey recording, drafts)
+│  ├─ lib.ts                   # Pure helpers: hotkey parsing, search matching, paging offset
+│  ├─ lib.test.ts              # Frontend unit tests (Vitest)
 │  └─ styles.css               # Light/dark themes, floating card styles
 ├─ src-tauri/
 │  ├─ src/
@@ -303,6 +305,7 @@ No proactive network access. Once disabled, it only contacts GitHub Releases whe
 Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for the exact process. Before submitting, make sure that:
 
 - `npm run build` (type check + frontend build) passes;
+- `npm test` (frontend unit tests) passes;
 - `cd src-tauri && cargo test` passes;
 - generated directories such as `node_modules/`, `dist/`, and `src-tauri/target/` are not committed.
 

@@ -90,7 +90,7 @@ jobs:
       - name: 安装 Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: 安装前端依赖
@@ -147,7 +147,8 @@ jobs:
 
             - 支持 Windows 10 / 11，需要 WebView2 运行时（系统一般已自带）。
             - 安装包未做代码签名，首次运行可能出现 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
-            - 完整变更见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)。
+            - 便携版的自动更新会安装到 `%LOCALAPPDATA%\闪记`，届时会变成安装版；想保持纯便携请手动替换 `flashnote.exe`。
+            - 完整变更见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/CHANGELOG.md)。
 
       - name: 打包便携版
         shell: pwsh
@@ -157,12 +158,18 @@ jobs:
             throw "找不到 $exe，构建可能失败"
           }
           $zip = "FlashNote_${{ steps.meta.outputs.version }}_portable_x64.zip"
-          Compress-Archive -Path $exe -DestinationPath $zip -CompressionLevel Optimal -Force
+          if (-not (Test-Path LICENSE)) {
+            throw "找不到 LICENSE，无法打包便携版"
+          }
+          Compress-Archive -Path $exe, LICENSE -DestinationPath $zip -CompressionLevel Optimal -Force
           "ZIP_NAME=$zip" >> $env:GITHUB_ENV
           Write-Host "已生成 $zip"
 
       - name: 生成 SHA256SUMS.txt
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           $version = "${{ steps.meta.outputs.version }}"
           $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${version}_x64-setup.exe" |
@@ -175,6 +182,22 @@ jobs:
             @{ Path = $installer.FullName; Name = "FlashNote_${version}_x64-setup.exe" },
             @{ Path = (Resolve-Path $env:ZIP_NAME).Path; Name = $env:ZIP_NAME }
           )
+
+          # 安装包的 .sig 与 updater 的 latest.json 也一并校验
+          $sig = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${version}_x64-setup.exe.sig" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($sig) {
+            $entries += @{ Path = $sig.FullName; Name = "$($sig.Name)" }
+          } else {
+            Write-Warning "没有找到安装包签名，SHA256SUMS 将不包含 .sig"
+          }
+
+          gh release download $env:TAG --pattern latest.json --dir . --clobber 2>$null
+          if (Test-Path latest.json) {
+            $entries += @{ Path = (Resolve-Path latest.json).Path; Name = "latest.json" }
+          } else {
+            Write-Warning "没有找到 latest.json，SHA256SUMS 将不包含它"
+          }
 
           $lines = foreach ($entry in $entries) {
             $hash = (Get-FileHash -Path $entry.Path -Algorithm SHA256).Hash.ToLower()

@@ -64,6 +64,8 @@ pub struct AppState {
     pub settings: Mutex<settings::Settings>,
     pub settings_path: std::path::PathBuf,
     pub last_source: Mutex<Option<String>>,
+    /// 串行化笔记文件读写：命令改成 async 后可能真正并发，追加与改写不能交叉。
+    pub io: Mutex<()>,
     startup_notice: Mutex<Option<StartupNotice>>,
 }
 
@@ -167,6 +169,7 @@ fn main() {
                 settings: Mutex::new(settings),
                 settings_path,
                 last_source: Mutex::new(None),
+                io: Mutex::new(()),
                 startup_notice: Mutex::new(startup_notice),
             });
 

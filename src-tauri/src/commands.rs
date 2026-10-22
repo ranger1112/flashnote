@@ -444,6 +444,14 @@ pub fn open_notes_dir_impl(app: &AppHandle) -> Result<(), String> {
     open_with_explorer(&dir)
 }
 
+/// 笔记文件的读写都串行化：命令改成 async 之后，追加与改写是真的可能并发的。
+fn io_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()> {
+    state
+        .io
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Settings {
     state
@@ -453,7 +461,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
         .clone()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_note(
     _app: AppHandle,
     state: State<'_, AppState>,
@@ -489,7 +497,10 @@ pub fn save_note(
         notes::format_entry(&time, content, source_title.as_deref())
     };
     let dir = PathBuf::from(&settings.notes_dir);
-    let path = notes::append_note(&dir, &date, &entry).map_err(|err| format!("写入失败：{err}"))?;
+    let path = {
+        let _guard = io_guard(&state);
+        notes::append_note(&dir, &date, &entry).map_err(|err| format!("写入失败：{err}"))?
+    };
 
     Ok(SavedNote {
         path: path.to_string_lossy().to_string(),
@@ -532,13 +543,17 @@ pub(crate) fn ensure_writable_dir(path: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_notes_dir(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    let dir = ensure_writable_dir(&path)?;
+    let dir = {
+        // 网络目录掉线时 create_dir_all 会阻塞很久，别让并发的笔记读写跟着卡住
+        let _guard = io_guard(&state);
+        ensure_writable_dir(&path)?
+    };
     state
         .settings
         .lock()
@@ -626,7 +641,7 @@ pub fn update_markdown_mode(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_notes(
     state: State<'_, AppState>,
     limit: Option<u32>,
@@ -643,7 +658,7 @@ pub fn list_notes(
         .map_err(|err| format!("读取笔记失败：{err}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn search_notes(
     state: State<'_, AppState>,
     query: String,
@@ -692,6 +707,8 @@ where
             .notes_dir,
     );
     let (dir, target) = resolve_within(&notes_dir, path)?;
+    // 读-改-写必须独占，否则两次并发删除会互相覆盖
+    let _guard = io_guard(state);
 
     let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
     let updated =
@@ -716,6 +733,8 @@ where
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("写入失败：{err}"));
     }
+    // 解析缓存按 mtime+size 判断，但同一秒内的改写可能撞上旧值，这里直接失效
+    notes::invalidate_cache(&target);
 
     prune_backups(&dir, stem);
     Ok(())
@@ -743,7 +762,7 @@ fn prune_backups(dir: &Path, stem: &str) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_note_entry(
     state: State<'_, AppState>,
     path: String,
@@ -756,7 +775,7 @@ pub fn delete_note_entry(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_note_entry(
     state: State<'_, AppState>,
     path: String,
@@ -773,7 +792,7 @@ pub fn update_note_entry(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_note_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let notes_dir = PathBuf::from(
         &state
@@ -786,12 +805,12 @@ pub fn open_note_file(state: State<'_, AppState>, path: String) -> Result<(), St
     open_with_explorer(&target)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_today_note(app: AppHandle) -> Result<(), String> {
     open_today_note_impl(&app)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_notes_dir(app: AppHandle) -> Result<(), String> {
     open_notes_dir_impl(&app)
 }
@@ -820,7 +839,7 @@ fn draft_path(app: &AppHandle) -> PathBuf {
     settings::settings_path(app).with_file_name("draft.txt")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn load_draft(app: AppHandle) -> Result<String, String> {
     match std::fs::read_to_string(draft_path(&app)) {
         Ok(text) => Ok(text),
@@ -829,8 +848,13 @@ pub fn load_draft(app: AppHandle) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
-pub fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn save_draft(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    content: String,
+) -> Result<(), String> {
+    let _guard = io_guard(&state);
     let path = draft_path(&app);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("保存草稿失败：{err}"))?;
@@ -840,8 +864,9 @@ pub fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|err| format!("保存草稿失败：{err}"))
 }
 
-#[tauri::command]
-pub fn clear_draft(app: AppHandle) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn clear_draft(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = io_guard(&state);
     match std::fs::remove_file(draft_path(&app)) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
