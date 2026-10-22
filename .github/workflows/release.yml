@@ -10,10 +10,10 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -21,21 +21,30 @@ jobs:
     name: 构建并发布 Windows 安装包
     runs-on: windows-latest
     timeout-minutes: 60
+    # 在仓库 Settings → Environments 为 release 配置 required reviewers，避免任何写权限账号推 tag 即发布
+    environment: release
+    permissions:
+      contents: write
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       # 版本以 tauri.conf.json 为准，先和 tag 对齐，避免发出 0.1.0 的包却挂着 v0.2.0 的 tag
       - name: 校验版本号
         id: meta
         shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          $tag = "${{ inputs.tag || github.ref_name }}"
-          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+          # 不直接把 tag 插值进脚本：Git 允许 tag 名包含引号、分号与反引号
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
             throw "tag 必须形如 v0.1.0 或 v0.1.0-beta.1，当前为：$tag"
           }
 
@@ -43,16 +52,23 @@ jobs:
 
           $configVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $pkgVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $lockVersion = (Get-Content package-lock.json -Raw | ConvertFrom-Json).version
           $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 
           foreach ($pair in @(
             @{ Name = 'src-tauri/tauri.conf.json'; Value = $configVersion },
             @{ Name = 'package.json'; Value = $pkgVersion },
+            @{ Name = 'package-lock.json'; Value = $lockVersion },
             @{ Name = 'src-tauri/Cargo.toml'; Value = $cargoVersion }
           )) {
             if ($pair.Value -ne $version) {
-              throw "版本不一致：tag 为 $tag，但 $($pair.Name) 是 $($pair.Value)。请先把三处版本统一为 $version 再打 tag。"
+              throw "版本不一致：tag 为 $tag，但 $($pair.Name) 是 $($pair.Value)。请先把各处版本统一为 $version 再打 tag。"
             }
+          }
+
+          $escaped = [regex]::Escape($version)
+          if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$escaped\]" -Quiet)) {
+            throw "CHANGELOG.md 缺少 $version 的条目，请先补更新日志再发版。"
           }
 
           "tag=$tag" >> $env:GITHUB_OUTPUT
@@ -61,15 +77,18 @@ jobs:
           Write-Host "发布 $tag（版本 $version）"
 
       - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
 
       - name: 缓存 Rust 构建产物
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
 
       - name: 安装 Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 20
           cache: npm
@@ -80,10 +99,22 @@ jobs:
       - name: 前端单元测试
         run: npm test
 
+      - name: Rust 格式检查
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Rust Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Rust 单元测试
+        working-directory: src-tauri
+        run: cargo test --locked
+
       # 安装包内部文件名是「闪记_<版本>_x64-setup.exe」，上传前统一改成 ASCII，
       # 避免中文文件名在下载、命令行引用和校验时被转义或剥离。
       - name: 构建并创建 Release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # minisign 私钥，用于生成 .sig 与 latest.json；缺失时构建出的包无法被自动更新校验
