@@ -10,6 +10,7 @@ import { marked } from "marked";
 import {
   accelFromEvent,
   clampOpacity,
+  externalLinkTarget,
   formatAccel,
   matchesTerm,
   nextOffset,
@@ -1311,6 +1312,29 @@ window.addEventListener(
   },
   true,
 );
+
+/**
+ * 预览里的链接绝不能导航主窗口：这个无边框置顶窗口一旦被远程页面接管，
+ * 本地 CSP 与 Esc 监听都会失效，只能从托盘退出。统一拦下来交给系统浏览器。
+ */
+function handleLinkActivation(event: MouseEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const anchor = target.closest("a[href]");
+  if (!(anchor instanceof HTMLAnchorElement)) return;
+
+  const href = anchor.getAttribute("href") ?? "";
+  // 页内锚点保持默认行为，其余一律不让 WebView 自己跳
+  if (href.trim().startsWith("#")) return;
+  event.preventDefault();
+
+  const url = externalLinkTarget(href);
+  if (!url) return;
+  void invoke("open_external_url", { url }).catch((error) => toast(String(error), true));
+}
+
+document.addEventListener("click", handleLinkActivation, true);
+document.addEventListener("auxclick", handleLinkActivation, true);
 
 resizeGrip.addEventListener("pointerdown", (event) => {
   event.preventDefault();

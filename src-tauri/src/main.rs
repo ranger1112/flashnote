@@ -171,6 +171,7 @@ fn main() {
             commands::open_note_file,
             commands::open_today_note,
             commands::open_notes_dir,
+            commands::open_external_url,
             commands::hide_window,
             commands::take_startup_notice,
             commands::load_draft,

@@ -3,6 +3,7 @@ import {
   accelFromEvent,
   clampOpacity,
   formatAccel,
+  externalLinkTarget,
   matchesTerm,
   nextOffset,
   normalizeTheme,
@@ -199,5 +200,24 @@ describe("nextOffset", () => {
   it("追加时累加，即使本批有被客户端过滤掉的行也不回退", () => {
     expect(nextOffset(100, 100, false)).toBe(200);
     expect(nextOffset(200, 35, false)).toBe(235);
+  });
+});
+
+describe("externalLinkTarget", () => {
+  it("http(s) 与 mailto 链接原样返回", () => {
+    expect(externalLinkTarget("https://example.com/a?b=1")).toBe("https://example.com/a?b=1");
+    expect(externalLinkTarget("  http://example.com  ")).toBe("http://example.com");
+    expect(externalLinkTarget("mailto:hi@example.com")).toBe("mailto:hi@example.com");
+  });
+
+  it("协议大小写不敏感", () => {
+    expect(externalLinkTarget("HTTPS://example.com")).toBe("HTTPS://example.com");
+  });
+
+  it("页内锚点、脚本、本地文件一律拒绝", () => {
+    expect(externalLinkTarget("#section")).toBeNull();
+    expect(externalLinkTarget("javascript:alert(1)")).toBeNull();
+    expect(externalLinkTarget("file:///C:/Windows/System32/calc.exe")).toBeNull();
+    expect(externalLinkTarget("")).toBeNull();
   });
 });
