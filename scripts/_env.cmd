@@ -27,7 +27,7 @@ if not defined VCVARS (
 
 call "%VCVARS%" >nul
 if errorlevel 1 (
-  echo [flashnote] failed to load MSVC environment from %VCVARS% 1>&2
+  echo [flashnote] failed to load MSVC environment from "%VCVARS%" 1>&2
   exit /b 1
 )
 exit /b 0
