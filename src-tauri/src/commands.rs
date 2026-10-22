@@ -6,7 +6,7 @@ use crate::{
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,8 +22,16 @@ pub struct SavedNote {
 }
 
 pub fn persist(app: &AppHandle) {
+    // 退出路径上顺手抓一次窗口位置：hide 之外（托盘退出、异常结束）的移动也不会丢。
+    if let Some(window) = app.get_webview_window("main") {
+        persist_geometry(app, &window);
+    }
     let state = app.state::<AppState>();
-    let snapshot = state.settings.lock().unwrap().clone();
+    let snapshot = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     if let Err(err) = settings::save(&state.settings_path, &snapshot) {
         log::error!("保存设置失败：{err}");
     }
@@ -64,11 +72,11 @@ pub(crate) struct Rect {
 
 impl Rect {
     fn right(self) -> i32 {
-        self.x.saturating_add(self.w as i32)
+        self.x.saturating_add(self.w.min(i32::MAX as u32) as i32)
     }
 
     fn bottom(self) -> i32 {
-        self.y.saturating_add(self.h as i32)
+        self.y.saturating_add(self.h.min(i32::MAX as u32) as i32)
     }
 }
 
@@ -134,13 +142,19 @@ pub(crate) fn clamp_rect(rect: Rect, monitors: &[Rect]) -> (i32, i32) {
             .unwrap_or(first);
     }
 
+    // 手改设置可能塞进超大尺寸，先夹到 i32 内再参与运算，避免溢出 panic
+    let rect_w = rect.w.min(i32::MAX as u32) as i32;
+    let rect_h = rect.h.min(i32::MAX as u32) as i32;
+    let best_w = best.w.min(i32::MAX as u32) as i32;
+    let best_h = best.h.min(i32::MAX as u32) as i32;
+
     // 至少保留左侧 120px、顶部 40px（标题栏）可见，保证窗口可以被拖回来
-    let visible_x = 120.min(rect.w as i32);
-    let visible_y = 40.min(rect.h as i32);
-    let min_x = best.x - (rect.w as i32 - visible_x);
-    let max_x = best.x + best.w as i32 - visible_x;
+    let visible_x = 120.min(rect_w);
+    let visible_y = 40.min(rect_h);
+    let min_x = best.x.saturating_sub(rect_w.saturating_sub(visible_x));
+    let max_x = best.x.saturating_add(best_w).saturating_sub(visible_x);
     let min_y = best.y;
-    let max_y = best.y + best.h as i32 - visible_y;
+    let max_y = best.y.saturating_add(best_h).saturating_sub(visible_y);
 
     let x = if min_x <= max_x {
         rect.x.clamp(min_x, max_x)
@@ -257,16 +271,27 @@ pub fn reclamp_window(app: &AppHandle) {
 
 pub fn show_window_impl(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let capture = state.settings.lock().unwrap().capture_source;
+    let capture = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .capture_source;
 
     let source = if capture {
         match source::foreground_window_title() {
             Some(title) => {
-                *state.last_source.lock().unwrap() = Some(title.clone());
+                *state
+                    .last_source
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(title.clone());
                 Some(title)
             }
             // 托盘菜单会短暂抢走前台窗口，抓不到时沿用上一次的来源
-            None => state.last_source.lock().unwrap().clone(),
+            None => state
+                .last_source
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         }
     } else {
         None
@@ -310,8 +335,11 @@ pub fn toggle_window(app: &AppHandle) {
 }
 
 fn open_with_explorer(path: &Path) -> Result<(), String> {
+    // explorer 不认 `\\?\` verbatim 前缀，遇到会直接报「找不到文件」；先剥掉再传
+    let display = path.to_string_lossy();
+    let target = display.strip_prefix(r"\\?\").unwrap_or(&display);
     std::process::Command::new("explorer")
-        .arg(path)
+        .arg(target)
         .spawn()
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -358,7 +386,7 @@ fn open_with_shell(target: &str) -> Result<(), String> {
     };
     // Win32 约定：返回值 <= 32 都算失败
     if (result as isize) <= 32 {
-        Err("无法打开链接".to_string())
+        Err("系统未能打开该目标".to_string())
     } else {
         Ok(())
     }
@@ -366,7 +394,7 @@ fn open_with_shell(target: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn open_with_shell(_target: &str) -> Result<(), String> {
-    Err("当前平台暂不支持打开外部链接".to_string())
+    Err("当前平台暂不支持调用系统默认程序".to_string())
 }
 
 /// 用系统默认浏览器打开预览里的链接。
@@ -381,11 +409,8 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 
 /// 交给系统默认关联程序打开（Markdown 文件通常是编辑器）。
 fn open_with_default_app(path: &Path) -> Result<(), String> {
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", path.to_string_lossy().as_ref()])
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    // 同样走 ShellExecuteW：`cmd /C start` 会二次解析路径里的 & % ^
+    open_with_shell(&path.to_string_lossy())
 }
 
 pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
@@ -421,7 +446,11 @@ pub fn open_notes_dir_impl(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[tauri::command]
@@ -436,9 +465,17 @@ pub fn save_note(
     }
 
     let (settings, source_title) = {
-        let settings = state.settings.lock().unwrap().clone();
+        let settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let source_title = if settings.capture_source {
-            state.last_source.lock().unwrap().clone()
+            state
+                .last_source
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         } else {
             None
         };
@@ -462,7 +499,11 @@ pub fn save_note(
 
 #[tauri::command]
 pub fn set_pinned(app: AppHandle, state: State<'_, AppState>, pinned: bool) -> Result<(), String> {
-    state.settings.lock().unwrap().pinned = pinned;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pinned = pinned;
     persist(&app);
     Ok(())
 }
@@ -474,7 +515,9 @@ pub(crate) fn ensure_writable_dir(path: &str) -> Result<PathBuf, String> {
         return Err("目录不能为空".to_string());
     }
 
-    let dir = PathBuf::from(trimmed);
+    // 相对路径会跟着进程 CWD 走（自启动和手动启动不同），这里统一转成绝对路径。
+    // 用绝对化而不是 canonicalize，避免拿到 explorer 不认的 `\\?\` 前缀。
+    let dir = settings::absolute_dir(trimmed);
     if dir.exists() && !dir.is_dir() {
         return Err("所选路径不是文件夹".to_string());
     }
@@ -496,7 +539,11 @@ pub fn update_notes_dir(
     path: String,
 ) -> Result<(), String> {
     let dir = ensure_writable_dir(&path)?;
-    state.settings.lock().unwrap().notes_dir = dir.to_string_lossy().to_string();
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notes_dir = dir.to_string_lossy().to_string();
     persist(&app);
     log::info!("笔记目录已更新为 {}", dir.display());
     Ok(())
@@ -508,23 +555,32 @@ pub fn update_hotkey(
     state: State<'_, AppState>,
     accel: String,
 ) -> Result<(), String> {
-    let shortcut: Shortcut = accel.parse().map_err(|_| "快捷键格式无效".to_string())?;
+    let shortcut = crate::parse_hotkey(&accel)?;
 
-    let old = state.settings.lock().unwrap().hotkey.clone();
+    let old = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hotkey
+        .clone();
     if let Err(err) = app.global_shortcut().unregister_all() {
         log::warn!("取消旧快捷键失败：{err}");
     }
 
     match app.global_shortcut().register(shortcut) {
         Ok(()) => {
-            state.settings.lock().unwrap().hotkey = accel.clone();
+            state
+                .settings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hotkey = accel.clone();
             persist(&app);
             log::info!("全局热键已更新为 {accel}");
             Ok(())
         }
         Err(err) => {
             log::warn!("注册新快捷键 {accel} 失败：{err}");
-            if let Ok(previous) = old.parse::<Shortcut>() {
+            if let Ok(previous) = crate::parse_hotkey(&old) {
                 if let Err(rollback_err) = app.global_shortcut().register(previous) {
                     log::error!("恢复旧快捷键 {old} 失败：{rollback_err}");
                 }
@@ -540,9 +596,16 @@ pub fn update_capture_source(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    state.settings.lock().unwrap().capture_source = enabled;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .capture_source = enabled;
     if !enabled {
-        *state.last_source.lock().unwrap() = None;
+        *state
+            .last_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
     persist(&app);
     Ok(())
@@ -554,7 +617,11 @@ pub fn update_markdown_mode(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    state.settings.lock().unwrap().markdown_mode = enabled;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .markdown_mode = enabled;
     persist(&app);
     Ok(())
 }
@@ -565,7 +632,13 @@ pub fn list_notes(
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
-    let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let dir = PathBuf::from(
+        &state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .notes_dir,
+    );
     notes::load_recent(&dir, clamp_limit(limit), offset.unwrap_or(0) as usize)
         .map_err(|err| format!("读取笔记失败：{err}"))
 }
@@ -576,7 +649,13 @@ pub fn search_notes(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
-    let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let dir = PathBuf::from(
+        &state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .notes_dir,
+    );
     notes::search_entries(&dir, &query, clamp_limit(limit))
         .map_err(|err| format!("搜索笔记失败：{err}"))
 }
@@ -605,7 +684,13 @@ fn rewrite_note<F>(state: &AppState, path: &str, update: F) -> Result<(), String
 where
     F: FnOnce(&str) -> Option<String>,
 {
-    let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let notes_dir = PathBuf::from(
+        &state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .notes_dir,
+    );
     let (dir, target) = resolve_within(&notes_dir, path)?;
 
     let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
@@ -620,9 +705,17 @@ where
     let backup = target.with_file_name(format!("{stem}.md.bak-{stamp}"));
     std::fs::copy(&target, &backup).map_err(|err| format!("备份失败：{err}"))?;
 
-    let tmp = target.with_extension("md.tmp");
-    std::fs::write(&tmp, updated.as_bytes()).map_err(|err| format!("写入失败：{err}"))?;
-    std::fs::rename(&tmp, &target).map_err(|err| format!("写入失败：{err}"))?;
+    // 临时文件带唯一后缀：上次异常退出残留的同名 tmp 不会挡住这次写入
+    let unique = chrono::Local::now().format("%Y%m%d-%H%M%S%.6f");
+    let tmp = target.with_file_name(format!("{stem}.md.tmp-{unique}"));
+    if let Err(err) = std::fs::write(&tmp, updated.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入失败：{err}"));
+    }
+    if let Err(err) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入失败：{err}"));
+    }
 
     prune_backups(&dir, stem);
     Ok(())
@@ -682,7 +775,13 @@ pub fn update_note_entry(
 
 #[tauri::command]
 pub fn open_note_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let notes_dir = PathBuf::from(
+        &state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .notes_dir,
+    );
     let (_, target) = resolve_within(&notes_dir, &path)?;
     open_with_explorer(&target)
 }
@@ -704,7 +803,11 @@ pub fn hide_window(app: AppHandle) {
 
 #[tauri::command]
 pub fn take_startup_notice(state: State<'_, AppState>) -> Option<crate::StartupNotice> {
-    state.startup_notice.lock().unwrap().take()
+    state
+        .startup_notice
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
 }
 
 pub fn open_log_dir_impl(app: &AppHandle) -> Result<(), String> {
@@ -748,7 +851,11 @@ pub fn clear_draft(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn complete_onboarding(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.settings.lock().unwrap().onboarded = true;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .onboarded = true;
     persist(&app);
     Ok(())
 }
@@ -759,7 +866,11 @@ pub fn update_history_preview(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    state.settings.lock().unwrap().history_preview = enabled;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .history_preview = enabled;
     persist(&app);
     Ok(())
 }
@@ -770,7 +881,11 @@ pub fn update_auto_update(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    state.settings.lock().unwrap().auto_update = enabled;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .auto_update = enabled;
     persist(&app);
     Ok(())
 }
@@ -778,7 +893,11 @@ pub fn update_auto_update(
 #[tauri::command]
 pub fn update_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> String {
     let applied = settings::normalize_theme(&theme);
-    state.settings.lock().unwrap().theme = applied.clone();
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .theme = applied.clone();
     persist(&app);
     applied
 }
@@ -789,7 +908,11 @@ pub fn update_auto_hide(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    state.settings.lock().unwrap().auto_hide_on_blur = enabled;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .auto_hide_on_blur = enabled;
     persist(&app);
     Ok(())
 }
@@ -797,7 +920,11 @@ pub fn update_auto_hide(
 #[tauri::command]
 pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opacity: f64) -> f64 {
     let applied = settings::clamp_opacity(opacity);
-    state.settings.lock().unwrap().background_opacity = applied;
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .background_opacity = applied;
     persist(&app);
     applied
 }
@@ -930,6 +1057,28 @@ mod tests {
 
         assert!(x <= 1920 - 120);
         assert!(y >= 0);
+    }
+
+    #[test]
+    fn clamp_rect_survives_absurd_saved_size() {
+        let monitors = [Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        }];
+        // 手改设置塞进 u32::MAX 时不能溢出 panic
+        let (x, y) = clamp_rect(
+            Rect {
+                x: 100,
+                y: 50,
+                w: u32::MAX,
+                h: i32::MAX as u32,
+            },
+            &monitors,
+        );
+        assert_eq!(x, 100);
+        assert_eq!(y, 50);
     }
 
     #[test]

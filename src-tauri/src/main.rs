@@ -10,6 +10,46 @@ use std::sync::Mutex;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
+/// 解析快捷键，并拒绝没有修饰键的组合——裸键注册成全局热键会吞掉所有输入。
+pub(crate) fn parse_hotkey(accel: &str) -> Result<Shortcut, String> {
+    let shortcut: Shortcut = accel.parse().map_err(|_| "快捷键格式无效".to_string())?;
+    if shortcut.mods.is_empty() {
+        return Err("快捷键至少需要一个修饰键（Ctrl / Alt / Shift / Win）".to_string());
+    }
+    Ok(shortcut)
+}
+
+/// release 构建没有控制台，启动失败时用 MessageBox 把原因显示出来。
+#[cfg(windows)]
+fn fatal_dialog(message: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let text = wide(message);
+    let title = wide("闪记启动失败");
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn fatal_dialog(message: &str) {
+    eprintln!("{message}");
+}
+
 /// 主快捷键被占用时依次尝试的备用组合。
 const HOTKEY_FALLBACKS: [&str; 2] = ["ctrl+alt+m", "ctrl+shift+alt+n"];
 
@@ -28,16 +68,14 @@ pub struct AppState {
 }
 
 fn register_hotkey(app: &tauri::AppHandle, accel: &str) -> Result<(), String> {
-    let shortcut = accel
-        .parse::<Shortcut>()
-        .map_err(|_| "快捷键格式无效".to_string())?;
+    let shortcut = parse_hotkey(accel)?;
     app.global_shortcut()
         .register(shortcut)
         .map_err(|err| err.to_string())
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             commands::show_window_impl(app);
         }))
@@ -185,14 +223,23 @@ fn main() {
             commands::update_background_opacity,
             commands::app_version,
         ])
-        .build(tauri::generate_context!())
-        .expect("启动闪记失败")
-        .run(|app, event| {
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
-                commands::persist(app);
-            }
-        });
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            log::error!("启动失败：{err}");
+            fatal_dialog(&format!("闪记启动失败：\n{err}"));
+            std::process::exit(1);
+        }
+    };
+
+    app.run(|app, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            commands::persist(app);
+        }
+    });
 }
