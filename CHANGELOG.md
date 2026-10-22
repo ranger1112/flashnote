@@ -29,6 +29,7 @@
 - 升级 Vitest 4，测试与构建共用同一份 Vite 8；lockfile 统一到官方源。
 - tokio 升级到 1.54.1（RUSTSEC-2026-0384）；updater 开启 `requireSignedVersion`。
 - 便携版 zip 附带 LICENSE，SHA256SUMS 覆盖 `.sig` 与 `latest.json`。
+- 前端引入 happy-dom，新增 11 个状态机 DOM 回归测试（删除撤销、搜索竞态、设置回滚、历史错误态、草稿加载）。
 
 ### 文档
 

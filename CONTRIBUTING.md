@@ -26,7 +26,7 @@ CI 会在 Windows 上跑同样的检查，本地先跑一遍可以少一轮往�
 
 ```bash
 npm run build                          # 类型检查 + 前端构建
-npm test                               # 前端单元测试
+npm test                               # 前端测试（纯函数 + DOM 状态机）
 cd src-tauri
 cargo fmt --all -- --check             # 格式
 cargo clippy --all-targets -- -D warnings
