@@ -179,6 +179,9 @@ fn main() {
             commands::complete_onboarding,
             commands::update_history_preview,
             commands::update_auto_update,
+            commands::update_theme,
+            commands::update_auto_hide,
+            commands::update_background_opacity,
             commands::app_version,
         ])
         .build(tauri::generate_context!())

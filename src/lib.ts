@@ -60,6 +60,31 @@ export function accelFromEvent(event: AccelEvent): string | null {
   return [...mods, key].join("+");
 }
 
+export type ThemeMode = "system" | "light" | "dark";
+export type ResolvedTheme = "light" | "dark";
+
+export const MIN_OPACITY = 0.6;
+export const MAX_OPACITY = 1;
+
+/** 后端或旧配置给出的任意值，收敛到支持的三档主题。 */
+export function normalizeTheme(value: unknown): ThemeMode {
+  if (typeof value !== "string") return "system";
+  const mode = value.trim().toLowerCase();
+  return mode === "light" || mode === "dark" ? mode : "system";
+}
+
+/** 「跟随系统」按当前系统偏好解析成具体主题。 */
+export function resolveTheme(mode: ThemeMode, prefersLight: boolean): ResolvedTheme {
+  if (mode === "system") return prefersLight ? "light" : "dark";
+  return mode;
+}
+
+/** 背景不透明度夹到 60%–100%；非法数字按不透明处理。 */
+export function clampOpacity(value: number): number {
+  if (!Number.isFinite(value)) return MAX_OPACITY;
+  return Math.min(MAX_OPACITY, Math.max(MIN_OPACITY, value));
+}
+
 /** 历史面板的本地过滤：日期、时间、正文、来源都参与匹配（调用方传入小写化的词）。 */
 export function matchesTerm(
   note: Pick<NoteEntry, "date" | "time" | "content" | "source">,

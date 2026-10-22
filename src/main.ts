@@ -7,7 +7,16 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
-import { accelFromEvent, formatAccel, matchesTerm, type NoteEntry } from "./lib";
+import {
+  accelFromEvent,
+  clampOpacity,
+  formatAccel,
+  matchesTerm,
+  normalizeTheme,
+  resolveTheme,
+  type NoteEntry,
+  type ThemeMode,
+} from "./lib";
 
 interface Settings {
   notesDir: string;
@@ -18,6 +27,9 @@ interface Settings {
   historyPreview: boolean;
   autoUpdate: boolean;
   onboarded: boolean;
+  theme: ThemeMode;
+  autoHideOnBlur: boolean;
+  backgroundOpacity: number;
   window: unknown;
 }
 
@@ -66,6 +78,10 @@ const captureSourceCheck = el<HTMLInputElement>("capture-source");
 const markdownModeCheck = el<HTMLInputElement>("markdown-mode");
 const autostartCheck = el<HTMLInputElement>("autostart");
 const autoUpdateCheck = el<HTMLInputElement>("auto-update");
+const autoHideCheck = el<HTMLInputElement>("auto-hide");
+const themeSelect = el<HTMLSelectElement>("theme");
+const bgOpacityInput = el<HTMLInputElement>("bg-opacity");
+const bgOpacityValue = el<HTMLSpanElement>("bg-opacity-value");
 const checkUpdateButton = el<HTMLButtonElement>("check-update");
 const updateStatus = el<HTMLParagraphElement>("update-status");
 const appVersionLabel = el<HTMLSpanElement>("app-version");
@@ -74,7 +90,10 @@ const updateBannerText = el<HTMLSpanElement>("update-banner-text");
 const updateBannerAction = el<HTMLButtonElement>("update-banner-action");
 const updateBannerDismiss = el<HTMLButtonElement>("update-banner-dismiss");
 const sourceLabel = el<HTMLSpanElement>("source");
+const card = el<HTMLDivElement>("card");
 const toastEl = el<HTMLDivElement>("toast");
+const toastMessage = el<HTMLSpanElement>("toast-message");
+const toastAction = el<HTMLButtonElement>("toast-action");
 const resizeGrip = el<HTMLDivElement>("resize-grip");
 const welcomePanel = el<HTMLElement>("welcome");
 const welcomeHotkey = el<HTMLSpanElement>("welcome-hotkey");
@@ -91,6 +110,9 @@ let settings: Settings = {
   historyPreview: false,
   autoUpdate: true,
   onboarded: true,
+  theme: "system",
+  autoHideOnBlur: false,
+  backgroundOpacity: 1,
   window: null,
 };
 let pinned = false;
@@ -111,15 +133,52 @@ let updating = false;
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
 
+let toastActionHandler: (() => void) | null = null;
+
+function hideToast(): void {
+  if (toastTimer !== undefined) {
+    window.clearTimeout(toastTimer);
+    toastTimer = undefined;
+  }
+  toastEl.classList.remove("show", "actionable");
+  toastAction.classList.add("hidden");
+  toastActionHandler = null;
+}
+
 function toast(message: string, error = false, duration = 1600): void {
   toastEl.setAttribute("role", error ? "alert" : "status");
   toastEl.setAttribute("aria-live", error ? "assertive" : "polite");
-  toastEl.textContent = message;
+  toastMessage.textContent = message;
   toastEl.classList.toggle("error", error);
+  toastEl.classList.remove("actionable");
+  toastAction.classList.add("hidden");
+  toastActionHandler = null;
   toastEl.classList.add("show");
   if (toastTimer !== undefined) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), duration);
 }
+
+/** 带一个操作按钮的 toast（目前用于「撤销删除」），显示时长由调用方控制。 */
+function showActionToast(message: string, label: string, onAction: () => void): void {
+  toastEl.setAttribute("role", "status");
+  toastEl.setAttribute("aria-live", "polite");
+  toastMessage.textContent = message;
+  toastEl.classList.remove("error");
+  toastAction.textContent = label;
+  toastAction.classList.remove("hidden");
+  toastActionHandler = onAction;
+  toastEl.classList.add("actionable", "show");
+  if (toastTimer !== undefined) {
+    window.clearTimeout(toastTimer);
+    toastTimer = undefined;
+  }
+}
+
+toastAction.addEventListener("click", () => {
+  const handler = toastActionHandler;
+  hideToast();
+  handler?.();
+});
 
 function showUpdateBanner(message: string, actionLabel: string | null): void {
   updateBannerText.textContent = message;
@@ -257,12 +316,21 @@ async function flushDraft(): Promise<void> {
   await persistDraft();
 }
 
-/** 面板打开时让背景不可聚焦，关闭后恢复。 */
+/**
+ * 面板打开时让背景不可聚焦，关闭后恢复。
+ * #toast 不参与：撤销删除的按钮要能在面板打开时点击。
+ */
 function setBackgroundInert(inert: boolean): void {
-  for (const selector of ["header", "main", "footer", "#toast", "#resize-grip"]) {
+  for (const selector of ["header", "main", "footer", "#resize-grip"]) {
     const node = document.querySelector<HTMLElement>(selector);
     if (node) node.inert = inert;
   }
+}
+
+function anyPanelOpen(): boolean {
+  return [welcomePanel, settingsPanel, historyPanel].some(
+    (panel) => !panel.classList.contains("hidden"),
+  );
 }
 
 /** 把 Tab 焦点限制在当前打开的面板内。 */
@@ -291,6 +359,98 @@ function trapFocus(event: KeyboardEvent): void {
   }
 }
 
+const panelLeaveTimers = new WeakMap<HTMLElement, number>();
+
+/** 打开面板：播放入场动画，并让背景让位（半透明时避免正文透底）。 */
+function showPanel(panel: HTMLElement): void {
+  const pending = panelLeaveTimers.get(panel);
+  if (pending !== undefined) {
+    window.clearTimeout(pending);
+    panelLeaveTimers.delete(panel);
+  }
+  panel.classList.remove("hidden", "panel-leave", "panel-enter");
+  // 强制回流，连续打开同一面板时动画也会重新播放
+  void panel.offsetWidth;
+  if (!reducedMotion.matches) {
+    panel.classList.add("panel-enter");
+    window.setTimeout(() => panel.classList.remove("panel-enter"), PANEL_IN_MS);
+  }
+  card.classList.add("panel-open");
+  setBackgroundInert(true);
+}
+
+/** 关闭面板：动画结束后才真正 hidden，焦点与 inert 也在那时恢复。 */
+function hidePanel(panel: HTMLElement, animate = true): void {
+  if (panel.classList.contains("hidden") || panel.classList.contains("panel-leave")) return;
+  panel.classList.remove("panel-enter");
+
+  if (!animate || reducedMotion.matches) {
+    panel.classList.add("hidden");
+    afterPanelClosed();
+    return;
+  }
+
+  panel.classList.add("panel-leave");
+  const timer = window.setTimeout(() => {
+    panelLeaveTimers.delete(panel);
+    // 动画期间被重新打开：showPanel 已移除 panel-leave，不要再隐藏
+    if (!panel.classList.contains("panel-leave")) return;
+    panel.classList.remove("panel-leave");
+    panel.classList.add("hidden");
+    afterPanelClosed();
+  }, PANEL_OUT_MS);
+  panelLeaveTimers.set(panel, timer);
+}
+
+/** 没有面板可见时恢复背景交互，焦点回到输入框而不是标题栏按钮。 */
+function afterPanelClosed(): void {
+  if (anyPanelOpen()) return;
+  card.classList.remove("panel-open");
+  setBackgroundInert(false);
+  textarea.focus();
+}
+
+const systemLight = window.matchMedia("(prefers-color-scheme: light)");
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+// 与 styles.css 里的动画时长保持一致
+const PANEL_IN_MS = 160;
+const PANEL_OUT_MS = 120;
+
+function applyTheme(mode: ThemeMode): void {
+  const resolved = resolveTheme(mode, systemLight.matches);
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved;
+}
+
+function paintOpacity(value: number): void {
+  document.documentElement.style.setProperty("--surface-alpha", String(value));
+  bgOpacityInput.value = String(Math.round(value * 100));
+  bgOpacityValue.textContent = `${Math.round(value * 100)}%`;
+}
+
+let windowFocusedOnce = false;
+let suppressBlurUntil = 0;
+
+/** 可选：窗口失去焦点时收起。常驻、面板打开、快捷键录制期间都不触发。 */
+function registerAutoHide(): void {
+  void getCurrentWindow().onFocusChanged(async ({ payload: focused }) => {
+    if (focused) {
+      windowFocusedOnce = true;
+      return;
+    }
+    if (!windowFocusedOnce || !settings.autoHideOnBlur || pinned || recording) return;
+    if (Date.now() < suppressBlurUntil || anyPanelOpen()) return;
+    if (!(await getCurrentWindow().isVisible())) return;
+
+    // 再确认一次，避开切换焦点时的瞬时抖动
+    window.setTimeout(() => {
+      if (Date.now() < suppressBlurUntil) return;
+      if (document.hasFocus() || pinned || recording || anyPanelOpen()) return;
+      void hideWindow();
+    }, 120);
+  });
+}
+
 function paintPin(): void {
   pinButton.classList.toggle("active", pinned);
   pinButton.title = pinned
@@ -310,12 +470,21 @@ async function refreshSettings(): Promise<void> {
   captureSourceCheck.checked = settings.captureSource;
   markdownModeCheck.checked = settings.markdownMode;
   autoUpdateCheck.checked = settings.autoUpdate;
+  autoHideCheck.checked = settings.autoHideOnBlur;
+
+  settings.theme = normalizeTheme(settings.theme);
+  themeSelect.value = settings.theme;
+  applyTheme(settings.theme);
+
+  settings.backgroundOpacity = clampOpacity(settings.backgroundOpacity);
+  paintOpacity(settings.backgroundOpacity);
 }
 
 async function hideWindow(): Promise<void> {
-  closeSettings();
-  closeHistory();
-  closeWelcome();
+  // 收起窗口时不做退出动画，避免面板还停留在一半
+  closeSettings(false);
+  closeHistory(false);
+  closeWelcome(false);
   setBackgroundInert(false);
   await flushDraft();
   await invoke("hide_window");
@@ -349,16 +518,18 @@ async function saveNote(): Promise<void> {
 }
 
 function openSettings(): void {
-  closeHistory();
-  closeWelcome();
+  closeHistory(false);
+  closeWelcome(false);
   hotkeyInput.value = formatAccel(settings.hotkey);
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
   markdownModeCheck.checked = settings.markdownMode;
   autoUpdateCheck.checked = settings.autoUpdate;
+  autoHideCheck.checked = settings.autoHideOnBlur;
+  themeSelect.value = settings.theme;
+  paintOpacity(settings.backgroundOpacity);
   hotkeyError.textContent = "";
-  settingsPanel.classList.remove("hidden");
-  setBackgroundInert(true);
+  showPanel(settingsPanel);
   settingsClose.focus();
 }
 
@@ -368,16 +539,10 @@ function stopRecording(): void {
   hotkeyRecord.textContent = "录制";
 }
 
-function closeSettings(): void {
+function closeSettings(animate = true): void {
   if (settingsPanel.classList.contains("hidden")) return;
-  settingsPanel.classList.add("hidden");
   stopRecording();
-  if (!historyPanel.classList.contains("hidden") || !welcomePanel.classList.contains("hidden")) {
-    return;
-  }
-  setBackgroundInert(false);
-  // 焦点回到输入框而不是齿轮按钮：按钮会留下 focus-visible 描边，看起来像没点干净
-  textarea.focus();
+  hidePanel(settingsPanel, animate);
 }
 
 function dateLabel(date: string): string {
@@ -390,44 +555,33 @@ function dateLabel(date: string): string {
   return date === today ? `今天 · ${date}` : date;
 }
 
-function closeHistory(): void {
+function closeHistory(animate = true): void {
   if (historyPanel.classList.contains("hidden")) return;
-  historyPanel.classList.add("hidden");
-  if (!settingsPanel.classList.contains("hidden") || !welcomePanel.classList.contains("hidden")) {
-    return;
-  }
-  setBackgroundInert(false);
-  textarea.focus();
+  // 面板关掉后列表就不再可见，未落盘的删除要立刻提交
+  void flushPendingDelete();
+  hidePanel(historyPanel, animate);
 }
 
 function showWelcome(): void {
   welcomeHotkey.textContent = formatAccel(settings.hotkey);
   welcomeDir.textContent = settings.notesDir;
-  welcomePanel.classList.remove("hidden");
-  setBackgroundInert(true);
+  showPanel(welcomePanel);
   welcomeStart.focus();
 }
 
-function closeWelcome(): void {
+function closeWelcome(animate = true): void {
   if (welcomePanel.classList.contains("hidden")) return;
-  welcomePanel.classList.add("hidden");
   settings.onboarded = true;
   void invoke("complete_onboarding").catch(() => {
     // 下次启动时重新展示引导
   });
-  if (!settingsPanel.classList.contains("hidden") || !historyPanel.classList.contains("hidden")) {
-    return;
-  }
-  setBackgroundInert(false);
+  hidePanel(welcomePanel, animate);
 }
 
 async function dismissWelcome(openSettingsAfter = false): Promise<void> {
-  closeWelcome();
-  if (openSettingsAfter) {
-    openSettings();
-  } else {
-    textarea.focus();
-  }
+  // 直接切到设置时不做退出动画，避免两个面板叠在一起
+  closeWelcome(!openSettingsAfter);
+  if (openSettingsAfter) openSettings();
 }
 
 function markdownHtml(markdown: string): string {
@@ -440,42 +594,68 @@ function paintPreviewButton(): void {
   historyPreview.textContent = settings.historyPreview ? "原文" : "预览";
 }
 
-function bindDelete(button: HTMLButtonElement, note: NoteEntry): void {
-  let confirmTimer: number | undefined;
-  const reset = (): void => {
-    if (confirmTimer !== undefined) window.clearTimeout(confirmTimer);
-    confirmTimer = undefined;
-    button.dataset.confirm = "";
-    button.textContent = "删除";
-    button.classList.remove("confirm");
-  };
-
-  button.addEventListener("click", () => {
-    if (button.dataset.confirm === "1") {
-      reset();
-      void deleteEntry(note);
-      return;
-    }
-    button.dataset.confirm = "1";
-    button.textContent = "确认";
-    button.classList.add("confirm");
-    confirmTimer = window.setTimeout(reset, 3000);
-  });
+interface PendingDelete {
+  note: NoteEntry;
+  index: number;
+  timer: number;
 }
 
-async function deleteEntry(note: NoteEntry): Promise<void> {
+let pendingDelete: PendingDelete | null = null;
+
+function bindDelete(button: HTMLButtonElement, note: NoteEntry): void {
+  button.addEventListener("click", () => requestDelete(note));
+}
+
+/** 先从列表移除并给 5 秒撤销窗口，到期才真正写盘。 */
+function requestDelete(note: NoteEntry): void {
+  // 同时只保留一条待删除记录，前一条立即落盘
+  if (pendingDelete) void commitPendingDelete();
+
+  const index = notes.indexOf(note);
+  if (index < 0) return;
+  notes.splice(index, 1);
+  renderNotes();
+
+  const timer = window.setTimeout(() => void commitPendingDelete(), 5000);
+  pendingDelete = { note, index, timer };
+  showActionToast("已删除", "撤销", undoDelete);
+}
+
+async function commitPendingDelete(): Promise<void> {
+  const pending = pendingDelete;
+  if (!pending) return;
+  pendingDelete = null;
+  window.clearTimeout(pending.timer);
+  // 只关掉自己的撤销提示，别误伤期间的其他 toast
+  if (toastActionHandler === undoDelete) hideToast();
+
   try {
     await invoke("delete_note_entry", {
-      path: note.path,
-      date: note.date,
-      time: note.time,
-      content: note.content,
+      path: pending.note.path,
+      date: pending.note.date,
+      time: pending.note.time,
+      content: pending.note.content,
     });
-    toast("已删除");
-    refreshNotes();
   } catch (error) {
+    // 删除失败就把条目放回原位，避免界面上「看起来删掉了」
+    notes.splice(Math.min(pending.index, notes.length), 0, pending.note);
+    renderNotes();
     toast(String(error), true);
   }
+}
+
+function undoDelete(): void {
+  const pending = pendingDelete;
+  if (!pending) return;
+  pendingDelete = null;
+  window.clearTimeout(pending.timer);
+  notes.splice(Math.min(pending.index, notes.length), 0, pending.note);
+  renderNotes();
+  toast("已恢复", false, 1200);
+}
+
+async function flushPendingDelete(): Promise<void> {
+  if (pendingDelete) await commitPendingDelete();
 }
 
 function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButtonElement): void {
@@ -675,6 +855,7 @@ function renderNotes(): void {
 }
 
 async function loadNotes(reset = true): Promise<void> {
+  await flushPendingDelete();
   const seq = ++searchSeq;
   if (reset) noteOffset = 0;
 
@@ -699,6 +880,8 @@ async function loadNotes(reset = true): Promise<void> {
 }
 
 async function runSearch(): Promise<void> {
+  // 重新查询前先提交待删除项，否则磁盘上的旧条目会重新出现
+  await flushPendingDelete();
   const seq = ++searchSeq;
   const term = historySearch.value.trim();
   if (!term) {
@@ -751,10 +934,9 @@ async function toggleHistoryPreview(): Promise<void> {
 }
 
 function openHistory(): void {
-  closeSettings();
-  closeWelcome();
-  historyPanel.classList.remove("hidden");
-  setBackgroundInert(true);
+  closeSettings(false);
+  closeWelcome(false);
+  showPanel(historyPanel);
   historySearch.value = "";
   notes = [];
   serverFiltered = false;
@@ -805,6 +987,7 @@ async function init(): Promise<void> {
     pinned = settings.pinned;
     paintPin();
     paintPreviewButton();
+    registerAutoHide();
 
     try {
       autostartCheck.checked = await isEnabled();
@@ -886,9 +1069,9 @@ pinButton.addEventListener("click", async () => {
 });
 
 settingsButton.addEventListener("click", openSettings);
-settingsClose.addEventListener("click", closeSettings);
+settingsClose.addEventListener("click", () => closeSettings());
 notesButton.addEventListener("click", openHistory);
-historyClose.addEventListener("click", closeHistory);
+historyClose.addEventListener("click", () => closeHistory());
 historyPreview.addEventListener("click", () => void toggleHistoryPreview());
 historySearch.addEventListener("input", () => {
   if (searchTimer !== undefined) window.clearTimeout(searchTimer);
@@ -963,6 +1146,62 @@ autoUpdateCheck.addEventListener("change", async () => {
     autoUpdateCheck.checked = !autoUpdateCheck.checked;
     toast(String(error), true);
   }
+});
+
+autoHideCheck.addEventListener("change", async () => {
+  try {
+    await invoke("update_auto_hide", { enabled: autoHideCheck.checked });
+    settings.autoHideOnBlur = autoHideCheck.checked;
+    toast(autoHideCheck.checked ? "已开启失焦收起" : "已关闭失焦收起");
+  } catch (error) {
+    autoHideCheck.checked = !autoHideCheck.checked;
+    toast(String(error), true);
+  }
+});
+
+themeSelect.addEventListener("change", async () => {
+  const previous = settings.theme;
+  const next = normalizeTheme(themeSelect.value);
+  settings.theme = next;
+  applyTheme(next);
+  try {
+    settings.theme = normalizeTheme(await invoke<string>("update_theme", { theme: next }));
+    themeSelect.value = settings.theme;
+    applyTheme(settings.theme);
+    toast("主题已更新");
+  } catch (error) {
+    settings.theme = previous;
+    themeSelect.value = previous;
+    applyTheme(previous);
+    toast(String(error), true);
+  }
+});
+
+bgOpacityInput.addEventListener("input", () => {
+  paintOpacity(clampOpacity(Number(bgOpacityInput.value) / 100));
+});
+
+bgOpacityInput.addEventListener("change", async () => {
+  const previous = settings.backgroundOpacity;
+  const value = clampOpacity(Number(bgOpacityInput.value) / 100);
+  try {
+    const applied = await invoke<number>("update_background_opacity", { opacity: value });
+    settings.backgroundOpacity = clampOpacity(applied);
+    paintOpacity(settings.backgroundOpacity);
+  } catch (error) {
+    settings.backgroundOpacity = previous;
+    paintOpacity(previous);
+    toast(String(error), true);
+  }
+});
+
+systemLight.addEventListener("change", () => {
+  if (settings.theme === "system") applyTheme("system");
+});
+
+// 窗口被隐藏时把未落盘的删除提交掉（例如从托盘收起）
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") void flushPendingDelete();
 });
 
 checkUpdateButton.addEventListener("click", () => {
@@ -1040,6 +1279,8 @@ resizeGrip.addEventListener("pointerdown", (event) => {
 });
 
 void listen<ShowPayload>("window-shown", (event) => {
+  // 唤起瞬间可能有一次焦点切换，避免误触发失焦收起
+  suppressBlurUntil = Date.now() + 600;
   setSource(event.payload.source);
   if (!appReady) return;
   if (!historyPanel.classList.contains("hidden")) {
@@ -1053,10 +1294,12 @@ void listen<ShowPayload>("window-shown", (event) => {
 });
 
 void listen("open-settings", () => {
+  suppressBlurUntil = Date.now() + 600;
   openSettings();
 });
 
 void listen("open-history", () => {
+  suppressBlurUntil = Date.now() + 600;
   openHistory();
 });
 

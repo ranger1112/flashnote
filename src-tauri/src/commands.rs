@@ -714,6 +714,37 @@ pub fn update_auto_update(
 }
 
 #[tauri::command]
+pub fn update_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> String {
+    let applied = settings::normalize_theme(&theme);
+    state.settings.lock().unwrap().theme = applied.clone();
+    persist(&app);
+    applied
+}
+
+#[tauri::command]
+pub fn update_auto_hide(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.settings.lock().unwrap().auto_hide_on_blur = enabled;
+    persist(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_background_opacity(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    opacity: f64,
+) -> f64 {
+    let applied = settings::clamp_opacity(opacity);
+    state.settings.lock().unwrap().background_opacity = applied;
+    persist(&app);
+    applied
+}
+
+#[tauri::command]
 pub fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }

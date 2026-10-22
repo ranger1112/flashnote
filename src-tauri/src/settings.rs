@@ -19,6 +19,28 @@ fn default_true() -> bool {
     true
 }
 
+/// 背景不透明度的下限：再低正文在浅色桌面上就难以辨认。
+pub const MIN_BACKGROUND_OPACITY: f64 = 0.6;
+
+/// 设置文件里的主题只接受这三档，非法值回落跟随系统。
+pub fn normalize_theme(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "light" => "light",
+        "dark" => "dark",
+        _ => "system",
+    }
+    .to_string()
+}
+
+/// 把不透明度夹到支持区间；非法浮点数按不透明处理。
+pub fn clamp_opacity(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(MIN_BACKGROUND_OPACITY, 1.0)
+    } else {
+        1.0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -34,6 +56,12 @@ pub struct Settings {
     /// 旧版本没有这个字段，缺省视为已完成引导；只有全新安装才会看到引导。
     #[serde(default = "default_true")]
     pub onboarded: bool,
+    /// system / light / dark；旧配置缺这个字段时跟随系统。
+    pub theme: String,
+    /// 窗口失去焦点时自动收起；常驻模式下面不生效。
+    pub auto_hide_on_blur: bool,
+    /// 小窗与面板的背景不透明度，0.6–1.0。
+    pub background_opacity: f64,
     pub window: Option<WindowGeometry>,
 }
 
@@ -48,6 +76,9 @@ impl Default for Settings {
             history_preview: false,
             auto_update: true,
             onboarded: false,
+            theme: "system".to_string(),
+            auto_hide_on_blur: false,
+            background_opacity: 1.0,
             window: None,
         }
     }
@@ -88,7 +119,12 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
 
     let settings = match fs::read_to_string(path) {
         Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
-            Ok(parsed) => parsed,
+            // 手工编辑出的非法值只纠正字段，不把整份设置当成损坏
+            Ok(mut parsed) => {
+                parsed.theme = normalize_theme(&parsed.theme);
+                parsed.background_opacity = clamp_opacity(parsed.background_opacity);
+                parsed
+            }
             Err(err) => {
                 log::error!("设置文件解析失败（{}）：{err}", path.display());
                 warning = Some(match backup_corrupt(path) {
@@ -260,6 +296,9 @@ mod tests {
             history_preview: true,
             auto_update: false,
             onboarded: true,
+            theme: "dark".to_string(),
+            auto_hide_on_blur: true,
+            background_opacity: 0.8,
             window: Some(WindowGeometry {
                 x: -120,
                 y: 40,
@@ -282,6 +321,9 @@ mod tests {
         assert!(loaded.settings.pinned);
         assert!(loaded.settings.history_preview);
         assert!(!loaded.settings.auto_update, "关闭状态应被保存");
+        assert_eq!(loaded.settings.theme, "dark");
+        assert!(loaded.settings.auto_hide_on_blur);
+        assert_eq!(loaded.settings.background_opacity, 0.8);
 
         let geometry = loaded.settings.window.expect("几何应当被保存");
         assert_eq!(
@@ -308,9 +350,48 @@ mod tests {
         assert!(!loaded.settings.history_preview);
         assert!(loaded.settings.auto_update, "老配置缺字段时默认检查更新");
         assert!(loaded.settings.onboarded, "老配置缺字段时视为已完成引导");
+        assert_eq!(loaded.settings.theme, "system", "老配置缺字段时跟随系统");
+        assert!(!loaded.settings.auto_hide_on_blur);
+        assert_eq!(loaded.settings.background_opacity, 1.0);
         assert!(loaded.settings.window.is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_theme_falls_back_to_system() {
+        let dir = temp_dir("theme");
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"theme":"neon"}"#).unwrap();
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warning.is_none(), "非法主题不算文件损坏");
+        assert_eq!(loaded.settings.theme, "system");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opacity_is_clamped_to_supported_range() {
+        let dir = temp_dir("opacity");
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"backgroundOpacity":0.2}"#).unwrap();
+        assert_eq!(load_from_path(&path).settings.background_opacity, 0.6);
+
+        fs::write(&path, r#"{"backgroundOpacity":1.4}"#).unwrap();
+        assert_eq!(load_from_path(&path).settings.background_opacity, 1.0);
+
+        assert_eq!(clamp_opacity(f64::NAN), 1.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn theme_matching_is_case_insensitive() {
+        assert_eq!(normalize_theme(" Light "), "light");
+        assert_eq!(normalize_theme("DARK"), "dark");
+        assert_eq!(normalize_theme(""), "system");
     }
 
     #[test]

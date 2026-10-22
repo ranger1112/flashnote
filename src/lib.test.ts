@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { accelFromEvent, formatAccel, matchesTerm, type AccelEvent } from "./lib";
+import {
+  accelFromEvent,
+  clampOpacity,
+  formatAccel,
+  matchesTerm,
+  normalizeTheme,
+  resolveTheme,
+  type AccelEvent,
+} from "./lib";
 
 function key(partial: Partial<AccelEvent>): AccelEvent {
   return {
@@ -25,6 +33,48 @@ describe("formatAccel", () => {
 
   it("未知按键原样保留", () => {
     expect(formatAccel("ctrl+space")).toBe("Ctrl + space");
+  });
+});
+
+describe("normalizeTheme", () => {
+  it("接受三档合法主题并忽略大小写与空白", () => {
+    expect(normalizeTheme("system")).toBe("system");
+    expect(normalizeTheme(" Light ")).toBe("light");
+    expect(normalizeTheme("DARK")).toBe("dark");
+  });
+
+  it("非法值与缺失值回落跟随系统", () => {
+    expect(normalizeTheme("neon")).toBe("system");
+    expect(normalizeTheme("")).toBe("system");
+    expect(normalizeTheme(null)).toBe("system");
+    expect(normalizeTheme(1)).toBe("system");
+  });
+});
+
+describe("resolveTheme", () => {
+  it("系统模式按系统偏好解析", () => {
+    expect(resolveTheme("system", true)).toBe("light");
+    expect(resolveTheme("system", false)).toBe("dark");
+  });
+
+  it("显式主题不受系统偏好影响", () => {
+    expect(resolveTheme("light", false)).toBe("light");
+    expect(resolveTheme("dark", true)).toBe("dark");
+  });
+});
+
+describe("clampOpacity", () => {
+  it("夹到 60%–100%", () => {
+    expect(clampOpacity(0.2)).toBe(0.6);
+    expect(clampOpacity(1.4)).toBe(1);
+    expect(clampOpacity(0.8)).toBe(0.8);
+    expect(clampOpacity(0.6)).toBe(0.6);
+    expect(clampOpacity(1)).toBe(1);
+  });
+
+  it("非有限值按不透明处理", () => {
+    expect(clampOpacity(Number.NaN)).toBe(1);
+    expect(clampOpacity(Number.POSITIVE_INFINITY)).toBe(1);
   });
 });
 

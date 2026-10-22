@@ -26,7 +26,8 @@ Press the global hotkey and a small window floats above the current window; jot 
 - **System tray**: left-click to summon; right-click to open today's notes, the notes folder, settings, or quit.
 - **Single instance**: launching again only summons the existing window — no second tray icon or hotkey conflict.
 - **Auto-update**: silently checks GitHub Releases on startup; when a new version appears, a banner shows at the bottom of the window — click it to download, verify the signature, and install, effective after restart.
-- **Other**: optional launch at login, follows the system light/dark theme, multi-monitor boundary correction.
+- **Appearance**: theme selection (system / light / dark) and adjustable background opacity (60%–100%).
+- **Other**: optional launch at login, auto-hide on focus loss, multi-monitor boundary correction.
 
 ## Usage
 
@@ -66,6 +67,9 @@ Left-clicking the tray icon summons the popover directly; the right-click menu c
 | Markdown mode | When on, each entry is written as `### 时间` + the raw content, so block-level syntax such as code blocks and tables renders correctly; off by default. |
 | Launch at login | Adds a startup entry for the current user; off by default. |
 | Check for updates automatically | Silently checks for new versions on startup and rechecks every 6 hours while running; on by default. Turning it off stops queued checks immediately; you can still trigger a check manually with "Check for updates". |
+| Hide when focus is lost | Tucks the window away when you click another application; off by default. Ignored in pin mode and while a panel is open. |
+| Theme | System, light, or dark; system mode follows Windows light/dark changes live. |
+| Background opacity | 60%–100%, applied to the window and its panels alike; 100% (opaque) by default. |
 
 Settings are stored at:
 
@@ -105,7 +109,7 @@ Rules:
 - Loads 100 entries at a time by default; "Load more" at the bottom pages further back.
 - Search scans every `YYYY-MM-DD.md` in the notes directory, case-insensitive, covering body text, time, and source title, returning at most 200 results.
 - "Preview" renders the entry content as Markdown (sanitized with DOMPurify); click again to return to the raw text. The toggle state is remembered.
-- "Edit" rewrites the entry in place while preserving the source line and the original format (compact list / Markdown block); "Delete" requires a second click within 3 seconds to confirm.
+- "Edit" rewrites the entry in place while preserving the source line and the original format (compact list / Markdown block); "Delete" removes the entry immediately, with a 5-second undo in the toast.
 
 ### Markdown mode
 

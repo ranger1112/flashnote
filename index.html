@@ -56,7 +56,10 @@
         <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 收起</span>
       </footer>
 
-      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+      <div id="toast" class="toast" role="status" aria-live="polite">
+        <span id="toast-message"></span>
+        <button id="toast-action" class="toast-action hidden" type="button">撤销</button>
+      </div>
 
       <div id="update-banner" class="update-banner hidden" role="status" aria-live="polite">
         <span id="update-banner-text" class="update-banner-text"></span>
@@ -124,6 +127,25 @@
             <input id="auto-update" type="checkbox" />
             自动检查更新
           </label>
+
+          <label class="check" title="窗口失去焦点时自动收起；常驻模式下不生效">
+            <input id="auto-hide" type="checkbox" />
+            失去焦点时自动收起
+          </label>
+
+          <div class="field">
+            <label for="theme">主题</label>
+            <select id="theme" class="select">
+              <option value="system">跟随系统</option>
+              <option value="light">浅色</option>
+              <option value="dark">深色</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="bg-opacity">背景不透明度 <span id="bg-opacity-value">100%</span></label>
+            <input id="bg-opacity" type="range" min="60" max="100" step="1" />
+          </div>
 
           <div class="field">
             <div class="row">
