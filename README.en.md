@@ -202,11 +202,11 @@ Outputs:
 ### Testing
 
 ```bash
-npm test                 # Frontend pure functions (hotkey parsing, search matching)
+npm test                 # Frontend tests: pure helpers + DOM state machine (happy-dom)
 cd src-tauri && cargo test
 ```
 
-Rust unit tests cover entry formatting, multi-line indentation, source-title normalization, file append separation, pagination, search, file rebuilding after edit/delete, atomic settings writes and corruption recovery, and path traversal validation for the notes directory; the frontend uses Vitest to cover `accelFromEvent` / `formatAccel` and search matching. Both run in CI.
+Rust unit tests cover entry formatting, multi-line indentation, source-title normalization, file append separation, pagination, search, file rebuilding after edit/delete, atomic settings writes and corruption recovery, and path traversal validation for the notes directory; the frontend uses Vitest for pure helpers (`accelFromEvent` / `formatAccel`, search matching) and loads the real `index.html` in happy-dom to cover delete/undo, search races, settings rollback, history error states, and draft loading. Both run in CI.
 
 ### Releasing
 
@@ -235,7 +235,8 @@ flashnote/
 ├─ src/
 │  ├─ main.ts                  # Frontend state and interaction (saving, hotkey recording, drafts)
 │  ├─ lib.ts                   # Pure helpers: hotkey parsing, search matching, paging offset
-│  ├─ lib.test.ts              # Frontend unit tests (Vitest)
+│  ├─ lib.test.ts              # Frontend pure-function tests (Vitest)
+│  ├─ main.dom.test.ts         # Frontend state-machine DOM tests (happy-dom)
 │  └─ styles.css               # Light/dark themes, floating card styles
 ├─ src-tauri/
 │  ├─ src/

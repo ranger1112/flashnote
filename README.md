@@ -206,7 +206,7 @@ npm test                 # 前端纯函数（快捷键解析、搜索匹配）
 cd src-tauri && cargo test
 ```
 
-Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，编辑 / 删除后的文件重建，设置的原子写入与损坏恢复，以及笔记目录的路径越界校验；前端用 Vitest 覆盖 `accelFromEvent` / `formatAccel` 与搜索匹配。两项都由 CI 执行。
+Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，编辑 / 删除后的文件重建，设置的原子写入与损坏恢复，以及笔记目录的路径越界校验；前端用 Vitest 覆盖 `accelFromEvent` / `formatAccel`、搜索匹配等纯函数，并在 happy-dom 里装载真实的 `index.html`，对删除撤销、搜索竞态、设置回滚、历史错误态与草稿加载做 DOM 级回归。两项都由 CI 执行。
 
 ### 发版
 
@@ -235,7 +235,8 @@ flashnote/
 ├─ src/
 │  ├─ main.ts                  # 前端状态与交互（保存、热键录制、草稿）
 │  ├─ lib.ts                   # 纯函数：快捷键解析、搜索匹配、分页偏移
-│  ├─ lib.test.ts              # 前端单元测试（Vitest）
+│  ├─ lib.test.ts              # 前端纯函数单元测试（Vitest）
+│  ├─ main.dom.test.ts         # 前端状态机 DOM 测试（happy-dom）
 │  └─ styles.css               # 深/浅色主题、悬浮卡片样式
 ├─ src-tauri/
 │  ├─ src/
