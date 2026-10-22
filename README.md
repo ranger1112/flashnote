@@ -58,7 +58,7 @@
 | 自动记录来源窗口 | 关闭后不再抓取和写入来源标题。 |
 | Markdown 模式 | 开启后每条写成 `### 时间` + 原文，代码块、表格等块级语法可正常渲染；默认关闭。 |
 | 开机自启 | 写入当前用户的启动项，默认关闭。 |
-| 自动检查更新 | 启动后静默检查一次新版本，默认开启；关闭后仍可用「检查更新」手动触发。 |
+| 自动检查更新 | 启动后静默检查新版本，常驻运行时每 6 小时复查，默认开启；关闭后立即停止排队的检查，仍可用「检查更新」手动触发。 |
 
 设置保存在：
 
@@ -131,7 +131,7 @@ const a = 1;
 每个 Release 都附带 `SHA256SUMS.txt`，可用来校验下载是否完整：
 
 ```powershell
-Get-FileHash .\FlashNote_0.2.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.2.1_x64-setup.exe -Algorithm SHA256
 ```
 
 把输出与 `SHA256SUMS.txt` 中对应行比对即可。
@@ -143,7 +143,7 @@ Get-FileHash .\FlashNote_0.2.0_x64-setup.exe -Algorithm SHA256
 从源码构建的安装包位于：
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.2.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\闪记_0.2.1_x64-setup.exe
 ```
 
 ## 开发
@@ -186,7 +186,7 @@ npm run tauri build
 产物：
 
 - 可执行文件：`src-tauri\target\release\flashnote.exe`
-- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.2.0_x64-setup.exe`
+- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.2.1_x64-setup.exe`
 
 ### 测试
 

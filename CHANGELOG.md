@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-22
+
+### 修复
+
+- 关闭「自动检查更新」后会立即取消已排队的检查，不必等到重启。
+- 常驻运行的实例每 6 小时复查一次更新，而不是只在启动时查一次。
+
 ## [0.2.0] - 2026-10-22
 
 ### 新增
@@ -30,6 +37,7 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.1.0

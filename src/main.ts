@@ -132,6 +132,30 @@ function hideUpdateBanner(): void {
   updateBanner.classList.add("hidden");
 }
 
+let autoCheckTimeout: number | undefined;
+let autoCheckInterval: number | undefined;
+
+function stopAutoUpdateChecks(): void {
+  if (autoCheckTimeout !== undefined) window.clearTimeout(autoCheckTimeout);
+  if (autoCheckInterval !== undefined) window.clearInterval(autoCheckInterval);
+  autoCheckTimeout = undefined;
+  autoCheckInterval = undefined;
+}
+
+// 启动 5 秒后检查一次；常驻不关的实例每 6 小时再查一次
+function startAutoUpdateChecks(): void {
+  stopAutoUpdateChecks();
+  if (!settings.autoUpdate) return;
+  autoCheckTimeout = window.setTimeout(() => {
+    autoCheckTimeout = undefined;
+    void checkForUpdate(false);
+    autoCheckInterval = window.setInterval(
+      () => void checkForUpdate(false),
+      6 * 60 * 60 * 1000,
+    );
+  }, 5000);
+}
+
 async function checkForUpdate(manual: boolean): Promise<void> {
   if (updating) return;
   // 已下载安装但尚未重启时，再查一次仍会返回同一版本，直接提示重启即可
@@ -807,9 +831,7 @@ async function init(): Promise<void> {
     }
 
     // 启动后延迟检查，不阻塞窗口显示；失败时静默
-    if (settings.autoUpdate) {
-      window.setTimeout(() => void checkForUpdate(false), 5000);
-    }
+    startAutoUpdateChecks();
 
     // 窗口在启动时就可见（首次运行、快捷键冲突）时立即提示；否则留到第一次唤起
     if (await getCurrentWindow().isVisible()) {
@@ -934,6 +956,7 @@ autoUpdateCheck.addEventListener("change", async () => {
   try {
     await invoke("update_auto_update", { enabled: autoUpdateCheck.checked });
     await refreshSettings();
+    startAutoUpdateChecks();
     toast(autoUpdateCheck.checked ? "已开启自动检查更新" : "已关闭自动检查更新");
   } catch (error) {
     autoUpdateCheck.checked = !autoUpdateCheck.checked;
