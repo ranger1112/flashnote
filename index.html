@@ -58,7 +58,12 @@
 
       <div id="toast" class="toast" role="status" aria-live="polite">
         <span id="toast-message"></span>
-        <button id="toast-action" class="toast-action hidden" type="button">撤销</button>
+      </div>
+
+      <!-- 撤销条和普通提示分开，避免「已更新」之类的提示把撤销入口挤掉 -->
+      <div id="undo-bar" class="toast undo-bar" role="status" aria-live="polite">
+        <span id="undo-message"></span>
+        <button id="undo-action" class="toast-action" type="button">撤销</button>
       </div>
 
       <div id="update-banner" class="update-banner hidden" role="status" aria-live="polite">

@@ -12,8 +12,10 @@ import {
   clampOpacity,
   formatAccel,
   matchesTerm,
+  nextOffset,
   normalizeTheme,
   resolveTheme,
+  withoutEntry,
   type NoteEntry,
   type ThemeMode,
 } from "./lib";
@@ -93,7 +95,9 @@ const sourceLabel = el<HTMLSpanElement>("source");
 const card = el<HTMLDivElement>("card");
 const toastEl = el<HTMLDivElement>("toast");
 const toastMessage = el<HTMLSpanElement>("toast-message");
-const toastAction = el<HTMLButtonElement>("toast-action");
+const undoBar = el<HTMLDivElement>("undo-bar");
+const undoMessage = el<HTMLSpanElement>("undo-message");
+const undoAction = el<HTMLButtonElement>("undo-action");
 const resizeGrip = el<HTMLDivElement>("resize-grip");
 const welcomePanel = el<HTMLElement>("welcome");
 const welcomeHotkey = el<HTMLSpanElement>("welcome-hotkey");
@@ -134,16 +138,12 @@ let updating = false;
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
 
-let toastActionHandler: (() => void) | null = null;
-
 function hideToast(): void {
   if (toastTimer !== undefined) {
     window.clearTimeout(toastTimer);
     toastTimer = undefined;
   }
-  toastEl.classList.remove("show", "actionable");
-  toastAction.classList.add("hidden");
-  toastActionHandler = null;
+  toastEl.classList.remove("show");
 }
 
 function toast(message: string, error = false, duration = 1600): void {
@@ -151,35 +151,22 @@ function toast(message: string, error = false, duration = 1600): void {
   toastEl.setAttribute("aria-live", error ? "assertive" : "polite");
   toastMessage.textContent = message;
   toastEl.classList.toggle("error", error);
-  toastEl.classList.remove("actionable");
-  toastAction.classList.add("hidden");
-  toastActionHandler = null;
   toastEl.classList.add("show");
   if (toastTimer !== undefined) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), duration);
 }
 
-/** 带一个操作按钮的 toast（目前用于「撤销删除」），显示时长由调用方控制。 */
-function showActionToast(message: string, label: string, onAction: () => void): void {
-  toastEl.setAttribute("role", "status");
-  toastEl.setAttribute("aria-live", "polite");
-  toastMessage.textContent = message;
-  toastEl.classList.remove("error");
-  toastAction.textContent = label;
-  toastAction.classList.remove("hidden");
-  toastActionHandler = onAction;
-  toastEl.classList.add("actionable", "show");
-  if (toastTimer !== undefined) {
-    window.clearTimeout(toastTimer);
-    toastTimer = undefined;
-  }
+/** 撤销条独立于普通提示，删除待确认期间一直可见，不会被其他 toast 顶掉。 */
+function showUndoBar(message: string): void {
+  undoMessage.textContent = message;
+  undoBar.classList.add("show");
 }
 
-toastAction.addEventListener("click", () => {
-  const handler = toastActionHandler;
-  hideToast();
-  handler?.();
-});
+function hideUndoBar(): void {
+  undoBar.classList.remove("show");
+}
+
+undoAction.addEventListener("click", () => undoDelete());
 
 function showUpdateBanner(message: string, actionLabel: string | null): void {
   updateBannerText.textContent = message;
@@ -569,8 +556,7 @@ function dateLabel(date: string): string {
 
 function closeHistory(animate = true): void {
   if (historyPanel.classList.contains("hidden")) return;
-  // 面板关掉后列表就不再可见，未落盘的删除要立刻提交
-  void flushPendingDelete();
+  // 未落盘的删除由撤销定时器负责，收起面板不提前提交，撤销窗口保持完整
   hidePanel(historyPanel, animate);
 }
 
@@ -618,6 +604,17 @@ function bindDelete(button: HTMLButtonElement, note: NoteEntry): void {
   button.addEventListener("click", () => requestDelete(note));
 }
 
+/** 待删除的条目还没写盘，服务端返回的列表里仍然有它，渲染前先剔掉。 */
+function dropPendingDelete(list: NoteEntry[]): NoteEntry[] {
+  const pending = pendingDelete;
+  if (!pending) return list;
+  return withoutEntry(list, pending.note);
+}
+
+function dropFromNotes(note: NoteEntry): void {
+  notes = withoutEntry(notes, note);
+}
+
 /** 先从列表移除并给 5 秒撤销窗口，到期才真正写盘。 */
 function requestDelete(note: NoteEntry): void {
   if (hasOpenEditor()) {
@@ -634,7 +631,7 @@ function requestDelete(note: NoteEntry): void {
 
   const timer = window.setTimeout(() => void commitPendingDelete(), 5000);
   pendingDelete = { note, index, timer };
-  showActionToast("已删除", "撤销", undoDelete);
+  showUndoBar("已删除");
 }
 
 async function commitPendingDelete(): Promise<void> {
@@ -642,8 +639,7 @@ async function commitPendingDelete(): Promise<void> {
   if (!pending) return;
   pendingDelete = null;
   window.clearTimeout(pending.timer);
-  // 只关掉自己的撤销提示，别误伤期间的其他 toast
-  if (toastActionHandler === undoDelete) hideToast();
+  hideUndoBar();
 
   try {
     await invoke("delete_note_entry", {
@@ -652,6 +648,13 @@ async function commitPendingDelete(): Promise<void> {
       time: pending.note.time,
       content: pending.note.content,
     });
+    // 删除完成前发出的列表请求，返回结果里还带着这条笔记，直接作废
+    searchSeq += 1;
+    // 服务端少了一条，后续分页偏移要跟着回退，否则「加载更多」会跳过一条
+    if (!serverFiltered) noteOffset = Math.max(0, noteOffset - 1);
+    // 兜底：期间若有陈旧结果把它塞回列表，这里再剔一次
+    dropFromNotes(pending.note);
+    renderNotes();
   } catch (error) {
     // 删除失败就把条目放回原位，避免界面上「看起来删掉了」
     notes.splice(Math.min(pending.index, notes.length), 0, pending.note);
@@ -665,13 +668,10 @@ function undoDelete(): void {
   if (!pending) return;
   pendingDelete = null;
   window.clearTimeout(pending.timer);
+  hideUndoBar();
   notes.splice(Math.min(pending.index, notes.length), 0, pending.note);
   renderNotes();
   toast("已恢复", false, 1200);
-}
-
-async function flushPendingDelete(): Promise<void> {
-  if (pendingDelete) await commitPendingDelete();
 }
 
 function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButtonElement): void {
@@ -727,10 +727,11 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
         content: note.content,
         newContent: value,
       });
-      // 先收起编辑器再刷新，否则重渲染保护会挡住列表更新
+      // 只更新内存里的这条并局部重渲，保留分页 offset 与滚动位置
+      note.content = value;
       close();
       toast("已更新");
-      refreshNotes();
+      renderNotes();
     } catch (error) {
       save.disabled = false;
       toast(String(error), true);
@@ -883,7 +884,6 @@ function renderNotes(): void {
 
 async function loadNotes(reset = true): Promise<void> {
   if (hasOpenEditor()) return;
-  await flushPendingDelete();
   const seq = ++searchSeq;
   if (reset) noteOffset = 0;
 
@@ -893,8 +893,10 @@ async function loadNotes(reset = true): Promise<void> {
       offset: noteOffset,
     });
     if (seq !== searchSeq) return;
-    notes = reset ? batch : [...notes, ...batch];
-    noteOffset = notes.length;
+    // 待删除的条目还没写盘，服务端仍会返回它；只过滤渲染，不影响偏移推进
+    const visible = dropPendingDelete(batch);
+    notes = reset ? visible : [...notes, ...visible];
+    noteOffset = nextOffset(noteOffset, batch.length, reset);
     hasMoreNotes = batch.length === PAGE_SIZE;
     serverFiltered = false;
   } catch (error) {
@@ -912,8 +914,7 @@ async function runSearch(): Promise<void> {
     toast("请先保存或取消正在编辑的笔记", true);
     return;
   }
-  // 重新查询前先提交待删除项，否则磁盘上的旧条目会重新出现
-  await flushPendingDelete();
+  // 待删除项不提前落盘（会缩短撤销窗口），改为在结果里过滤掉
   const seq = ++searchSeq;
   const term = historySearch.value.trim();
   if (!term) {
@@ -928,7 +929,7 @@ async function runSearch(): Promise<void> {
       limit: SEARCH_LIMIT,
     });
     if (seq !== searchSeq) return;
-    notes = results;
+    notes = dropPendingDelete(results);
     noteOffset = 0;
     hasMoreNotes = false;
     serverFiltered = true;
@@ -1236,10 +1237,8 @@ systemLight.addEventListener("change", () => {
   if (settings.theme === "system") applyTheme("system");
 });
 
-// 窗口被隐藏时把未落盘的删除提交掉（例如从托盘收起）
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") void flushPendingDelete();
-});
+// 窗口被隐藏时不提前提交待删除项：撤销定时器会负责落盘，
+// 这样从托盘收起再唤起时，5 秒窗口内的撤销入口仍然有效
 
 checkUpdateButton.addEventListener("click", () => {
   void checkForUpdate(true);

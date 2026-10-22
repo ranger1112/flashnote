@@ -274,6 +274,16 @@ kbd {
   pointer-events: auto;
 }
 
+/* 撤销条独立于普通提示，往上让一个身位，两条可同时出现 */
+.undo-bar {
+  bottom: 78px;
+}
+
+/* 隐藏时不吃点击，避免透明元素挡住下方内容 */
+.undo-bar.show {
+  pointer-events: auto;
+}
+
 .toast-action {
   padding: 0;
   border: 0;
