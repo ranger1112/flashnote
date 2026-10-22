@@ -131,7 +131,7 @@ const a = 1;
 每个 Release 都附带 `SHA256SUMS.txt`，可用来校验下载是否完整：
 
 ```powershell
-Get-FileHash .\FlashNote_0.1.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.2.0_x64-setup.exe -Algorithm SHA256
 ```
 
 把输出与 `SHA256SUMS.txt` 中对应行比对即可。
@@ -143,7 +143,7 @@ Get-FileHash .\FlashNote_0.1.0_x64-setup.exe -Algorithm SHA256
 从源码构建的安装包位于：
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.1.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\闪记_0.2.0_x64-setup.exe
 ```
 
 ## 开发
@@ -186,7 +186,7 @@ npm run tauri build
 产物：
 
 - 可执行文件：`src-tauri\target\release\flashnote.exe`
-- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.1.0_x64-setup.exe`
+- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.2.0_x64-setup.exe`
 
 ### 测试
 

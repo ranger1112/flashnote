@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-22
+
 ### 新增
 
 - 打 `v*` tag 自动构建并发布：NSIS 安装包、便携版 zip 和 `SHA256SUMS.txt` 一并上传，asset 名统一为 ASCII。
@@ -28,5 +30,6 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.1.0
