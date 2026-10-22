@@ -45,6 +45,7 @@ fn persist_geometry(app: &AppHandle, window: &WebviewWindow) {
                 y: pos.y,
                 w: size.width,
                 h: size.height,
+                scale: window.scale_factor().ok(),
             });
         }
     }
@@ -170,6 +171,33 @@ pub(crate) fn clamp_rect(rect: Rect, monitors: &[Rect]) -> (i32, i32) {
     (x, y)
 }
 
+/// 把保存的物理像素几何从旧 DPI 缩放换算到当前缩放，保证逻辑位置/尺寸不变。
+/// 老配置没有缩放字段（None）或数值异常时原样返回。
+pub(crate) fn scale_geometry(rect: Rect, saved_scale: Option<f64>, current_scale: f64) -> Rect {
+    let factor = match saved_scale {
+        Some(saved) if saved > 0.0 && current_scale > 0.0 => current_scale / saved,
+        _ => return rect,
+    };
+    if (factor - 1.0).abs() < 1e-9 {
+        return rect;
+    }
+
+    let point = |value: i32| -> i32 {
+        (value as f64 * factor)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+    };
+    let extent =
+        |value: u32| -> u32 { (value as f64 * factor).round().clamp(0.0, u32::MAX as f64) as u32 };
+
+    Rect {
+        x: point(rect.x),
+        y: point(rect.y),
+        w: extent(rect.w),
+        h: extent(rect.h),
+    }
+}
+
 /// 尺寸限制在最小窗口尺寸与所在显示器工作区之间。
 pub(crate) fn clamp_size(w: u32, h: u32, x: i32, y: i32, monitors: &[Rect]) -> (u32, u32) {
     const MIN_W: u32 = 380;
@@ -219,23 +247,27 @@ pub fn apply_initial_geometry(app: &AppHandle) {
         .state::<AppState>()
         .settings
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .window
         .clone();
 
     match saved {
         Some(geometry) => {
             let monitors = monitor_rects(&window);
-            let (x, y) = clamp_rect(
+            // 物理像素会随 DPI 缩放变化，按保存时的缩放换算回同样的逻辑位置/尺寸
+            let current_scale = window.scale_factor().unwrap_or(1.0);
+            let scaled = scale_geometry(
                 Rect {
                     x: geometry.x,
                     y: geometry.y,
                     w: geometry.w,
                     h: geometry.h,
                 },
-                &monitors,
+                geometry.scale,
+                current_scale,
             );
-            let (w, h) = clamp_size(geometry.w, geometry.h, x, y, &monitors);
+            let (x, y) = clamp_rect(scaled, &monitors);
+            let (w, h) = clamp_size(scaled.w, scaled.h, x, y, &monitors);
             if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
                 log::warn!("恢复窗口位置失败：{err}");
             }
@@ -418,7 +450,7 @@ pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
         .state::<AppState>()
         .settings
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .notes_dir
         .clone();
     let (date, _) = notes::now_parts();
@@ -436,7 +468,7 @@ pub fn open_notes_dir_impl(app: &AppHandle) -> Result<(), String> {
         .state::<AppState>()
         .settings
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .notes_dir
         .clone();
     let dir = PathBuf::from(notes_dir);
@@ -1082,6 +1114,26 @@ mod tests {
 
         assert!(x <= 1920 - 120);
         assert!(y >= 0);
+    }
+
+    #[test]
+    fn scale_geometry_follows_dpi_changes() {
+        let rect = Rect {
+            x: 100,
+            y: 50,
+            w: 480,
+            h: 360,
+        };
+
+        let scaled = scale_geometry(rect, Some(1.0), 1.5);
+        assert_eq!(
+            (scaled.x, scaled.y, scaled.w, scaled.h),
+            (150, 75, 720, 540)
+        );
+
+        // 老配置没有 scale 字段：保持原样，不能凭空放大
+        let untouched = scale_geometry(rect, None, 2.0);
+        assert_eq!((untouched.x, untouched.y, untouched.w), (100, 50, 480));
     }
 
     #[test]
