@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 文档
+
+- 新增 `docs/code-signing.md`：对比不签名、Azure Artifact Signing、OV/EV 证书的成本、SmartScreen 行为与 CI 接入方式，说明 Authenticode 与自动更新 minisign 签名的关系，并给出推荐与后续接入步骤。
+
 ## [0.2.1] - 2026-10-22
 
 ### 修复

@@ -143,7 +143,7 @@ Get-FileHash .\FlashNote_0.2.1_x64-setup.exe -Algorithm SHA256
 
 把输出与 `SHA256SUMS.txt` 中对应行比对即可。
 
-安装包未签名，首次运行可能触发 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
+安装包未签名，首次运行可能触发 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。签名方案的成本、取舍与接入路径见 [docs/code-signing.md](docs/code-signing.md)。
 
 卸载：Windows「设置 → 应用」，或运行安装目录下的 `uninstall.exe`。
 
@@ -266,7 +266,7 @@ flashnote/
 - 暂无云同步和导出功能；搜索为逐文件扫描，笔记量很大时会稍慢。
 - 全局快捷键被其他程序占用时需要在设置里更换。
 - 笔记文件只追加不轮转，长期使用后单日文件会逐渐变大。
-- 安装包未做代码签名。
+- 安装包未做代码签名，首次安装会触发 SmartScreen 提示；调研结论与后续接入步骤见 [docs/code-signing.md](docs/code-signing.md)。
 
 ## 常见问题
 

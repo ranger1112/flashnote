@@ -143,7 +143,7 @@ Get-FileHash .\FlashNote_0.2.1_x64-setup.exe -Algorithm SHA256
 
 Compare the output with the corresponding line in `SHA256SUMS.txt`.
 
-The installers are unsigned, so SmartScreen may warn on first run; choose "More info → Run anyway".
+The installers are unsigned, so SmartScreen may warn on first run; choose "More info → Run anyway". The cost, trade-offs, and adoption path for code signing are documented in [docs/code-signing.md](docs/code-signing.md) (in Chinese).
 
 Uninstall: Windows "Settings → Apps", or run `uninstall.exe` in the install directory.
 
@@ -266,7 +266,7 @@ Currently verified only on **Windows 10/11**. Source-window capture relies on th
 - No cloud sync or export yet; search scans files one by one, so it gets slower with very large note collections.
 - If another application has claimed the global hotkey, you need to change it in settings.
 - Note files are append-only and never rotated, so a single day's file grows gradually over long-term use.
-- The installers are not code-signed.
+- The installers are not code-signed, so the first install triggers a SmartScreen warning; see [docs/code-signing.md](docs/code-signing.md) for the research and the adoption path.
 
 ## FAQ
 
