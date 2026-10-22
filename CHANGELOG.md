@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 代码围栏按标记字符与长度配对解析，围栏内的「来源」行与 `- HH:MM` 不再被误当成条目；非 UTF-8 笔记文件按有损解码读取。
+- 来源标题写入前压平空白、限长 200 字符并转义 Markdown/HTML 特殊字符，避免注入。
+- 保存过程中重复提交不再覆盖用户输入；编辑条目时不再被后台刷新冲掉；输入法组合期间不触发快捷键。
+- 删除后的撤销条独立显示，5 秒内不会被其他提示挤掉；刷新列表不会让已删除条目复活；删除后「加载更多」不再跳条目。
+- Markdown 预览中的链接改用系统浏览器打开，主窗口不再被导航到外部页面。
+
+### 变更
+
+- 发布流水线加固：tag 注入防护、Action 固定 commit SHA、发布环境审批、版本与 CHANGELOG 校验，打包前执行 fmt/clippy/test。
+- Rust 工具链固定 1.94.1；CI 与发布统一使用 Node 24。
+- 笔记读写命令移出 UI 线程，解析结果按 (mtime, size) 缓存，网络目录掉线时不再冻结窗口。
+- 升级 Vitest 4，测试与构建共用同一份 Vite 8；lockfile 统一到官方源。
+- tokio 升级到 1.54.1（RUSTSEC-2026-0384）；updater 开启 `requireSignedVersion`。
+- 便携版 zip 附带 LICENSE，SHA256SUMS 覆盖 `.sig` 与 `latest.json`。
+
+### 文档
+
+- 修正 README / CONTRIBUTING / SECURITY 中的 Node 版本、测试清单、联网表述与发版示例。
+
 ## [0.3.0] - 2026-10-22
 
 ### 新增
