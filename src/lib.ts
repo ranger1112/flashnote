@@ -117,3 +117,9 @@ export function withoutEntry<T extends NoteEntry>(list: T[], target: NoteEntry):
 export function nextOffset(previous: number, batchLength: number, reset: boolean): number {
   return reset ? batchLength : previous + batchLength;
 }
+
+/** 预览里只把 http(s)/mailto 链接交给系统浏览器，其余协议一律不动。 */
+export function externalLinkTarget(href: string): string | null {
+  const value = href.trim();
+  return /^(https?:\/\/|mailto:)/i.test(value) ? value : null;
+}

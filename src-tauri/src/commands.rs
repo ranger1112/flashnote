@@ -317,6 +317,68 @@ fn open_with_explorer(path: &Path) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// 只允许把 http(s) 与 mailto 交给系统打开，其余协议（file:、javascript: 等）一律拒绝。
+fn external_url_allowed(url: &str) -> bool {
+    const ALLOWED: [&str; 3] = ["http://", "https://", "mailto:"];
+    !url.is_empty()
+        && url.len() <= 2048
+        && !url.chars().any(|ch| ch.is_control() || ch == '"')
+        && ALLOWED.iter().any(|prefix| {
+            url.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+}
+
+#[cfg(windows)]
+fn open_with_shell(target: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // 直接调 ShellExecuteW，不经过 cmd，避免 URL 里的 & | ^ 被当成命令分隔符
+    let operation = wide("open");
+    let file = wide(target);
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Win32 约定：返回值 <= 32 都算失败
+    if (result as isize) <= 32 {
+        Err("无法打开链接".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn open_with_shell(_target: &str) -> Result<(), String> {
+    Err("当前平台暂不支持打开外部链接".to_string())
+}
+
+/// 用系统默认浏览器打开预览里的链接。
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    let target = url.trim();
+    if !external_url_allowed(target) {
+        return Err("只允许打开 http(s) 或 mailto 链接".to_string());
+    }
+    open_with_shell(target)
+}
+
 /// 交给系统默认关联程序打开（Markdown 文件通常是编辑器）。
 fn open_with_default_app(path: &Path) -> Result<(), String> {
     std::process::Command::new("cmd")
@@ -755,6 +817,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn allows_http_https_and_mailto() {
+        assert!(external_url_allowed("https://example.com/a?b=1"));
+        assert!(external_url_allowed("HTTP://example.com"));
+        assert!(external_url_allowed("mailto:hi@example.com"));
+    }
+
+    #[test]
+    fn rejects_other_schemes_and_control_chars() {
+        assert!(!external_url_allowed(""));
+        assert!(!external_url_allowed("#anchor"));
+        assert!(!external_url_allowed("javascript:alert(1)"));
+        assert!(!external_url_allowed(
+            "file:///C:/Windows/System32/calc.exe"
+        ));
+        // 换行属于控制字符，不能在 URL 里悄悄夹带
+        assert!(!external_url_allowed("https://example.com/\ncalc.exe"));
+        assert!(!external_url_allowed("https://example.com/\"x"));
+        assert!(!external_url_allowed(&format!(
+            "https://example.com/{}",
+            "a".repeat(2048)
+        )));
     }
 
     #[test]
