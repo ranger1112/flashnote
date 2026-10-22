@@ -28,6 +28,9 @@ pub struct Settings {
     pub capture_source: bool,
     pub markdown_mode: bool,
     pub history_preview: bool,
+    /// 启动后静默检查更新；旧配置缺这个字段时默认开启。
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
     /// 旧版本没有这个字段，缺省视为已完成引导；只有全新安装才会看到引导。
     #[serde(default = "default_true")]
     pub onboarded: bool,
@@ -43,6 +46,7 @@ impl Default for Settings {
             capture_source: true,
             markdown_mode: false,
             history_preview: false,
+            auto_update: true,
             onboarded: false,
             window: None,
         }
@@ -193,6 +197,8 @@ mod tests {
         assert!(loaded.settings.pinned);
         assert!(!loaded.settings.capture_source);
         assert!(loaded.settings.markdown_mode);
+        // 旧配置文件没有 autoUpdate 字段，默认开启检查
+        assert!(loaded.settings.auto_update);
         // 旧配置文件没有 onboarded 字段，不应再次弹出引导
         assert!(loaded.settings.onboarded);
 
@@ -252,6 +258,7 @@ mod tests {
             capture_source: false,
             markdown_mode: true,
             history_preview: true,
+            auto_update: false,
             onboarded: true,
             window: Some(WindowGeometry {
                 x: -120,
@@ -274,6 +281,7 @@ mod tests {
         assert_eq!(loaded.settings.hotkey, "ctrl+shift+k");
         assert!(loaded.settings.pinned);
         assert!(loaded.settings.history_preview);
+        assert!(!loaded.settings.auto_update, "关闭状态应被保存");
 
         let geometry = loaded.settings.window.expect("几何应当被保存");
         assert_eq!(
@@ -298,6 +306,7 @@ mod tests {
         assert!(loaded.settings.capture_source);
         assert!(!loaded.settings.markdown_mode);
         assert!(!loaded.settings.history_preview);
+        assert!(loaded.settings.auto_update, "老配置缺字段时默认检查更新");
         assert!(loaded.settings.onboarded, "老配置缺字段时视为已完成引导");
         assert!(loaded.settings.window.is_none());
 

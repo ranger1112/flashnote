@@ -702,6 +702,22 @@ pub fn update_history_preview(
     Ok(())
 }
 
+#[tauri::command]
+pub fn update_auto_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.settings.lock().unwrap().auto_update = enabled;
+    persist(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

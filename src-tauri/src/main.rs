@@ -68,6 +68,8 @@ fn main() {
             None::<Vec<&str>>,
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
             let loaded = settings::load(&handle);
@@ -176,6 +178,8 @@ fn main() {
             commands::clear_draft,
             commands::complete_onboarding,
             commands::update_history_preview,
+            commands::update_auto_update,
+            commands::app_version,
         ])
         .build(tauri::generate_context!())
         .expect("启动闪记失败")

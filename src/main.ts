@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { accelFromEvent, formatAccel, matchesTerm, type NoteEntry } from "./lib";
@@ -14,6 +16,7 @@ interface Settings {
   captureSource: boolean;
   markdownMode: boolean;
   historyPreview: boolean;
+  autoUpdate: boolean;
   onboarded: boolean;
   window: unknown;
 }
@@ -62,6 +65,14 @@ const chooseDirButton = el<HTMLButtonElement>("choose-dir");
 const captureSourceCheck = el<HTMLInputElement>("capture-source");
 const markdownModeCheck = el<HTMLInputElement>("markdown-mode");
 const autostartCheck = el<HTMLInputElement>("autostart");
+const autoUpdateCheck = el<HTMLInputElement>("auto-update");
+const checkUpdateButton = el<HTMLButtonElement>("check-update");
+const updateStatus = el<HTMLParagraphElement>("update-status");
+const appVersionLabel = el<HTMLSpanElement>("app-version");
+const updateBanner = el<HTMLDivElement>("update-banner");
+const updateBannerText = el<HTMLSpanElement>("update-banner-text");
+const updateBannerAction = el<HTMLButtonElement>("update-banner-action");
+const updateBannerDismiss = el<HTMLButtonElement>("update-banner-dismiss");
 const sourceLabel = el<HTMLSpanElement>("source");
 const toastEl = el<HTMLDivElement>("toast");
 const resizeGrip = el<HTMLDivElement>("resize-grip");
@@ -78,6 +89,7 @@ let settings: Settings = {
   captureSource: true,
   markdownMode: false,
   historyPreview: false,
+  autoUpdate: true,
   onboarded: true,
   window: null,
 };
@@ -92,6 +104,9 @@ let noteOffset = 0;
 let hasMoreNotes = false;
 let serverFiltered = false;
 let searchSeq = 0;
+let pendingUpdate: Update | null = null;
+let updateReady = false;
+let updating = false;
 
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
@@ -104,6 +119,86 @@ function toast(message: string, error = false, duration = 1600): void {
   toastEl.classList.add("show");
   if (toastTimer !== undefined) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), duration);
+}
+
+function showUpdateBanner(message: string, actionLabel: string | null): void {
+  updateBannerText.textContent = message;
+  updateBannerAction.hidden = actionLabel === null;
+  if (actionLabel) updateBannerAction.textContent = actionLabel;
+  updateBanner.classList.remove("hidden");
+}
+
+function hideUpdateBanner(): void {
+  updateBanner.classList.add("hidden");
+}
+
+async function checkForUpdate(manual: boolean): Promise<void> {
+  if (updating) return;
+  if (manual) {
+    checkUpdateButton.disabled = true;
+    updateStatus.textContent = "正在检查更新…";
+  }
+
+  try {
+    const update = await check();
+    if (!update) {
+      if (manual) {
+        updateStatus.textContent = "已是最新版本";
+        toast("已是最新版本");
+      }
+      return;
+    }
+
+    pendingUpdate = update;
+    updateStatus.textContent = `发现新版本 ${update.version}`;
+    showUpdateBanner(`发现新版本 ${update.version}`, "更新");
+  } catch (error) {
+    // 启动时的静默检查失败不打扰用户；手动检查才提示
+    if (manual) {
+      updateStatus.textContent = "检查更新失败，请稍后再试";
+      toast(String(error), true);
+    }
+  } finally {
+    if (manual) checkUpdateButton.disabled = false;
+  }
+}
+
+async function installUpdate(): Promise<void> {
+  const update = pendingUpdate;
+  if (!update || updating) return;
+
+  updating = true;
+  updateBannerAction.disabled = true;
+  showUpdateBanner("正在下载更新…", null);
+
+  try {
+    let total = 0;
+    let received = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? 0;
+      } else if (event.event === "Progress") {
+        received += event.data.chunkLength;
+        const percent =
+          total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
+        showUpdateBanner(
+          percent === null ? "正在下载更新…" : `正在下载更新… ${percent}%`,
+          null,
+        );
+      }
+    });
+
+    updateReady = true;
+    updateStatus.textContent = `已安装 ${update.version}，重启后生效`;
+    showUpdateBanner(`新版本 ${update.version} 已安装，重启后生效`, "重启");
+  } catch (error) {
+    showUpdateBanner("更新失败，请稍后重试", "重试");
+    updateStatus.textContent = "更新失败";
+    toast(String(error), true);
+  } finally {
+    updating = false;
+    updateBannerAction.disabled = false;
+  }
 }
 
 function scheduleDraftSave(): void {
@@ -182,6 +277,7 @@ async function refreshSettings(): Promise<void> {
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
   markdownModeCheck.checked = settings.markdownMode;
+  autoUpdateCheck.checked = settings.autoUpdate;
 }
 
 async function hideWindow(): Promise<void> {
@@ -227,6 +323,7 @@ function openSettings(): void {
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
   markdownModeCheck.checked = settings.markdownMode;
+  autoUpdateCheck.checked = settings.autoUpdate;
   hotkeyError.textContent = "";
   settingsPanel.classList.remove("hidden");
   setBackgroundInert(true);
@@ -695,6 +792,17 @@ async function init(): Promise<void> {
 
     appReady = true;
 
+    try {
+      appVersionLabel.textContent = `v${await invoke<string>("app_version")}`;
+    } catch {
+      appVersionLabel.textContent = "";
+    }
+
+    // 启动后延迟检查，不阻塞窗口显示；失败时静默
+    if (settings.autoUpdate) {
+      window.setTimeout(() => void checkForUpdate(false), 5000);
+    }
+
     // 窗口在启动时就可见（首次运行、快捷键冲突）时立即提示；否则留到第一次唤起
     if (await getCurrentWindow().isVisible()) {
       if (await handleFirstShow()) return;
@@ -813,6 +921,31 @@ markdownModeCheck.addEventListener("change", async () => {
     toast(String(error), true);
   }
 });
+
+autoUpdateCheck.addEventListener("change", async () => {
+  try {
+    await invoke("update_auto_update", { enabled: autoUpdateCheck.checked });
+    await refreshSettings();
+    toast(autoUpdateCheck.checked ? "已开启自动检查更新" : "已关闭自动检查更新");
+  } catch (error) {
+    autoUpdateCheck.checked = !autoUpdateCheck.checked;
+    toast(String(error), true);
+  }
+});
+
+checkUpdateButton.addEventListener("click", () => {
+  void checkForUpdate(true);
+});
+
+updateBannerAction.addEventListener("click", () => {
+  if (updateReady) {
+    void relaunch();
+  } else {
+    void installUpdate();
+  }
+});
+
+updateBannerDismiss.addEventListener("click", hideUpdateBanner);
 
 autostartCheck.addEventListener("change", async () => {
   try {

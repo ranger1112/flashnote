@@ -702,3 +702,31 @@ kbd {
   line-height: 1.6;
   color: var(--muted);
 }
+
+.update-banner {
+  position: absolute;
+  z-index: 19;
+  left: 14px;
+  right: 14px;
+  bottom: 46px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-solid);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.update-banner.hidden {
+  display: none;
+}
+
+.update-banner-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.4;
+}

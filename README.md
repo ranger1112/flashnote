@@ -18,6 +18,7 @@
 - **笔记历史**：标题栏的笔记按钮打开历史面板，按日期倒序浏览、全文搜索（跨所有日期文件）、加载更早的记录；可切换 Markdown 渲染预览，也能直接编辑或删除单条记录。
 - **系统托盘**：左键唤起；右键可打开今日笔记、笔记文件夹、设置或退出。
 - **单实例运行**：重复启动只会唤起已有窗口，不会出现第二个托盘图标或热键冲突。
+- **自动更新**：启动后静默检查 GitHub Release；发现新版本时窗口底部出现提示条，点击即可下载、校验签名并安装，重启后生效。
 - **其他**：可选开机自启、跟随系统深/浅色主题、多显示器边界校正。
 
 ## 使用
@@ -57,6 +58,7 @@
 | 自动记录来源窗口 | 关闭后不再抓取和写入来源标题。 |
 | Markdown 模式 | 开启后每条写成 `### 时间` + 原文，代码块、表格等块级语法可正常渲染；默认关闭。 |
 | 开机自启 | 写入当前用户的启动项，默认关闭。 |
+| 自动检查更新 | 启动后静默检查一次新版本，默认开启；关闭后仍可用「检查更新」手动触发。 |
 
 设置保存在：
 
@@ -206,6 +208,14 @@ git push origin v0.2.0
 
 `.github/workflows/release.yml` 会自动构建 NSIS 安装包与便携版 zip、生成 `SHA256SUMS.txt`，并创建一个 **draft** Release；检查无误后在 GitHub 上点发布。版本号不一致时工作流会直接失败，避免发出 tag 与安装包版本不符的包。
 
+自动更新依赖仓库的两个 Actions secret：`TAURI_SIGNING_PRIVATE_KEY`（minisign 私钥全文）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会用它们生成 `.sig` 与 `latest.json`；缺少时构建出来的包无法通过更新校验。私钥只在本地备份，不要提交进仓库。发布后 `latest.json` 的地址是：
+
+```
+https://github.com/ranger1112/flashnote/releases/latest/download/latest.json
+```
+
+这个地址只指向**已发布**的最新正式版，draft 和 prerelease 不会被自动更新选中。
+
 ### 项目结构
 
 ```
@@ -233,7 +243,7 @@ flashnote/
 ## 技术说明
 
 - **框架**：Tauri 2 + Rust 2021，前端为原生 TypeScript + Vite，不使用前端框架。
-- **插件**：`single-instance`（单实例）、`global-shortcut`（全局热键）、`autostart`（开机自启）、`dialog`（目录选择）。
+- **插件**：`single-instance`（单实例）、`global-shortcut`（全局热键）、`autostart`（开机自启）、`dialog`（目录选择）、`updater` / `process`（更新检查、安装与重启）。
 - **前后端边界**：前端不直接访问文件系统，保存、设置、窗口显隐全部通过 Tauri command 完成。
 - **窗口**：无边框 + 透明背景，四周留 10px 由 CSS 绘制圆角与阴影；`skipTaskbar` 使其不占用任务栏。
 - **来源抓取**：`GetForegroundWindow` + `GetWindowTextW`，通过 PID 排除闪记自身；抓不到时沿用上一次来源。

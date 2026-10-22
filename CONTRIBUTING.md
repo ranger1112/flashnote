@@ -68,6 +68,14 @@ chore(ci): 缓存 Rust 构建产物
 
 预发布版本直接用 `v0.2.0-beta.1` 这样的 tag，三处版本也要写成 `0.2.0-beta.1`；tag 里带 `-` 时工作流会自动标记为 prerelease。重跑同一 tag 会覆盖同名 asset，不会产生重复文件。
 
+自动更新所需的两个仓库 secret（`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`）由维护者在本地生成并配置：
+
+```bash
+npx tauri signer generate -w ~/.tauri/flashnote.key
+```
+
+私钥和密码只保存在本地密码管理器与仓库 secret 中，不要提交、不要贴进 Issue。公钥写在 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`。
+
 ## 数据与隐私
 
-笔记、设置、日志都在本机，应用不联网。提交 Issue 或截图时请自行打码笔记正文和窗口标题。
+笔记、设置、日志都在本机。唯一的网络请求是检查更新时下载 GitHub Release 上的 `latest.json` 与安装包；关闭「自动检查更新」后只在手动点「检查更新」时访问。提交 Issue 或截图时请自行打码笔记正文和窗口标题。

@@ -57,6 +57,17 @@
       </footer>
 
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+      <div id="update-banner" class="update-banner hidden" role="status" aria-live="polite">
+        <span id="update-banner-text" class="update-banner-text"></span>
+        <button id="update-banner-action" class="btn tiny" type="button">更新</button>
+        <button id="update-banner-dismiss" class="icon-btn" type="button" aria-label="稍后再说">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18" />
+            <path d="m6 6 12 12" />
+          </svg>
+        </button>
+      </div>
       <div id="resize-grip" title="拖动调整大小"></div>
 
       <section
@@ -107,6 +118,19 @@
           <input id="autostart" type="checkbox" />
           开机自启
         </label>
+
+        <label class="check">
+          <input id="auto-update" type="checkbox" />
+          自动检查更新
+        </label>
+
+        <div class="field">
+          <div class="row">
+            <span class="tip">当前版本 <span id="app-version">—</span></span>
+            <button id="check-update" class="btn" type="button">检查更新</button>
+          </div>
+          <p id="update-status" class="tip" aria-live="polite"></p>
+        </div>
 
         <p class="tip">笔记按日期保存为本地 Markdown 文件。</p>
       </section>
