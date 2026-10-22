@@ -18,16 +18,16 @@ set "PATH=%CARGO_HOME%\bin;%PATH%"
 if not defined VCVARS call :detect
 
 if not defined VCVARS (
-  echo [flashnote] vcvars64.bat not found. 1>&2
-  echo [flashnote] Install "Visual Studio Build Tools 2022" with the "Desktop development 1>&2
-  echo [flashnote] with C++" workload, then use the default install path or set VCVARS 1>&2
-  echo [flashnote] to the full path of vcvars64.bat, or drop it in scripts\_env.local.cmd. 1>&2
+  >&2 echo [flashnote] vcvars64.bat not found.
+  >&2 echo [flashnote] Install "Visual Studio Build Tools 2022" with the "Desktop development with C++" workload,
+  >&2 echo [flashnote] then use the default install path or set VCVARS to the full path of vcvars64.bat,
+  >&2 echo [flashnote] or drop it in scripts\_env.local.cmd.
   exit /b 1
 )
 
 call "%VCVARS%" >nul
 if errorlevel 1 (
-  echo [flashnote] failed to load MSVC environment from "%VCVARS%" 1>&2
+  >&2 echo [flashnote] failed to load MSVC environment from "%VCVARS%"
   exit /b 1
 )
 exit /b 0
@@ -54,5 +54,10 @@ for %%r in (
 goto :eof
 
 :detect_vswhere
-for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+rem vswhere speaks only when it likes the command line; the `(x86)` in its own path
+rem trips cmd's parenthesis parsing inside a for/f backtick, so redirect to a file.
+set "VSWHERE_OUT=%TEMP%\flashnote-vswhere-%RANDOM%.txt"
+"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%VSWHERE_OUT%" 2>nul
+for /f "usebackq delims=" %%i in ("%VSWHERE_OUT%") do if not defined VCVARS set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+del "%VSWHERE_OUT%" >nul 2>&1
 goto :eof

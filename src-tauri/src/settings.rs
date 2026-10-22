@@ -117,7 +117,7 @@ pub fn load(app: &AppHandle) -> LoadedSettings {
 pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     let mut warning = None;
 
-    let settings = match fs::read_to_string(path) {
+    let mut settings = match fs::read_to_string(path) {
         Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
             // 手工编辑出的非法值只纠正字段，不把整份设置当成损坏
             Ok(mut parsed) => {
@@ -147,7 +147,29 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
         }
     };
 
+    // 手改出的相对路径会跟着进程 CWD 漂移（自启动 vs 手动启动），读到时就固定成绝对路径
+    settings.notes_dir = absolute_notes_dir(&settings.notes_dir);
+
     LoadedSettings { settings, warning }
+}
+
+/// 把相对路径固定成基于当前 CWD 的绝对路径。不碰文件系统，也不会引入 `\\?\` 前缀。
+pub(crate) fn absolute_dir(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
+}
+
+fn absolute_notes_dir(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    absolute_dir(trimmed).to_string_lossy().to_string()
 }
 
 /// 配置文件存在但不可用时使用：不再重复触发首次运行引导。
@@ -211,6 +233,24 @@ mod tests {
         assert!(loaded.settings.capture_source);
         // 文件不存在 = 全新安装，需要展示引导
         assert!(!loaded.settings.onboarded);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_notes_dir_is_made_absolute() {
+        let dir = temp_dir("relative");
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"notesDir":"notes","hotkey":"ctrl+shift+k","pinned":true,"captureSource":false,"markdownMode":true,"window":null}"#,
+        )
+        .unwrap();
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warning.is_none());
+        assert!(Path::new(&loaded.settings.notes_dir).is_absolute());
 
         let _ = fs::remove_dir_all(&dir);
     }

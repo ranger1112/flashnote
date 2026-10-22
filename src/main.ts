@@ -557,6 +557,11 @@ function dateLabel(date: string): string {
 
 function closeHistory(animate = true): void {
   if (historyPanel.classList.contains("hidden")) return;
+  // 面板关了就不该再跑一次搜索
+  if (searchTimer !== undefined) {
+    window.clearTimeout(searchTimer);
+    searchTimer = undefined;
+  }
   // 未落盘的删除由撤销定时器负责，收起面板不提前提交，撤销窗口保持完整
   hidePanel(historyPanel, animate);
 }
@@ -1097,12 +1102,18 @@ welcomeStart.addEventListener("click", () => void dismissWelcome());
 welcomeSettings.addEventListener("click", () => void dismissWelcome(true));
 
 pinButton.addEventListener("click", async () => {
-  pinned = !pinned;
+  const next = !pinned;
+  pinned = next;
   paintPin();
   try {
-    await invoke("set_pinned", { pinned });
-    toast(pinned ? "常驻模式：保存后保持打开" : "保存后自动收起");
+    await invoke("set_pinned", { pinned: next });
+    toast(next ? "常驻模式：保存后保持打开" : "保存后自动收起");
   } catch (error) {
+    // 后端没落盘就不能让按钮停留在假状态
+    if (pinned === next) {
+      pinned = !next;
+      paintPin();
+    }
     toast(String(error), true);
   }
 });
