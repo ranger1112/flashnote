@@ -1,9 +1,12 @@
 use chrono::{DateTime, Local, NaiveDate};
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::SystemTime,
 };
 
 /// 来源标题来自前台窗口，属于外部不可信数据：写入 Markdown 前压平空白、限长，
@@ -435,6 +438,108 @@ fn read_note(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// 解析结果的缓存项，用 (mtime, size) 判断文件是否被外部改动过。
+struct CachedFile {
+    modified: SystemTime,
+    len: u64,
+    entries: Vec<(String, String, Option<String>)>,
+}
+
+/// 缓存条目上限：长期运行且频繁换目录时不至于无限增长。
+const CACHE_LIMIT: usize = 1024;
+
+fn parse_cache() -> &'static Mutex<HashMap<PathBuf, CachedFile>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFile>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn with_cache<T>(action: impl FnOnce(&mut HashMap<PathBuf, CachedFile>) -> T) -> T {
+    let mut cache = parse_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action(&mut cache)
+}
+
+/// 我们自己改写文件后立刻让缓存失效，不依赖文件系统时间戳的精度。
+pub fn invalidate_cache(path: &Path) {
+    with_cache(|cache| cache.remove(path));
+}
+
+/// 读取并解析一个日期文件；命中缓存时只需一次 stat，不用读盘和重新解析。
+fn entries_of(path: &Path) -> Option<Vec<(String, String, Option<String>)>> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            log::warn!("读取笔记文件失败 {}：{error}", path.display());
+            return None;
+        }
+    };
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let len = meta.len();
+
+    let cached = with_cache(|cache| {
+        cache
+            .get(path)
+            .filter(|hit| hit.modified == modified && hit.len == len)
+            .map(|hit| hit.entries.clone())
+    });
+    if let Some(entries) = cached {
+        return Some(entries);
+    }
+
+    let text = match read_note(path) {
+        Ok(text) => text,
+        Err(error) => {
+            log::warn!("读取笔记文件失败 {}：{error}", path.display());
+            return None;
+        }
+    };
+    let entries = parse_entries(&text);
+    with_cache(|cache| {
+        if cache.len() >= CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            CachedFile {
+                modified,
+                len,
+                entries: entries.clone(),
+            },
+        );
+    });
+    Some(entries)
+}
+
+/// 不区分 ASCII 大小写的子串匹配，不产生临时字符串。
+fn contains_fold(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.as_bytes();
+    let pat = needle.as_bytes();
+    pat.is_empty()
+        || (pat.len() <= hay.len() && hay.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)))
+}
+
+/// 一行笔记是否命中搜索词：日期、时间、正文、来源分开匹配，免去拼接与整体小写化。
+fn matches_query(
+    date: &str,
+    time: &str,
+    content: &str,
+    source: Option<&str>,
+    needle: &str,
+    folded: &str,
+) -> bool {
+    let source = source.unwrap_or("");
+    let fields = [date, time, content, source];
+    if needle.is_ascii() {
+        fields.iter().any(|field| contains_fold(field, needle))
+    } else {
+        // 非 ASCII 的匹配只能走完整小写化，这种查询很少见
+        fields
+            .iter()
+            .any(|field| field.to_lowercase().contains(folded))
+    }
+}
+
 /// 读取笔记，按日期与写入顺序倒序返回；`offset` 用于分页。
 pub fn load_recent(dir: &Path, limit: usize, offset: usize) -> std::io::Result<Vec<NoteEntry>> {
     if !dir.exists() {
@@ -449,14 +554,9 @@ pub fn load_recent(dir: &Path, limit: usize, offset: usize) -> std::io::Result<V
             .and_then(|stem| stem.to_str())
             .unwrap_or("")
             .to_string();
-        let text = match read_note(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                log::warn!("读取笔记文件失败 {}：{error}", path.display());
-                continue;
-            }
+        let Some(mut parsed) = entries_of(&path) else {
+            continue;
         };
-        let mut parsed = parse_entries(&text);
         parsed.reverse();
         for (time, content, source) in parsed {
             if skipped < offset {
@@ -474,10 +574,11 @@ pub fn load_recent(dir: &Path, limit: usize, offset: usize) -> std::io::Result<V
 
 /// 全文搜索（不区分大小写），按日期与写入顺序倒序返回，最多 `limit` 条。
 pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<Vec<NoteEntry>> {
-    let needle = query.trim().to_lowercase();
+    let needle = query.trim();
     if needle.is_empty() || !dir.exists() {
         return Ok(Vec::new());
     }
+    let folded = needle.to_lowercase();
 
     let mut result = Vec::new();
     for path in note_files(dir)? {
@@ -486,22 +587,12 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
             .and_then(|stem| stem.to_str())
             .unwrap_or("")
             .to_string();
-        let text = match read_note(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                log::warn!("读取笔记文件失败 {}：{error}", path.display());
-                continue;
-            }
+        let Some(mut parsed) = entries_of(&path) else {
+            continue;
         };
-        let mut parsed = parse_entries(&text);
         parsed.reverse();
         for (time, content, source) in parsed {
-            let haystack = format!(
-                "{date} {time} {content} {}",
-                source.as_deref().unwrap_or("")
-            )
-            .to_lowercase();
-            if haystack.contains(&needle) {
+            if matches_query(&date, &time, &content, source.as_deref(), needle, &folded) {
                 result.push(entry_for(&path, &date, time, content, source));
                 if result.len() >= limit {
                     return Ok(result);
@@ -530,6 +621,9 @@ pub fn append_note(dir: &Path, date: &str, entry: &str) -> std::io::Result<PathB
         writeln!(file)?;
     }
     writeln!(file, "{entry}")?;
+    // 追加后 mtime 会变，但同一秒内的多次写入仍可能撞上旧缓存，这里直接清掉
+    drop(file);
+    invalidate_cache(&path);
 
     Ok(path)
 }
@@ -808,6 +902,59 @@ mod tests {
         assert_eq!(by_source.len(), 1);
 
         assert!(search_entries(&dir, "  ", 10).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn searches_non_ascii_needles() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-search-cjk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        append_note(&dir, "2026-10-20", "- 10:00 记录一下闪记的用法").unwrap();
+
+        let hits = search_entries(&dir, "闪记", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "记录一下闪记的用法");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_cache_sees_external_rewrites() {
+        let dir = std::env::temp_dir().join(format!("flashnote-test-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-20.md");
+
+        fs::write(&path, "# 2026-10-20\n\n- 10:00 第一次\n").unwrap();
+        let first = load_recent(&dir, 10, 0).unwrap();
+        assert_eq!(first[0].content, "第一次");
+
+        // 外部程序改写：长度与内容都变了，缓存必须失效
+        fs::write(&path, "# 2026-10-20\n\n- 11:00 外部改写的更长的内容\n").unwrap();
+        let second = load_recent(&dir, 10, 0).unwrap();
+        assert_eq!(second[0].content, "外部改写的更长的内容");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appending_refreshes_cached_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "flashnote-test-cache-append-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        append_note(&dir, "2026-10-20", "- 10:00 第一条").unwrap();
+        assert_eq!(load_recent(&dir, 10, 0).unwrap().len(), 1);
+
+        append_note(&dir, "2026-10-20", "- 11:00 第二条").unwrap();
+        let all = load_recent(&dir, 10, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].content, "第二条");
 
         let _ = fs::remove_dir_all(&dir);
     }
