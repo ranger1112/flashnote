@@ -376,7 +376,8 @@ function closeSettings(): void {
     return;
   }
   setBackgroundInert(false);
-  settingsButton.focus();
+  // 焦点回到输入框而不是齿轮按钮：按钮会留下 focus-visible 描边，看起来像没点干净
+  textarea.focus();
 }
 
 function dateLabel(date: string): string {
@@ -396,7 +397,7 @@ function closeHistory(): void {
     return;
   }
   setBackgroundInert(false);
-  notesButton.focus();
+  textarea.focus();
 }
 
 function showWelcome(): void {
