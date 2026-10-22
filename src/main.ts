@@ -132,6 +132,8 @@ let noteOffset = 0;
 let hasMoreNotes = false;
 let serverFiltered = false;
 let searchSeq = 0;
+/** 历史面板最近一次读取失败的提示；为空表示没有错误。 */
+let historyError: string | null = null;
 let pendingUpdate: Update | null = null;
 let updateReady = false;
 let updating = false;
@@ -310,7 +312,7 @@ async function flushDraft(): Promise<void> {
  * #toast 不参与：撤销删除的按钮要能在面板打开时点击。
  */
 function setBackgroundInert(inert: boolean): void {
-  for (const selector of ["header", "main", "footer", "#resize-grip"]) {
+  for (const selector of ["header", "main", "footer", "#resize-grip", "#update-banner"]) {
     const node = document.querySelector<HTMLElement>(selector);
     if (node) node.inert = inert;
   }
@@ -422,22 +424,24 @@ let suppressBlurUntil = 0;
 
 /** 可选：窗口失去焦点时收起。常驻、面板打开、快捷键录制期间都不触发。 */
 function registerAutoHide(): void {
-  void getCurrentWindow().onFocusChanged(async ({ payload: focused }) => {
-    if (focused) {
-      windowFocusedOnce = true;
-      return;
-    }
-    if (!windowFocusedOnce || !settings.autoHideOnBlur || pinned || recording) return;
-    if (Date.now() < suppressBlurUntil || anyPanelOpen()) return;
-    if (!(await getCurrentWindow().isVisible())) return;
+  getCurrentWindow()
+    .onFocusChanged(async ({ payload: focused }) => {
+      if (focused) {
+        windowFocusedOnce = true;
+        return;
+      }
+      if (!windowFocusedOnce || !settings.autoHideOnBlur || pinned || recording) return;
+      if (Date.now() < suppressBlurUntil || anyPanelOpen()) return;
+      if (!(await getCurrentWindow().isVisible())) return;
 
-    // 再确认一次，避开切换焦点时的瞬时抖动
-    window.setTimeout(() => {
-      if (Date.now() < suppressBlurUntil) return;
-      if (document.hasFocus() || pinned || recording || anyPanelOpen()) return;
-      void hideWindow();
-    }, 120);
-  });
+      // 再确认一次，避开切换焦点时的瞬时抖动
+      window.setTimeout(() => {
+        if (Date.now() < suppressBlurUntil) return;
+        if (document.hasFocus() || pinned || recording || anyPanelOpen()) return;
+        void hideWindow();
+      }, 120);
+    })
+    .catch((error) => console.error("监听焦点变化失败", error));
 }
 
 function paintPin(): void {
@@ -452,21 +456,24 @@ function setSource(source: string | null): void {
   sourceLabel.title = source ?? "";
 }
 
-async function refreshSettings(): Promise<void> {
-  settings = await invoke<Settings>("get_settings");
+/** 把当前 settings 回填到设置面板的各个控件。 */
+function paintSettings(): void {
   hotkeyInput.value = formatAccel(settings.hotkey);
   notesDirInput.value = settings.notesDir;
   captureSourceCheck.checked = settings.captureSource;
   markdownModeCheck.checked = settings.markdownMode;
   autoUpdateCheck.checked = settings.autoUpdate;
   autoHideCheck.checked = settings.autoHideOnBlur;
-
-  settings.theme = normalizeTheme(settings.theme);
   themeSelect.value = settings.theme;
-  applyTheme(settings.theme);
-
-  settings.backgroundOpacity = clampOpacity(settings.backgroundOpacity);
   paintOpacity(settings.backgroundOpacity);
+}
+
+async function refreshSettings(): Promise<void> {
+  settings = await invoke<Settings>("get_settings");
+  settings.theme = normalizeTheme(settings.theme);
+  settings.backgroundOpacity = clampOpacity(settings.backgroundOpacity);
+  applyTheme(settings.theme);
+  paintSettings();
 }
 
 async function hideWindow(): Promise<void> {
@@ -520,14 +527,7 @@ async function saveNote(): Promise<void> {
 function openSettings(): void {
   closeHistory(false);
   closeWelcome(false);
-  hotkeyInput.value = formatAccel(settings.hotkey);
-  notesDirInput.value = settings.notesDir;
-  captureSourceCheck.checked = settings.captureSource;
-  markdownModeCheck.checked = settings.markdownMode;
-  autoUpdateCheck.checked = settings.autoUpdate;
-  autoHideCheck.checked = settings.autoHideOnBlur;
-  themeSelect.value = settings.theme;
-  paintOpacity(settings.backgroundOpacity);
+  paintSettings();
   hotkeyError.textContent = "";
   showPanel(settingsPanel);
   settingsClose.focus();
@@ -780,7 +780,19 @@ function renderNotes(): void {
 
   entryList.replaceChildren();
 
-  if (filtered.length === 0) {
+  if (historyError !== null && filtered.length === 0) {
+    // 目录不可读和「真的没有笔记」必须区分开，否则面板会长期显示空状态
+    const failure = document.createElement("p");
+    failure.className = "history-empty history-error";
+    failure.textContent = `读取笔记失败：${historyError}`;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn";
+    retry.textContent = "重试";
+    retry.addEventListener("click", () => void runSearch());
+    failure.append(document.createElement("br"), retry);
+    entryList.append(failure);
+  } else if (filtered.length === 0) {
     const empty = document.createElement("p");
     empty.className = "history-empty";
     empty.textContent =
@@ -899,6 +911,7 @@ async function loadNotes(reset = true): Promise<void> {
       offset: noteOffset,
     });
     if (seq !== searchSeq) return;
+    historyError = null;
     // 待删除的条目还没写盘，服务端仍会返回它；只过滤渲染，不影响偏移推进
     const visible = dropPendingDelete(batch);
     notes = reset ? visible : [...notes, ...visible];
@@ -909,6 +922,7 @@ async function loadNotes(reset = true): Promise<void> {
     if (seq !== searchSeq) return;
     if (reset) notes = [];
     hasMoreNotes = false;
+    historyError = String(error);
     toast(String(error), true);
   }
   renderNotes();
@@ -935,6 +949,7 @@ async function runSearch(): Promise<void> {
       limit: SEARCH_LIMIT,
     });
     if (seq !== searchSeq) return;
+    historyError = null;
     notes = dropPendingDelete(results);
     noteOffset = 0;
     hasMoreNotes = false;
@@ -943,6 +958,7 @@ async function runSearch(): Promise<void> {
     if (seq !== searchSeq) return;
     notes = [];
     serverFiltered = true;
+    historyError = String(error);
     toast(String(error), true);
   }
   renderNotes();
@@ -986,6 +1002,7 @@ function openHistory(): void {
   serverFiltered = false;
   noteOffset = 0;
   hasMoreNotes = false;
+  historyError = null;
   paintPreviewButton();
   entryList.replaceChildren();
   historyCount.textContent = "";
@@ -1042,13 +1059,29 @@ async function init(): Promise<void> {
     // 草稿优先读磁盘；首次升级时把 localStorage 中的旧草稿迁移过来
     const legacyDraft = localStorage.getItem(DRAFT_KEY);
     const draft = await invoke<string>("load_draft");
-    if (draft) {
-      textarea.value = draft;
-    } else if (legacyDraft) {
-      textarea.value = legacyDraft;
-      await invoke("save_draft", { content: legacyDraft }).catch(() => {});
+    // 读取期间用户可能已经开始输入，不要用磁盘内容把它盖掉
+    if (textarea.value === "") {
+      if (draft) {
+        textarea.value = draft;
+      } else if (legacyDraft) {
+        textarea.value = legacyDraft;
+      }
     }
-    if (legacyDraft !== null) localStorage.removeItem(DRAFT_KEY);
+
+    if (legacyDraft !== null) {
+      if (draft) {
+        // 磁盘上已有更新的草稿，旧副本可以丢弃
+        localStorage.removeItem(DRAFT_KEY);
+      } else {
+        // 迁移成功才删 localStorage；失败时保留，下次启动还能重试
+        try {
+          await invoke("save_draft", { content: legacyDraft });
+          localStorage.removeItem(DRAFT_KEY);
+        } catch {
+          // 保留 localStorage 里的旧草稿
+        }
+      }
+    }
 
     appReady = true;
 
@@ -1352,6 +1385,10 @@ resizeGrip.addEventListener("pointerdown", (event) => {
   void getCurrentWindow().startResizeDragging("SouthEast");
 });
 
+const reportListenerError = (error: unknown): void => {
+  console.error("监听窗口事件失败", error);
+};
+
 void listen<ShowPayload>("window-shown", (event) => {
   // 唤起瞬间可能有一次焦点切换，避免误触发失焦收起
   suppressBlurUntil = Date.now() + 600;
@@ -1362,19 +1399,21 @@ void listen<ShowPayload>("window-shown", (event) => {
     return;
   }
   if (!settingsPanel.classList.contains("hidden")) return;
-  void handleFirstShow().then((handled) => {
-    if (!handled) textarea.focus();
-  });
-});
+  void handleFirstShow()
+    .then((handled) => {
+      if (!handled) textarea.focus();
+    })
+    .catch((error) => toast(String(error), true));
+}).catch(reportListenerError);
 
 void listen("open-settings", () => {
   suppressBlurUntil = Date.now() + 600;
   openSettings();
-});
+}).catch(reportListenerError);
 
 void listen("open-history", () => {
   suppressBlurUntil = Date.now() + 600;
   openHistory();
-});
+}).catch(reportListenerError);
 
 void init();

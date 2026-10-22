@@ -13,6 +13,9 @@ pub struct WindowGeometry {
     pub y: i32,
     pub w: u32,
     pub h: u32,
+    /// 保存时的 DPI 缩放。老配置没有该字段时为 None，读取时不换算。
+    #[serde(default)]
+    pub scale: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -344,6 +347,7 @@ mod tests {
                 y: 40,
                 w: 480,
                 h: 360,
+                scale: Some(1.0),
             }),
         };
 
