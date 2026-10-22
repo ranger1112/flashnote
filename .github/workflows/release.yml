@@ -91,7 +91,8 @@ jobs:
           releaseName: "闪记 ${{ steps.meta.outputs.tag }}"
           releaseDraft: true
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          releaseAssetNamePattern: "FlashNote_[version]_[arch][setup][ext]"
+          # 已发布的 tauri-action 里这个输入叫 assetNamePattern（dev 分支文档写的是 releaseAssetNamePattern）
+          assetNamePattern: "FlashNote_[version]_[arch][setup][ext]"
           releaseBody: |
             ## 下载
 
