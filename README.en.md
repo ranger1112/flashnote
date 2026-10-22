@@ -138,7 +138,7 @@ Download from [Releases](https://github.com/ranger1112/flashnote/releases/latest
 Each release ships with a `SHA256SUMS.txt` that you can use to verify the download:
 
 ```powershell
-Get-FileHash .\FlashNote_0.2.1_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.2.2_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the output with the corresponding line in `SHA256SUMS.txt`.
@@ -150,7 +150,7 @@ Uninstall: Windows "Settings → Apps", or run `uninstall.exe` in the install di
 An installer built from source is located at:
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.2.1_x64-setup.exe
+src-tauri\target\release\bundle\nsis\闪记_0.2.2_x64-setup.exe
 ```
 
 ## Development
@@ -193,7 +193,7 @@ npm run tauri build
 Outputs:
 
 - Executable: `src-tauri\target\release\flashnote.exe`
-- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.2.1_x64-setup.exe`
+- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.2.2_x64-setup.exe`
 
 ### Testing
 

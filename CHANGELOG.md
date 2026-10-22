@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-22
+
 ### 修复
 
 - 设置、欢迎页和历史列表的滚动条改为细窄圆角的半透明样式，去掉了原生灰色轨道与箭头，不再贴着圆角卡片边缘割裂视觉；深色与浅色主题分别适配。
@@ -45,7 +47,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.1.0

@@ -1,6 +1,6 @@
 [package]
 name = "flashnote"
-version = "0.2.1"
+version = "0.2.2"
 description = "不打断阅读的速记小窗"
 authors = ["ranger"]
 license = "MIT"
