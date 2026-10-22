@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 设置、欢迎页和历史列表的滚动条改为细窄圆角的半透明样式，去掉了原生灰色轨道与箭头，不再贴着圆角卡片边缘割裂视觉；深色与浅色主题分别适配。
+
 ### 文档
 
 - 新增 `docs/code-signing.md`：对比不签名、Azure Artifact Signing、OV/EV 证书的成本、SmartScreen 行为与 CI 接入方式，说明 Authenticode 与自动更新 minisign 签名的关系，并给出推荐与后续接入步骤。
