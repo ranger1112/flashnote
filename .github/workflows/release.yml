@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（例如 v0.1.0-rc.1），必须已存在"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布 Windows 安装包
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # 版本以 tauri.conf.json 为准，先和 tag 对齐，避免发出 0.1.0 的包却挂着 v0.2.0 的 tag
+      - name: 校验版本号
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            throw "tag 必须形如 v0.1.0 或 v0.1.0-beta.1，当前为：$tag"
+          }
+
+          $version = $tag.TrimStart('v')
+
+          $configVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $pkgVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+
+          foreach ($pair in @(
+            @{ Name = 'src-tauri/tauri.conf.json'; Value = $configVersion },
+            @{ Name = 'package.json'; Value = $pkgVersion },
+            @{ Name = 'src-tauri/Cargo.toml'; Value = $cargoVersion }
+          )) {
+            if ($pair.Value -ne $version) {
+              throw "版本不一致：tag 为 $tag，但 $($pair.Name) 是 $($pair.Value)。请先把三处版本统一为 $version 再打 tag。"
+            }
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$($version.Contains('-').ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "发布 $tag（版本 $version）"
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 前端单元测试
+        run: npm test
+
+      # 安装包内部文件名是「闪记_<版本>_x64-setup.exe」，上传前统一改成 ASCII，
+      # 避免中文文件名在下载、命令行引用和校验时被转义或剥离。
+      - name: 构建并创建 Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ steps.meta.outputs.tag }}
+          releaseName: "闪记 ${{ steps.meta.outputs.tag }}"
+          releaseDraft: true
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          releaseAssetNamePattern: "FlashNote_[version]_[arch][setup][ext]"
+          releaseBody: |
+            ## 下载
+
+            | 版本 | 文件 | 说明 |
+            | --- | --- | --- |
+            | 安装版 | `FlashNote_${{ steps.meta.outputs.version }}_x64-setup.exe` | 双击安装，按当前用户安装，无需管理员权限 |
+            | 便携版 | `FlashNote_${{ steps.meta.outputs.version }}_portable_x64.zip` | 解压后直接运行 `flashnote.exe`，不写安装目录 |
+
+            校验下载文件：
+
+            ```powershell
+            Get-FileHash .\FlashNote_${{ steps.meta.outputs.version }}_x64-setup.exe -Algorithm SHA256
+            ```
+
+            结果应与 `SHA256SUMS.txt` 中对应行一致。
+
+            ## 说明
+
+            - 支持 Windows 10 / 11，需要 WebView2 运行时（系统一般已自带）。
+            - 安装包未做代码签名，首次运行可能出现 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
+            - 完整变更见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)。
+
+      - name: 打包便携版
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/release/flashnote.exe"
+          if (-not (Test-Path $exe)) {
+            throw "找不到 $exe，构建可能失败"
+          }
+          $zip = "FlashNote_${{ steps.meta.outputs.version }}_portable_x64.zip"
+          Compress-Archive -Path $exe -DestinationPath $zip -CompressionLevel Optimal -Force
+          "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+          Write-Host "已生成 $zip"
+
+      - name: 生成 SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${version}_x64-setup.exe" |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "找不到 NSIS 安装包（闪记_${version}_x64-setup.exe）"
+          }
+
+          $entries = @(
+            @{ Path = $installer.FullName; Name = "FlashNote_${version}_x64-setup.exe" },
+            @{ Path = (Resolve-Path $env:ZIP_NAME).Path; Name = $env:ZIP_NAME }
+          )
+
+          $lines = foreach ($entry in $entries) {
+            $hash = (Get-FileHash -Path $entry.Path -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($entry.Name)"
+          }
+
+          $lines | Set-Content -Path SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
+      - name: 上传便携版与校验和
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          gh release upload $env:TAG $env:ZIP_NAME SHA256SUMS.txt --clobber
+          gh release view $env:TAG --json assets --jq '.assets[].name'

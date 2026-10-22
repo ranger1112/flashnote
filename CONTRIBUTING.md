@@ -14,7 +14,7 @@ npm install
 npm run tauri dev
 ```
 
-也可以使用封装脚本（自动加载 MSVC 环境，路径按本机安装位置修改 `scripts\cargo.cmd`）：
+也可以使用封装脚本（自动探测 Rust 与 MSVC；工具链装在非默认位置时，把 `scripts\_env.local.cmd.example` 复制成 `scripts\_env.local.cmd` 并填写路径）：
 
 ```bat
 scripts\dev.cmd
@@ -58,6 +58,15 @@ chore(ci): 缓存 Rust 构建产物
 - 在 PR 描述里写清改动目的、验证方式（手动步骤或新增测试）；
 - 如果是修 Bug，请先建对应 Issue 并在 PR 中引用；
 - 不提交 `node_modules/`、`dist/`、`src-tauri/target/` 等生成目录。
+
+## 发版流程
+
+1. 把 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的版本改成同一个值（如 `0.2.0`），在 `CHANGELOG.md` 补上对应条目，提交并推 `main`。
+2. 打 tag 并推送：`git tag v0.2.0 && git push origin v0.2.0`。
+3. `.github/workflows/release.yml` 会构建安装包与便携版、生成校验和，并创建 **draft** Release。
+4. 下载 draft 里的安装包试用一遍，确认无误后在 GitHub 上发布。
+
+预发布版本直接用 `v0.2.0-beta.1` 这样的 tag，三处版本也要写成 `0.2.0-beta.1`；tag 里带 `-` 时工作流会自动标记为 prerelease。重跑同一 tag 会覆盖同名 asset，不会产生重复文件。
 
 ## 数据与隐私
 

@@ -119,13 +119,22 @@ const a = 1;
 
 ## 安装
 
-从 [Releases](https://github.com/ranger1112/flashnote/releases/latest) 下载最新安装包：
+从 [Releases](https://github.com/ranger1112/flashnote/releases/latest) 下载：
 
-```
-FlashNote_0.1.0_x64-setup.exe
+| 版本 | 文件 | 说明 |
+| --- | --- | --- |
+| 安装版 | `FlashNote_<版本>_x64-setup.exe` | 双击安装，按当前用户安装，无需管理员权限 |
+| 便携版 | `FlashNote_<版本>_portable_x64.zip` | 解压后直接运行 `flashnote.exe`，不写安装目录 |
+
+每个 Release 都附带 `SHA256SUMS.txt`，可用来校验下载是否完整：
+
+```powershell
+Get-FileHash .\FlashNote_0.1.0_x64-setup.exe -Algorithm SHA256
 ```
 
-双击安装即可。安装器按当前用户安装，无需管理员权限；安装包未签名，首次运行可能触发 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
+把输出与 `SHA256SUMS.txt` 中对应行比对即可。
+
+安装包未签名，首次运行可能触发 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
 
 卸载：Windows「设置 → 应用」，或运行安装目录下的 `uninstall.exe`。
 
@@ -185,6 +194,17 @@ cd src-tauri && cargo test
 ```
 
 Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，编辑 / 删除后的文件重建，设置的原子写入与损坏恢复，以及笔记目录的路径越界校验；前端用 Vitest 覆盖 `accelFromEvent` / `formatAccel` 与搜索匹配。两项都由 CI 执行。
+
+### 发版
+
+把 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 三处版本改成同一个值后打 tag：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` 会自动构建 NSIS 安装包与便携版 zip、生成 `SHA256SUMS.txt`，并创建一个 **draft** Release；检查无误后在 GitHub 上点发布。版本号不一致时工作流会直接失败，避免发出 tag 与安装包版本不符的包。
 
 ### 项目结构
 
