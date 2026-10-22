@@ -52,7 +52,9 @@ jobs:
 
           $configVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $pkgVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $lockVersion = (Get-Content package-lock.json -Raw | ConvertFrom-Json).version
+          # package-lock.json 的 packages 里有一个空字符串键（根包），
+          # PowerShell 7.4+ 的 ConvertFrom-Json 默认会因此报错，必须走 -AsHashtable
+          $lockVersion = (Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable)['version']
           $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 
           foreach ($pair in @(
