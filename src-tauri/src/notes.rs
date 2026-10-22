@@ -461,6 +461,43 @@ mod tests {
     }
 
     #[test]
+    fn keeps_unterminated_fence_in_one_entry() {
+        let text = "### 10:00\n```js\n- 11:00 看起来像条目\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "```js\n- 11:00 看起来像条目");
+    }
+
+    #[test]
+    fn parses_mixed_formats_in_one_file() {
+        let text = "# 2026-10-21\n\n- 10:00 列表条目\n  _来源：Chrome_\n\n### 11:00\n## Markdown 条目\n\n<!-- 来源：VS Code -->\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "10:00");
+        assert_eq!(entries[0].1, "列表条目");
+        assert_eq!(entries[0].2.as_deref(), Some("Chrome"));
+        assert_eq!(entries[1].0, "11:00");
+        assert_eq!(entries[1].1, "## Markdown 条目");
+        assert_eq!(entries[1].2.as_deref(), Some("VS Code"));
+    }
+
+    #[test]
+    fn empty_file_has_no_entries() {
+        assert!(parse_entries("").is_empty());
+    }
+
+    #[test]
+    fn header_only_file_has_no_entries() {
+        assert!(parse_entries("# 2026-10-21\n").is_empty());
+    }
+
+    #[test]
+    fn entry_with_only_source_is_skipped() {
+        let text = "# 2026-10-21\n\n- 10:00\n  _来源：Chrome_\n";
+        assert!(parse_entries(text).is_empty());
+    }
+
+    #[test]
     fn loads_recent_entries_newest_first() {
         let dir =
             std::env::temp_dir().join(format!("flashnote-test-recent-{}", std::process::id()));

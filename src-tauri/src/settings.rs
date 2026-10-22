@@ -240,4 +240,85 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn save_is_atomic_and_round_trips() {
+        let dir = temp_dir("save");
+        let path = dir.join("settings.json");
+        let settings = Settings {
+            notes_dir: "D:\\Notes".to_string(),
+            hotkey: "ctrl+shift+k".to_string(),
+            pinned: true,
+            capture_source: false,
+            markdown_mode: true,
+            history_preview: true,
+            onboarded: true,
+            window: Some(WindowGeometry {
+                x: -120,
+                y: 40,
+                w: 480,
+                h: 360,
+            }),
+        };
+
+        save(&path, &settings).unwrap();
+
+        assert!(path.exists());
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "重命名后不应残留 .json.tmp"
+        );
+
+        let loaded = load_from_path(&path);
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.settings.hotkey, "ctrl+shift+k");
+        assert!(loaded.settings.pinned);
+        assert!(loaded.settings.history_preview);
+
+        let geometry = loaded.settings.window.expect("几何应当被保存");
+        assert_eq!(
+            (geometry.x, geometry.y, geometry.w, geometry.h),
+            (-120, 40, 480, 360)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_file_falls_back_to_defaults() {
+        let dir = temp_dir("partial");
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"hotkey":"ctrl+alt+m"}"#).unwrap();
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warning.is_none(), "缺字段不算损坏");
+        assert_eq!(loaded.settings.hotkey, "ctrl+alt+m");
+        assert_eq!(loaded.settings.notes_dir, "");
+        assert!(loaded.settings.capture_source);
+        assert!(!loaded.settings.markdown_mode);
+        assert!(!loaded.settings.history_preview);
+        assert!(loaded.settings.onboarded, "老配置缺字段时视为已完成引导");
+        assert!(loaded.settings.window.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let dir = temp_dir("unknown");
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hotkey":"ctrl+alt+n","futureOption":{"nested":true}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.settings.hotkey, "ctrl+alt+n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

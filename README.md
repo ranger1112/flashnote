@@ -179,12 +179,12 @@ npm run tauri build
 
 ### 测试
 
-```bat
-cd src-tauri
-cargo test
+```bash
+npm test                 # 前端纯函数（快捷键解析、搜索匹配）
+cd src-tauri && cargo test
 ```
 
-单元测试覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，以及编辑 / 删除后的文件重建。
+Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，编辑 / 删除后的文件重建，设置的原子写入与损坏恢复，以及笔记目录的路径越界校验；前端用 Vitest 覆盖 `accelFromEvent` / `formatAccel` 与搜索匹配。两项都由 CI 执行。
 
 ### 项目结构
 

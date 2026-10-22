@@ -42,6 +42,9 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
+      - name: 前端单元测试
+        run: npm test
+
       # tauri::generate_context! 在编译期要求 frontendDist 目录存在，必须先构建前端
       - name: 构建前端（类型检查 + Vite）
         run: npm run build

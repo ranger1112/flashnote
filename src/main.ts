@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
+import { accelFromEvent, formatAccel, matchesTerm, type NoteEntry } from "./lib";
 
 interface Settings {
   notesDir: string;
@@ -24,14 +25,6 @@ interface SavedNote {
 
 interface ShowPayload {
   source: string | null;
-}
-
-interface NoteEntry {
-  date: string;
-  time: string;
-  content: string;
-  source: string | null;
-  path: string;
 }
 
 interface StartupNotice {
@@ -102,45 +95,6 @@ let searchSeq = 0;
 
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
-
-function formatAccel(accel: string): string {
-  return accel
-    .split("+")
-    .map((part) => {
-      const value = part.trim();
-      const lower = value.toLowerCase();
-      if (lower === "ctrl" || lower === "control") return "Ctrl";
-      if (lower === "alt") return "Alt";
-      if (lower === "shift") return "Shift";
-      if (lower === "super" || lower === "meta") return "Win";
-      if (value.length === 1) return value.toUpperCase();
-      return value;
-    })
-    .join(" + ");
-}
-
-function accelFromEvent(event: KeyboardEvent): string | null {
-  const mods: string[] = [];
-  if (event.ctrlKey) mods.push("ctrl");
-  if (event.altKey) mods.push("alt");
-  if (event.shiftKey) mods.push("shift");
-  if (event.metaKey) mods.push("super");
-
-  if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return null;
-
-  let key: string | null = null;
-  if (/^Key[A-Z]$/.test(event.code)) key = event.code.slice(3).toLowerCase();
-  else if (/^Digit[0-9]$/.test(event.code)) key = event.code.slice(5);
-  else if (/^F([1-9]|1[0-9]|2[0-4])$/.test(event.code)) key = event.code.toLowerCase();
-  else if (event.code === "Space") key = "space";
-  else if (event.code === "Backquote") key = "`";
-  else if (event.code === "Minus") key = "-";
-  else if (event.code === "Equal") key = "=";
-  else if (event.key.length === 1) key = event.key.toLowerCase();
-
-  if (!key || mods.length === 0) return null;
-  return [...mods, key].join("+");
-}
 
 function toast(message: string, error = false, duration = 1600): void {
   toastEl.setAttribute("role", error ? "alert" : "status");
@@ -344,12 +298,6 @@ async function dismissWelcome(openSettingsAfter = false): Promise<void> {
   } else {
     textarea.focus();
   }
-}
-
-function matchesTerm(note: NoteEntry, term: string): boolean {
-  return [note.date, note.time, note.content, note.source ?? ""].some((value) =>
-    value.toLowerCase().includes(term),
-  );
 }
 
 function markdownHtml(markdown: string): string {

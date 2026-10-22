@@ -504,12 +504,8 @@ pub fn list_notes(
     offset: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
     let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
-    notes::load_recent(
-        &dir,
-        limit.unwrap_or(200).clamp(1, 1000) as usize,
-        offset.unwrap_or(0) as usize,
-    )
-    .map_err(|err| format!("读取笔记失败：{err}"))
+    notes::load_recent(&dir, clamp_limit(limit), offset.unwrap_or(0) as usize)
+        .map_err(|err| format!("读取笔记失败：{err}"))
 }
 
 #[tauri::command]
@@ -519,17 +515,18 @@ pub fn search_notes(
     limit: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
     let dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
-    notes::search_entries(&dir, &query, limit.unwrap_or(200).clamp(1, 1000) as usize)
+    notes::search_entries(&dir, &query, clamp_limit(limit))
         .map_err(|err| format!("搜索笔记失败：{err}"))
 }
 
-/// 在笔记目录内改写单个文件：先备份，再原子替换。
-fn rewrite_note<F>(state: &AppState, path: &str, update: F) -> Result<(), String>
-where
-    F: FnOnce(&str) -> Option<String>,
-{
-    let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
-    let dir = notes_dir
+/// 列表条数限制在 1..=1000，缺省 200。
+fn clamp_limit(limit: Option<u32>) -> usize {
+    limit.unwrap_or(200).clamp(1, 1000) as usize
+}
+
+/// 把目标文件解析到笔记目录内。`..` 穿越、指向目录外的绝对路径都会被拒绝。
+fn resolve_within(dir: &Path, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let dir = dir
         .canonicalize()
         .map_err(|err| format!("笔记目录不可用：{err}"))?;
     let target = PathBuf::from(path)
@@ -538,6 +535,16 @@ where
     if !target.starts_with(&dir) {
         return Err("文件不在笔记目录中".to_string());
     }
+    Ok((dir, target))
+}
+
+/// 在笔记目录内改写单个文件：先备份，再原子替换。
+fn rewrite_note<F>(state: &AppState, path: &str, update: F) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
+    let (dir, target) = resolve_within(&notes_dir, path)?;
 
     let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
     let updated =
@@ -614,15 +621,7 @@ pub fn update_note_entry(
 #[tauri::command]
 pub fn open_note_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let notes_dir = PathBuf::from(&state.settings.lock().unwrap().notes_dir);
-    let dir = notes_dir
-        .canonicalize()
-        .map_err(|err| format!("笔记目录不可用：{err}"))?;
-    let target = PathBuf::from(&path)
-        .canonicalize()
-        .map_err(|err| format!("文件不存在：{err}"))?;
-    if !target.starts_with(&dir) {
-        return Err("文件不在笔记目录中".to_string());
-    }
+    let (_, target) = resolve_within(&notes_dir, &path)?;
     open_with_explorer(&target)
 }
 
@@ -855,5 +854,66 @@ mod tests {
     #[test]
     fn ensure_writable_dir_rejects_empty_path() {
         assert!(ensure_writable_dir("   ").is_err());
+    }
+
+    #[test]
+    fn clamps_list_limit() {
+        assert_eq!(clamp_limit(None), 200);
+        assert_eq!(clamp_limit(Some(0)), 1, "0 条应当被抬到 1");
+        assert_eq!(clamp_limit(Some(1)), 1);
+        assert_eq!(clamp_limit(Some(1000)), 1000);
+        assert_eq!(clamp_limit(Some(100_000)), 1000, "上限 1000");
+    }
+
+    #[test]
+    fn resolve_within_accepts_file_in_notes_dir() {
+        let dir = temp_dir("resolve-inside");
+        let file = dir.join("2026-10-21.md");
+        std::fs::write(&file, "# 2026-10-21\n").unwrap();
+
+        let (_, target) = resolve_within(&dir, file.to_str().unwrap()).unwrap();
+        assert_eq!(target, file.canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_within_rejects_parent_traversal() {
+        let dir = temp_dir("resolve-traversal");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let outside = dir.join("secret.md");
+        std::fs::write(&outside, "x").unwrap();
+
+        let sneaky = notes.join("..").join("secret.md");
+        let err = resolve_within(&notes, sneaky.to_str().unwrap()).unwrap_err();
+        assert_eq!(err, "文件不在笔记目录中");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_within_rejects_absolute_path_outside() {
+        let dir = temp_dir("resolve-outside");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let outside = dir.join("elsewhere.md");
+        std::fs::write(&outside, "x").unwrap();
+
+        let err = resolve_within(&notes, outside.to_str().unwrap()).unwrap_err();
+        assert_eq!(err, "文件不在笔记目录中");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_within_rejects_missing_file() {
+        let dir = temp_dir("resolve-missing");
+        let missing = dir.join("nope.md");
+
+        let err = resolve_within(&dir, missing.to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("文件不存在"), "实际：{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
