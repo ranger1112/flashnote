@@ -193,7 +193,8 @@ jobs:
           $sig = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${version}_x64-setup.exe.sig" -ErrorAction SilentlyContinue |
             Select-Object -First 1
           if ($sig) {
-            $entries += @{ Path = $sig.FullName; Name = "$($sig.Name)" }
+            # 与上传后的 asset 名保持一致，避免清单里出现中文原名
+            $entries += @{ Path = $sig.FullName; Name = "FlashNote_${version}_x64-setup.exe.sig" }
           } else {
             Write-Warning "没有找到安装包签名，SHA256SUMS 将不包含 .sig"
           }
