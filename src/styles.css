@@ -519,17 +519,28 @@ kbd {
   padding: 0 4px;
 }
 
+/* 日期做成「文字 + 细线」的分隔，不再铺满一条底色：
+   面板本身是半透明的，日期条再叠一层会明显发白，看起来像选中行。 */
 .entry-date {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  padding: 4px 2px;
-  background: var(--bg-solid);
-  /* 半透明主题下，吸顶日期要模糊下方的条目，否则滚动时会串字 */
-  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 9px 0 1px;
+  padding: 0 2px;
   font-size: 11px;
   letter-spacing: 0.06em;
   color: var(--muted);
+}
+
+.entry-date:first-child {
+  margin-top: 0;
+}
+
+.entry-date::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
 }
 
 .entry {
