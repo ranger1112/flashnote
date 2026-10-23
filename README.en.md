@@ -142,7 +142,7 @@ Download from [Releases](https://github.com/ranger1112/flashnote/releases/latest
 Each release ships with a `SHA256SUMS.txt` that you can use to verify the download:
 
 ```powershell
-Get-FileHash .\FlashNote_0.3.1_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.4.0_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the output with the corresponding line in `SHA256SUMS.txt`.
@@ -154,7 +154,7 @@ Uninstall: Windows "Settings → Apps", or run `uninstall.exe` in the install di
 An installer built from source is located at:
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.3.1_x64-setup.exe
+src-tauri\target\release\bundle\nsis\闪记_0.4.0_x64-setup.exe
 ```
 
 ## Development
@@ -197,7 +197,7 @@ npm run tauri build
 Outputs:
 
 - Executable: `src-tauri\target\release\flashnote.exe`
-- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.3.1_x64-setup.exe`
+- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.4.0_x64-setup.exe`
 
 ### Testing
 
@@ -213,15 +213,15 @@ Rust unit tests cover entry formatting, multi-line indentation, source-title nor
 Keep all five version fields in sync (`package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/tauri.conf.json`):
 
 ```bash
-npm run bump -- 0.4.0     # write the new version (npm needs `--` to pass args)
+npm run bump -- 0.4.1     # write the new version (npm needs `--` to pass args)
 npm run version:check     # verify consistency (also run in CI)
 ```
 
 Then update the CHANGELOG and the installer filenames in the READMEs, and tag:
 
 ```bash
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.4.1
+git push origin v0.4.1
 ```
 
 The `.github/workflows/release.yml` workflow builds the NSIS installer and portable zip, generates `SHA256SUMS.txt`, and creates a **draft** Release; review it and publish from GitHub. If the version numbers don't match, the workflow fails immediately, preventing a tagged release whose installer version differs.

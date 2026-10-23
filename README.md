@@ -142,7 +142,7 @@ const a = 1;
 每个 Release 都附带 `SHA256SUMS.txt`，可用来校验下载是否完整：
 
 ```powershell
-Get-FileHash .\FlashNote_0.3.1_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.4.0_x64-setup.exe -Algorithm SHA256
 ```
 
 把输出与 `SHA256SUMS.txt` 中对应行比对即可。
@@ -154,7 +154,7 @@ Get-FileHash .\FlashNote_0.3.1_x64-setup.exe -Algorithm SHA256
 从源码构建的安装包位于：
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.3.1_x64-setup.exe
+src-tauri\target\release\bundle\nsis\闪记_0.4.0_x64-setup.exe
 ```
 
 ## 开发
@@ -197,7 +197,7 @@ npm run tauri build
 产物：
 
 - 可执行文件：`src-tauri\target\release\flashnote.exe`
-- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.3.1_x64-setup.exe`
+- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.4.0_x64-setup.exe`
 
 ### 测试
 
@@ -213,15 +213,15 @@ Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件
 先统一五处版本号（`package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json`）：
 
 ```bash
-npm run bump -- 0.4.0     # 写入新版本（npm 需要 `--` 才能把参数传给脚本）
+npm run bump -- 0.4.1     # 写入新版本（npm 需要 `--` 才能把参数传给脚本）
 npm run version:check     # 只校验是否一致，CI 也会执行
 ```
 
 再补 CHANGELOG、更新 README 里的安装包文件名，然后打 tag：
 
 ```bash
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.4.1
+git push origin v0.4.1
 ```
 
 `.github/workflows/release.yml` 会自动构建 NSIS 安装包与便携版 zip、生成 `SHA256SUMS.txt`，并创建一个 **draft** Release；检查无误后在 GitHub 上点发布。版本号不一致时工作流会直接失败，避免发出 tag 与安装包版本不符的包。

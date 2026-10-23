@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-23
+
 ### 变更
 
 - 笔记读写、目录创建、搜索与草稿落盘改到阻塞线程池执行，托盘里的「打开笔记/文件夹」也不再占用 UI 线程；设置改为后台异步写入并按序号合并，UI 线程与 tokio worker 不再等待磁盘。
@@ -114,7 +116,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.3.0
 [0.2.2]: https://github.com/ranger1112/flashnote/releases/tag/v0.2.2
