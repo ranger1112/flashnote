@@ -15,6 +15,7 @@
 pub(crate) mod backend;
 pub(crate) mod merge;
 pub(crate) mod state;
+pub(crate) mod webdav;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
