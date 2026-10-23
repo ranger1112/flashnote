@@ -6,6 +6,7 @@ mod geometry;
 mod notes;
 mod settings;
 mod source;
+mod sync;
 mod tray;
 
 use std::sync::{atomic::AtomicU64, Mutex};
