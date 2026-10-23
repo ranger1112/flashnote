@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod files;
+mod geometry;
 mod notes;
 mod settings;
 mod source;
 mod tray;
 
-use std::sync::Mutex;
+use std::sync::{atomic::AtomicU64, Mutex};
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -66,6 +68,12 @@ pub struct AppState {
     pub last_source: Mutex<Option<String>>,
     /// 串行化笔记文件读写：命令改成 async 后可能真正并发，追加与改写不能交叉。
     pub io: Mutex<()>,
+    /// 设置写入序号：每次持久化分配一个递增序号。
+    pub settings_write_seq: AtomicU64,
+    /// 最近一次真正写成功的序号；旧快照据此跳过，写入失败时不会误伤兜底。
+    pub settings_last_saved_seq: AtomicU64,
+    /// 串行化设置文件写入，避免两个快照同时写同一个临时文件。
+    pub settings_write_lock: Mutex<()>,
     startup_notice: Mutex<Option<StartupNotice>>,
 }
 
@@ -170,10 +178,13 @@ fn main() {
                 settings_path,
                 last_source: Mutex::new(None),
                 io: Mutex::new(()),
+                settings_write_seq: AtomicU64::new(0),
+                settings_last_saved_seq: AtomicU64::new(0),
+                settings_write_lock: Mutex::new(()),
                 startup_notice: Mutex::new(startup_notice),
             });
 
-            commands::apply_initial_geometry(&handle);
+            geometry::apply_initial_geometry(&handle);
             tray::create(app)?;
 
             if open_settings || first_run {
@@ -193,7 +204,7 @@ fn main() {
                 commands::hide_window_impl(window.app_handle());
             }
             tauri::WindowEvent::ScaleFactorChanged { .. } => {
-                commands::reclamp_window(window.app_handle());
+                geometry::reclamp_window(window.app_handle());
             }
             _ => {}
         })
@@ -242,7 +253,7 @@ fn main() {
             event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
-            commands::persist(app);
+            commands::persist_on_exit(app);
         }
     });
 }

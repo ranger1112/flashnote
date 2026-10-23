@@ -1,0 +1,59 @@
+/**
+ * DOM 元素引用：模块加载时一次性查询，供其他模块复用。
+ */
+
+export function el<T extends HTMLElement>(id: string): T {
+  const node = document.getElementById(id);
+  if (!node) throw new Error(`missing element #${id}`);
+  return node as T;
+}
+
+export const ui = {
+  textarea: el<HTMLTextAreaElement>("note"),
+  pinButton: el<HTMLButtonElement>("pin"),
+  settingsButton: el<HTMLButtonElement>("settings-btn"),
+  closeButton: el<HTMLButtonElement>("close-btn"),
+  notesButton: el<HTMLButtonElement>("notes-btn"),
+  historyPanel: el<HTMLElement>("history"),
+  historyClose: el<HTMLButtonElement>("history-close"),
+  historySearch: el<HTMLInputElement>("history-search"),
+  historyCount: el<HTMLSpanElement>("history-count"),
+  historyFolder: el<HTMLButtonElement>("history-folder"),
+  historyPreview: el<HTMLButtonElement>("history-preview"),
+  entryList: el<HTMLDivElement>("entry-list"),
+  settingsPanel: el<HTMLElement>("settings"),
+  settingsClose: el<HTMLButtonElement>("settings-close"),
+  hotkeyInput: el<HTMLInputElement>("hotkey-input"),
+  hotkeyRecord: el<HTMLButtonElement>("hotkey-record"),
+  hotkeyError: el<HTMLParagraphElement>("hotkey-error"),
+  notesDirInput: el<HTMLInputElement>("notes-dir"),
+  chooseDirButton: el<HTMLButtonElement>("choose-dir"),
+  captureSourceCheck: el<HTMLInputElement>("capture-source"),
+  markdownModeCheck: el<HTMLInputElement>("markdown-mode"),
+  autostartCheck: el<HTMLInputElement>("autostart"),
+  autoUpdateCheck: el<HTMLInputElement>("auto-update"),
+  autoHideCheck: el<HTMLInputElement>("auto-hide"),
+  themeSelect: el<HTMLSelectElement>("theme"),
+  bgOpacityInput: el<HTMLInputElement>("bg-opacity"),
+  bgOpacityValue: el<HTMLSpanElement>("bg-opacity-value"),
+  checkUpdateButton: el<HTMLButtonElement>("check-update"),
+  updateStatus: el<HTMLParagraphElement>("update-status"),
+  appVersionLabel: el<HTMLSpanElement>("app-version"),
+  updateBanner: el<HTMLDivElement>("update-banner"),
+  updateBannerText: el<HTMLSpanElement>("update-banner-text"),
+  updateBannerAction: el<HTMLButtonElement>("update-banner-action"),
+  updateBannerDismiss: el<HTMLButtonElement>("update-banner-dismiss"),
+  sourceLabel: el<HTMLSpanElement>("source"),
+  card: el<HTMLDivElement>("card"),
+  toastEl: el<HTMLDivElement>("toast"),
+  toastMessage: el<HTMLSpanElement>("toast-message"),
+  undoBar: el<HTMLDivElement>("undo-bar"),
+  undoMessage: el<HTMLSpanElement>("undo-message"),
+  undoAction: el<HTMLButtonElement>("undo-action"),
+  resizeGrip: el<HTMLDivElement>("resize-grip"),
+  welcomePanel: el<HTMLElement>("welcome"),
+  welcomeHotkey: el<HTMLSpanElement>("welcome-hotkey"),
+  welcomeDir: el<HTMLElement>("welcome-dir"),
+  welcomeStart: el<HTMLButtonElement>("welcome-start"),
+  welcomeSettings: el<HTMLButtonElement>("welcome-settings"),
+};

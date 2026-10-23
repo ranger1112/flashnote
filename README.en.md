@@ -206,15 +206,22 @@ npm test                 # Frontend tests: pure helpers + DOM state machine (hap
 cd src-tauri && cargo test
 ```
 
-Rust unit tests cover entry formatting, multi-line indentation, source-title normalization, file append separation, pagination, search, file rebuilding after edit/delete, atomic settings writes and corruption recovery, and path traversal validation for the notes directory; the frontend uses Vitest for pure helpers (`accelFromEvent` / `formatAccel`, search matching) and loads the real `index.html` in happy-dom to cover delete/undo, search races, settings rollback, history error states, and draft loading. Both run in CI.
+Rust unit tests cover entry formatting, multi-line indentation, source-title normalization, file append separation, pagination, search, file rebuilding after edit/delete, atomic settings writes and corruption recovery, path traversal validation for the notes directory, and multi-monitor geometry clamping with DPI scaling; the frontend uses Vitest for pure helpers (`accelFromEvent` / `formatAccel`, search matching) and loads the real `index.html` in happy-dom to cover delete/undo, search races, settings rollback, history error states, and draft loading. Both run in CI.
 
 ### Releasing
 
-Set the version to the same value in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`, then tag:
+Keep all five version fields in sync (`package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/tauri.conf.json`):
 
 ```bash
-git tag v<version>
-git push origin v<version>
+npm run bump -- 0.4.0     # write the new version (npm needs `--` to pass args)
+npm run version:check     # verify consistency (also run in CI)
+```
+
+Then update the CHANGELOG and the installer filenames in the READMEs, and tag:
+
+```bash
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 The `.github/workflows/release.yml` workflow builds the NSIS installer and portable zip, generates `SHA256SUMS.txt`, and creates a **draft** Release; review it and publish from GitHub. If the version numbers don't match, the workflow fails immediately, preventing a tagged release whose installer version differs.
@@ -233,7 +240,17 @@ This URL only points to the latest **published** stable release; drafts and prer
 flashnote/
 ├─ index.html                  # DOM structure for the popover and settings panel
 ├─ src/
-│  ├─ main.ts                  # Frontend state and interaction (saving, hotkey recording, drafts)
+│  ├─ main.ts                  # Entry and orchestration: startup, saving, show/hide, resize, global keys
+│  ├─ dom.ts                   # Cached DOM element references
+│  ├─ panels.ts                # Panel visibility, focus trapping, background inert
+│  ├─ history.ts               # Note history: list, search, paging, edit, delete/undo
+│  ├─ settings-panel.ts        # Settings panel and hotkey recording
+│  ├─ settings-store.ts        # In-memory settings state and loading
+│  ├─ appearance.ts            # Theme and background opacity
+│  ├─ draft.ts                 # Draft autosave and restore
+│  ├─ updater.ts               # Update checks, install, notice banner
+│  ├─ welcome.ts               # First-run guide
+│  ├─ toast.ts                 # Toasts and undo bar
 │  ├─ lib.ts                   # Pure helpers: hotkey parsing, search matching, paging offset
 │  ├─ lib.test.ts              # Frontend pure-function tests (Vitest)
 │  ├─ main.dom.test.ts         # Frontend state-machine DOM tests (happy-dom)
@@ -241,7 +258,9 @@ flashnote/
 ├─ src-tauri/
 │  ├─ src/
 │  │  ├─ main.rs               # App entry: plugins, tray, single instance, hotkey registration
-│  │  ├─ commands.rs           # Frontend/backend commands: show/hide, save, settings, geometry persistence
+│  │  ├─ commands.rs           # Frontend/backend commands: show/hide, save, settings
+│  │  ├─ files.rs              # Opening files/folders, URL allowlist, note rewriting (backup + atomic replace)
+│  │  ├─ geometry.rs           # Window geometry: multi-monitor clamping, DPI scaling, restore
 │  │  ├─ notes.rs              # Markdown entry formatting and per-day appending (with tests)
 │  │  ├─ settings.rs           # Atomic settings.json read/write and defaults
 │  │  ├─ source.rs             # Foreground window title capture (Win32)
@@ -261,7 +280,7 @@ flashnote/
 - **Frontend/backend boundary**: the frontend never touches the filesystem directly; saving, settings, and window visibility all go through Tauri commands.
 - **Window**: borderless with a transparent background; 10px of padding on all sides leaves room for CSS-drawn rounded corners and shadow; `skipTaskbar` keeps it out of the taskbar.
 - **Source capture**: `GetForegroundWindow` + `GetWindowTextW`, excluding FlashNote itself by PID; if capture fails, the previous source is reused.
-- **Saving**: appends to a file per date; the settings file is replaced atomically.
+- **Saving**: appends to a file per date and replaces the settings file atomically; file I/O and directory creation run on the blocking pool, and settings are flushed asynchronously with only the newest snapshot winning, so the UI thread never waits on disk.
 - **Logging**: written to `%LOCALAPPDATA%\com.phoebe.flashnote\logs`, rotating when a single file exceeds 2MB and keeping the 3 most recent files; openable directly from the tray menu. Logs never contain note bodies.
 
 ## Platform support
