@@ -108,6 +108,19 @@ function updateCargoToml(version) {
   fail("src-tauri/Cargo.toml 的 [package] 段里没有 version");
 }
 
+/** 只替换顶层 version 行，避免重新序列化把数组等手写格式改掉。 */
+function updateTauriConf(version) {
+  const text = readFileSync(FILES.tauriConf, "utf8");
+  const lines = text.split(/\r?\n/);
+  const index = lines.findIndex((line) => /^  "version"\s*:\s*"[^"]*"/.test(line));
+  if (index < 0) fail("src-tauri/tauri.conf.json 顶层缺少 version");
+  lines[index] = lines[index].replace(
+    /^(\s*"version"\s*:\s*)"[^"]*"/,
+    `$1"${version}"`,
+  );
+  if (!dryRun) writeFileSync(FILES.tauriConf, lines.join(eolOf(text)));
+}
+
 /** 定位 Cargo.lock 里根包 flashnote 的 version 行；跳过同名依赖。 */
 function cargoLockVersionLine(lines) {
   let inPackage = false;
@@ -228,9 +241,7 @@ writeJson(FILES.lock, lock);
 updateCargoToml(versionArg);
 updateCargoLock(versionArg);
 
-const tauriConf = readJson(FILES.tauriConf);
-tauriConf.version = versionArg;
-writeJson(FILES.tauriConf, tauriConf);
+updateTauriConf(versionArg);
 
 console.log(`${dryRun ? "（预览）" : ""}已把五处版本号更新为 ${versionArg}：`);
 console.log("  package.json");
