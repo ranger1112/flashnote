@@ -10,6 +10,7 @@
 - `commands.rs` 拆出 `files.rs`（打开文件/目录、URL 白名单、笔记改写）与 `geometry.rs`（窗口边界夹取、DPI 换算与位置恢复）。
 - `main.ts` 按职责拆分为 `dom` / `panels` / `history` / `settings-panel` / `settings-store` / `appearance` / `draft` / `updater` / `welcome` / `toast`，入口只保留编排。
 - 新增 `npm run bump -- <version>` 与 `npm run version:check`，一次同步 `package.json`、`package-lock.json`、`Cargo.toml`、`Cargo.lock`、`tauri.conf.json` 五处版本号；CI 增加一致性检查。
+- 历史面板的日期从整行吸顶色块改为「文字 + 细线」分隔，半透明背景上不再出现突兀的白条。
 
 ### 文档
 
