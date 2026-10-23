@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 笔记读写、目录创建、搜索与草稿落盘改到阻塞线程池执行，托盘里的「打开笔记/文件夹」也不再占用 UI 线程；设置改为后台异步写入并按序号合并，UI 线程与 tokio worker 不再等待磁盘。
+- `commands.rs` 拆出 `files.rs`（打开文件/目录、URL 白名单、笔记改写）与 `geometry.rs`（窗口边界夹取、DPI 换算与位置恢复）。
+- `main.ts` 按职责拆分为 `dom` / `panels` / `history` / `settings-panel` / `settings-store` / `appearance` / `draft` / `updater` / `welcome` / `toast`，入口只保留编排。
+- 新增 `npm run bump -- <version>` 与 `npm run version:check`，一次同步 `package.json`、`package-lock.json`、`Cargo.toml`、`Cargo.lock`、`tauri.conf.json` 五处版本号；CI 增加一致性检查。
+
+### 文档
+
+- 更新 README 的界面截图与发版步骤。
+
 ## [0.3.1] - 2026-10-23
 
 ### 修复

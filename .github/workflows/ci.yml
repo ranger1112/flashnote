@@ -48,6 +48,9 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
+      - name: 版本号一致性
+        run: npm run version:check
+
       - name: 前端单元测试
         run: npm test
 

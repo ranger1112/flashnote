@@ -202,19 +202,26 @@ npm run tauri build
 ### 测试
 
 ```bash
-npm test                 # 前端纯函数（快捷键解析、搜索匹配）
+npm test                 # 前端单测：纯函数 + happy-dom 状态机
 cd src-tauri && cargo test
 ```
 
-Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，编辑 / 删除后的文件重建，设置的原子写入与损坏恢复，以及笔记目录的路径越界校验；前端用 Vitest 覆盖 `accelFromEvent` / `formatAccel`、搜索匹配等纯函数，并在 happy-dom 里装载真实的 `index.html`，对删除撤销、搜索竞态、设置回滚、历史错误态与草稿加载做 DOM 级回归。两项都由 CI 执行。
+Rust 单测覆盖条目格式化、多行缩进、来源标题归一化、文件追加分隔、分页、搜索，编辑 / 删除后的文件重建，设置的原子写入与损坏恢复，笔记目录的路径越界校验，以及窗口几何的多屏夹取与 DPI 换算；前端用 Vitest 覆盖 `accelFromEvent` / `formatAccel`、搜索匹配等纯函数，并在 happy-dom 里装载真实的 `index.html`，对删除撤销、搜索竞态、设置回滚、历史错误态与草稿加载做 DOM 级回归。两项都由 CI 执行。
 
 ### 发版
 
-把 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 三处版本改成同一个值后打 tag：
+先统一五处版本号（`package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json`）：
 
 ```bash
-git tag v<version>
-git push origin v<version>
+npm run bump -- 0.4.0     # 写入新版本（npm 需要 `--` 才能把参数传给脚本）
+npm run version:check     # 只校验是否一致，CI 也会执行
+```
+
+再补 CHANGELOG、更新 README 里的安装包文件名，然后打 tag：
+
+```bash
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 `.github/workflows/release.yml` 会自动构建 NSIS 安装包与便携版 zip、生成 `SHA256SUMS.txt`，并创建一个 **draft** Release；检查无误后在 GitHub 上点发布。版本号不一致时工作流会直接失败，避免发出 tag 与安装包版本不符的包。
@@ -233,7 +240,17 @@ https://github.com/ranger1112/flashnote/releases/latest/download/latest.json
 flashnote/
 ├─ index.html                  # 小窗与设置面板的 DOM 结构
 ├─ src/
-│  ├─ main.ts                  # 前端状态与交互（保存、热键录制、草稿）
+│  ├─ main.ts                  # 入口与编排：启动、保存、显隐、缩放、全局键盘
+│  ├─ dom.ts                   # DOM 元素引用
+│  ├─ panels.ts                # 面板显隐、焦点圈定与背景 inert
+│  ├─ history.ts               # 笔记历史：列表、搜索、分页、编辑、删除撤销
+│  ├─ settings-panel.ts        # 设置面板与快捷键录制
+│  ├─ settings-store.ts        # 设置内存状态与读取
+│  ├─ appearance.ts            # 主题与背景不透明度
+│  ├─ draft.ts                 # 草稿自动保存与恢复
+│  ├─ updater.ts               # 更新检查、安装与提示横幅
+│  ├─ welcome.ts               # 首次使用引导
+│  ├─ toast.ts                 # 提示与撤销条
 │  ├─ lib.ts                   # 纯函数：快捷键解析、搜索匹配、分页偏移
 │  ├─ lib.test.ts              # 前端纯函数单元测试（Vitest）
 │  ├─ main.dom.test.ts         # 前端状态机 DOM 测试（happy-dom）
@@ -241,7 +258,9 @@ flashnote/
 ├─ src-tauri/
 │  ├─ src/
 │  │  ├─ main.rs               # 应用入口：插件、托盘、单实例、热键注册
-│  │  ├─ commands.rs           # 前后端命令：显隐、保存、设置、几何持久化
+│  │  ├─ commands.rs           # 前后端命令：显隐、保存、设置
+│  │  ├─ files.rs              # 打开文件/目录、URL 白名单、笔记改写（备份 + 原子替换）
+│  │  ├─ geometry.rs           # 窗口几何：多屏夹取、DPI 换算、位置恢复
 │  │  ├─ notes.rs              # Markdown 条目格式化与按日追加（含测试）
 │  │  ├─ settings.rs           # settings.json 原子读写与默认值
 │  │  ├─ source.rs             # 抓取前台窗口标题（Win32）
@@ -261,7 +280,7 @@ flashnote/
 - **前后端边界**：前端不直接访问文件系统，保存、设置、窗口显隐全部通过 Tauri command 完成。
 - **窗口**：无边框 + 透明背景，四周留 10px 由 CSS 绘制圆角与阴影；`skipTaskbar` 使其不占用任务栏。
 - **来源抓取**：`GetForegroundWindow` + `GetWindowTextW`，通过 PID 排除闪记自身；抓不到时沿用上一次来源。
-- **保存**：按日期文件追加写入；设置文件原子替换。
+- **保存**：按日期文件追加写入，设置文件原子替换；文件 I/O 与目录创建都在阻塞线程池执行，设置异步落盘且只保留最新快照，UI 线程不等磁盘。
 - **日志**：写入 `%LOCALAPPDATA%\com.phoebe.flashnote\logs`，单个文件超过 2MB 轮转、保留最近 3 份；托盘菜单可直接打开。日志不记录笔记正文。
 
 ## 平台支持

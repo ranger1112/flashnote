@@ -1,11 +1,23 @@
+//! 前后端命令：设置、窗口显隐、笔记读写与草稿。
+//!
+//! 文件 I/O 一律通过 `run_blocking` 放进阻塞线程池，设置持久化则交给
+//! 非阻塞的 `persist`：UI 线程与 tokio worker 都不该等磁盘。
+
 use crate::{
+    files::{self, io_guard},
     notes,
-    settings::{self, Settings, WindowGeometry},
-    source, AppState,
+    settings::{self, Settings},
+    AppState,
 };
 use serde::Serialize;
-use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 #[derive(Clone, Serialize)]
@@ -21,284 +33,94 @@ pub struct SavedNote {
     pub time: String,
 }
 
+/// 把阻塞文件 I/O 放进专用阻塞线程池，避免占用 UI 线程或 tokio worker。
+async fn run_blocking<T, F>(task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|err| format!("后台任务失败：{err}"))?
+}
+
+/// 非阻塞地持久化当前设置：UI 线程只复制快照，真正写盘在阻塞线程池里完成。
+/// 快照带递增序号，并发写入时最终落盘的总是最新一份。
 pub fn persist(app: &AppHandle) {
-    // 退出路径上顺手抓一次窗口位置：hide 之外（托盘退出、异常结束）的移动也不会丢。
-    if let Some(window) = app.get_webview_window("main") {
-        persist_geometry(app, &window);
-    }
     let state = app.state::<AppState>();
-    let snapshot = state
-        .settings
+    let (snapshot, seq) = {
+        let settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seq = state.settings_write_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        (settings.clone(), seq)
+    };
+    let path = state.settings_path.clone();
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        write_snapshot(&state, &path, seq, &snapshot);
+    });
+}
+
+/// 退出路径同步落盘，确保进程结束前最后一次修改不会丢。
+pub fn persist_sync(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let (snapshot, seq) = {
+        let settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seq = state.settings_write_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        (settings.clone(), seq)
+    };
+    write_snapshot(&state, &state.settings_path, seq, &snapshot);
+}
+
+fn write_snapshot(state: &AppState, path: &Path, seq: u64, snapshot: &Settings) {
+    write_snapshot_locked(
+        path,
+        seq,
+        snapshot,
+        &state.settings_last_saved_seq,
+        &state.settings_write_lock,
+    );
+}
+
+/// 写盘成功后才推进 `last_saved`：这样只有「真正落盘的更新快照」会让旧快照跳过。
+/// 若最新一次写入失败，排在后面的旧快照仍会兜底，不会把两次修改一起丢掉。
+fn write_snapshot_locked(
+    path: &Path,
+    seq: u64,
+    snapshot: &Settings,
+    last_saved: &AtomicU64,
+    write_lock: &Mutex<()>,
+) -> bool {
+    let _guard = write_lock
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    if let Err(err) = settings::save(&state.settings_path, &snapshot) {
-        log::error!("保存设置失败：{err}");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seq <= last_saved.load(Ordering::SeqCst) {
+        return false;
     }
-}
-
-fn persist_geometry(app: &AppHandle, window: &WebviewWindow) {
-    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
-        if let Ok(mut settings) = app.state::<AppState>().settings.lock() {
-            settings.window = Some(WindowGeometry {
-                x: pos.x,
-                y: pos.y,
-                w: size.width,
-                h: size.height,
-                scale: window.scale_factor().ok(),
-            });
+    match settings::save(path, snapshot) {
+        Ok(()) => {
+            last_saved.store(seq, Ordering::SeqCst);
+            true
+        }
+        Err(err) => {
+            log::error!("保存设置失败：{err}");
+            false
         }
     }
 }
 
-fn top_right_position(window: &WebviewWindow) -> Option<(i32, i32)> {
-    let monitor = window.primary_monitor().ok().flatten()?;
-    let area = monitor.work_area();
-    let window_size = window.inner_size().unwrap_or(PhysicalSize::new(480, 360));
-    let margin = (24.0 * monitor.scale_factor()) as i32;
-    Some((
-        area.position.x + area.size.width as i32 - window_size.width as i32 - margin,
-        area.position.y + margin,
-    ))
-}
-
-/// 物理像素矩形，用于窗口与显示器工作区之间的夹取计算。
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-}
-
-impl Rect {
-    fn right(self) -> i32 {
-        self.x.saturating_add(self.w.min(i32::MAX as u32) as i32)
+/// 退出时补存窗口几何与设置。
+pub fn persist_on_exit(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        crate::geometry::persist_geometry(app, &window);
     }
-
-    fn bottom(self) -> i32 {
-        self.y.saturating_add(self.h.min(i32::MAX as u32) as i32)
-    }
-}
-
-fn overlap_area(a: Rect, b: Rect) -> i64 {
-    let left = a.x.max(b.x) as i64;
-    let top = a.y.max(b.y) as i64;
-    let right = a.right().min(b.right()) as i64;
-    let bottom = a.bottom().min(b.bottom()) as i64;
-    if right <= left || bottom <= top {
-        0
-    } else {
-        (right - left) * (bottom - top)
-    }
-}
-
-fn monitor_rects(window: &WebviewWindow) -> Vec<Rect> {
-    window
-        .available_monitors()
-        .map(|monitors| {
-            monitors
-                .iter()
-                .map(|monitor| {
-                    let area = monitor.work_area();
-                    Rect {
-                        x: area.position.x,
-                        y: area.position.y,
-                        w: area.size.width,
-                        h: area.size.height,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 把窗口位置夹回某块显示器的工作区：优先选择与保存位置重叠面积最大的屏幕，
-/// 完全不相交时退到中心点最近的一块。
-pub(crate) fn clamp_rect(rect: Rect, monitors: &[Rect]) -> (i32, i32) {
-    let Some(first) = monitors.first() else {
-        return (rect.x, rect.y);
-    };
-
-    let mut best = *first;
-    let mut best_area = overlap_area(rect, best);
-    for monitor in monitors.iter().skip(1) {
-        let area = overlap_area(rect, *monitor);
-        if area > best_area {
-            best = *monitor;
-            best_area = area;
-        }
-    }
-
-    if best_area == 0 {
-        let center_x = rect.x.saturating_add(rect.w as i32 / 2);
-        let center_y = rect.y.saturating_add(rect.h as i32 / 2);
-        best = *monitors
-            .iter()
-            .min_by_key(|monitor| {
-                let dx = monitor.x.saturating_add(monitor.w as i32 / 2) - center_x;
-                let dy = monitor.y.saturating_add(monitor.h as i32 / 2) - center_y;
-                dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
-            })
-            .unwrap_or(first);
-    }
-
-    // 手改设置可能塞进超大尺寸，先夹到 i32 内再参与运算，避免溢出 panic
-    let rect_w = rect.w.min(i32::MAX as u32) as i32;
-    let rect_h = rect.h.min(i32::MAX as u32) as i32;
-    let best_w = best.w.min(i32::MAX as u32) as i32;
-    let best_h = best.h.min(i32::MAX as u32) as i32;
-
-    // 至少保留左侧 120px、顶部 40px（标题栏）可见，保证窗口可以被拖回来
-    let visible_x = 120.min(rect_w);
-    let visible_y = 40.min(rect_h);
-    let min_x = best.x.saturating_sub(rect_w.saturating_sub(visible_x));
-    let max_x = best.x.saturating_add(best_w).saturating_sub(visible_x);
-    let min_y = best.y;
-    let max_y = best.y.saturating_add(best_h).saturating_sub(visible_y);
-
-    let x = if min_x <= max_x {
-        rect.x.clamp(min_x, max_x)
-    } else {
-        best.x
-    };
-    let y = if min_y <= max_y {
-        rect.y.clamp(min_y, max_y)
-    } else {
-        best.y
-    };
-
-    (x, y)
-}
-
-/// 把保存的物理像素几何从旧 DPI 缩放换算到当前缩放，保证逻辑位置/尺寸不变。
-/// 老配置没有缩放字段（None）或数值异常时原样返回。
-pub(crate) fn scale_geometry(rect: Rect, saved_scale: Option<f64>, current_scale: f64) -> Rect {
-    let factor = match saved_scale {
-        Some(saved) if saved > 0.0 && current_scale > 0.0 => current_scale / saved,
-        _ => return rect,
-    };
-    if (factor - 1.0).abs() < 1e-9 {
-        return rect;
-    }
-
-    let point = |value: i32| -> i32 {
-        (value as f64 * factor)
-            .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
-    };
-    let extent =
-        |value: u32| -> u32 { (value as f64 * factor).round().clamp(0.0, u32::MAX as f64) as u32 };
-
-    Rect {
-        x: point(rect.x),
-        y: point(rect.y),
-        w: extent(rect.w),
-        h: extent(rect.h),
-    }
-}
-
-/// 尺寸限制在最小窗口尺寸与所在显示器工作区之间。
-pub(crate) fn clamp_size(w: u32, h: u32, x: i32, y: i32, monitors: &[Rect]) -> (u32, u32) {
-    const MIN_W: u32 = 380;
-    const MIN_H: u32 = 240;
-
-    let monitor = monitors
-        .iter()
-        .find(|monitor| {
-            x >= monitor.x
-                && x < monitor.x.saturating_add(monitor.w as i32)
-                && y >= monitor.y
-                && y < monitor.y.saturating_add(monitor.h as i32)
-        })
-        .or_else(|| monitors.first());
-
-    match monitor {
-        Some(monitor) => (
-            w.clamp(MIN_W, monitor.w.max(MIN_W)),
-            h.clamp(MIN_H, monitor.h.max(MIN_H)),
-        ),
-        None => (w.max(MIN_W), h.max(MIN_H)),
-    }
-}
-
-fn clamp_position(window: &WebviewWindow, x: i32, y: i32) -> (i32, i32) {
-    let monitors = monitor_rects(window);
-    if monitors.is_empty() {
-        return top_right_position(window).unwrap_or((x, y));
-    }
-    let size = window.inner_size().unwrap_or(PhysicalSize::new(480, 360));
-    clamp_rect(
-        Rect {
-            x,
-            y,
-            w: size.width,
-            h: size.height,
-        },
-        &monitors,
-    )
-}
-
-pub fn apply_initial_geometry(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    let saved = app
-        .state::<AppState>()
-        .settings
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .window
-        .clone();
-
-    match saved {
-        Some(geometry) => {
-            let monitors = monitor_rects(&window);
-            // 物理像素会随 DPI 缩放变化，按保存时的缩放换算回同样的逻辑位置/尺寸
-            let current_scale = window.scale_factor().unwrap_or(1.0);
-            let scaled = scale_geometry(
-                Rect {
-                    x: geometry.x,
-                    y: geometry.y,
-                    w: geometry.w,
-                    h: geometry.h,
-                },
-                geometry.scale,
-                current_scale,
-            );
-            let (x, y) = clamp_rect(scaled, &monitors);
-            let (w, h) = clamp_size(scaled.w, scaled.h, x, y, &monitors);
-            if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
-                log::warn!("恢复窗口位置失败：{err}");
-            }
-            if let Err(err) = window.set_size(PhysicalSize::new(w, h)) {
-                log::warn!("恢复窗口尺寸失败：{err}");
-            }
-        }
-        None => {
-            if let Some((x, y)) = top_right_position(&window) {
-                if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
-                    log::warn!("设置窗口初始位置失败：{err}");
-                }
-            }
-        }
-    }
-}
-
-/// 系统缩放比例变化（切换显示器、修改缩放）后重新夹取窗口位置。
-pub fn reclamp_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    let Ok(position) = window.outer_position() else {
-        return;
-    };
-    let (x, y) = clamp_position(&window, position.x, position.y);
-    if (x, y) != (position.x, position.y) {
-        if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
-            log::warn!("缩放变化后调整窗口位置失败：{err}");
-        }
-    }
+    persist_sync(app);
 }
 
 pub fn show_window_impl(app: &AppHandle) {
@@ -310,7 +132,7 @@ pub fn show_window_impl(app: &AppHandle) {
         .capture_source;
 
     let source = if capture {
-        match source::foreground_window_title() {
+        match crate::source::foreground_window_title() {
             Some(title) => {
                 *state
                     .last_source
@@ -348,7 +170,7 @@ pub fn show_window_impl(app: &AppHandle) {
 
 pub fn hide_window_impl(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        persist_geometry(app, &window);
+        crate::geometry::persist_geometry(app, &window);
         persist(app);
         if let Err(err) = window.hide() {
             log::error!("隐藏窗口失败：{err}");
@@ -366,122 +188,14 @@ pub fn toggle_window(app: &AppHandle) {
     }
 }
 
-fn open_with_explorer(path: &Path) -> Result<(), String> {
-    // explorer 不认 `\\?\` verbatim 前缀，遇到会直接报「找不到文件」；先剥掉再传
-    let display = path.to_string_lossy();
-    let target = display.strip_prefix(r"\\?\").unwrap_or(&display);
-    std::process::Command::new("explorer")
-        .arg(target)
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-}
-
-/// 只允许把 http(s) 与 mailto 交给系统打开，其余协议（file:、javascript: 等）一律拒绝。
-fn external_url_allowed(url: &str) -> bool {
-    const ALLOWED: [&str; 3] = ["http://", "https://", "mailto:"];
-    !url.is_empty()
-        && url.len() <= 2048
-        && !url.chars().any(|ch| ch.is_control() || ch == '"')
-        && ALLOWED.iter().any(|prefix| {
-            url.get(..prefix.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        })
-}
-
-#[cfg(windows)]
-fn open_with_shell(target: &str) -> Result<(), String> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    fn wide(value: &str) -> Vec<u16> {
-        OsStr::new(value)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    // 直接调 ShellExecuteW，不经过 cmd，避免 URL 里的 & | ^ 被当成命令分隔符
-    let operation = wide("open");
-    let file = wide(target);
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    // Win32 约定：返回值 <= 32 都算失败
-    if (result as isize) <= 32 {
-        Err("系统未能打开该目标".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-fn open_with_shell(_target: &str) -> Result<(), String> {
-    Err("当前平台暂不支持调用系统默认程序".to_string())
-}
-
 /// 用系统默认浏览器打开预览里的链接。
 #[tauri::command]
 pub fn open_external_url(url: String) -> Result<(), String> {
     let target = url.trim();
-    if !external_url_allowed(target) {
+    if !files::external_url_allowed(target) {
         return Err("只允许打开 http(s) 或 mailto 链接".to_string());
     }
-    open_with_shell(target)
-}
-
-/// 交给系统默认关联程序打开（Markdown 文件通常是编辑器）。
-fn open_with_default_app(path: &Path) -> Result<(), String> {
-    // 同样走 ShellExecuteW：`cmd /C start` 会二次解析路径里的 & % ^
-    open_with_shell(&path.to_string_lossy())
-}
-
-pub fn open_today_note_impl(app: &AppHandle) -> Result<(), String> {
-    let notes_dir = app
-        .state::<AppState>()
-        .settings
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .notes_dir
-        .clone();
-    let (date, _) = notes::now_parts();
-    let dir = PathBuf::from(notes_dir);
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(format!("{date}.md"));
-    if !path.exists() {
-        std::fs::write(&path, format!("# {date}\n")).map_err(|err| err.to_string())?;
-    }
-    open_with_default_app(&path)
-}
-
-pub fn open_notes_dir_impl(app: &AppHandle) -> Result<(), String> {
-    let notes_dir = app
-        .state::<AppState>()
-        .settings
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .notes_dir
-        .clone();
-    let dir = PathBuf::from(notes_dir);
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    open_with_explorer(&dir)
-}
-
-/// 笔记文件的读写都串行化：命令改成 async 之后，追加与改写是真的可能并发的。
-fn io_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()> {
-    state
-        .io
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    files::open_with_shell(target)
 }
 
 #[tauri::command]
@@ -493,51 +207,51 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
         .clone()
 }
 
-#[tauri::command(async)]
-pub fn save_note(
-    _app: AppHandle,
-    state: State<'_, AppState>,
-    content: String,
-) -> Result<SavedNote, String> {
-    let content = content.trim();
+#[tauri::command]
+pub async fn save_note(app: AppHandle, content: String) -> Result<SavedNote, String> {
+    let content = content.trim().to_string();
     if content.is_empty() {
         return Err("内容为空".to_string());
     }
 
-    let (settings, source_title) = {
-        let settings = state
-            .settings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let source_title = if settings.capture_source {
-            state
-                .last_source
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let (settings, source_title) = {
+            let settings = state
+                .settings
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        } else {
-            None
+                .clone();
+            let source_title = if settings.capture_source {
+                state
+                    .last_source
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            } else {
+                None
+            };
+            (settings, source_title)
         };
-        (settings, source_title)
-    };
 
-    let (date, time) = notes::now_parts();
-    let entry = if settings.markdown_mode {
-        notes::format_entry_markdown(&time, content, source_title.as_deref())
-    } else {
-        notes::format_entry(&time, content, source_title.as_deref())
-    };
-    let dir = PathBuf::from(&settings.notes_dir);
-    let path = {
-        let _guard = io_guard(&state);
-        notes::append_note(&dir, &date, &entry).map_err(|err| format!("写入失败：{err}"))?
-    };
+        let (date, time) = notes::now_parts();
+        let entry = if settings.markdown_mode {
+            notes::format_entry_markdown(&time, &content, source_title.as_deref())
+        } else {
+            notes::format_entry(&time, &content, source_title.as_deref())
+        };
+        let dir = PathBuf::from(&settings.notes_dir);
+        let path = {
+            let _guard = io_guard(&state);
+            notes::append_note(&dir, &date, &entry).map_err(|err| format!("写入失败：{err}"))?
+        };
 
-    Ok(SavedNote {
-        path: path.to_string_lossy().to_string(),
-        time,
+        Ok(SavedNote {
+            path: path.to_string_lossy().to_string(),
+            time,
+        })
     })
+    .await
 }
 
 #[tauri::command]
@@ -551,46 +265,26 @@ pub fn set_pinned(app: AppHandle, state: State<'_, AppState>, pinned: bool) -> R
     Ok(())
 }
 
-/// 校验目录存在且可写，返回创建好的路径。
-pub(crate) fn ensure_writable_dir(path: &str) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return Err("目录不能为空".to_string());
-    }
-
-    // 相对路径会跟着进程 CWD 走（自启动和手动启动不同），这里统一转成绝对路径。
-    // 用绝对化而不是 canonicalize，避免拿到 explorer 不认的 `\\?\` 前缀。
-    let dir = settings::absolute_dir(trimmed);
-    if dir.exists() && !dir.is_dir() {
-        return Err("所选路径不是文件夹".to_string());
-    }
-    std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建目录：{err}"))?;
-
-    let probe = dir.join(format!(".flashnote-write-test-{}", std::process::id()));
-    std::fs::write(&probe, b"flashnote").map_err(|err| format!("该目录不可写：{err}"))?;
-    if let Err(err) = std::fs::remove_file(&probe) {
-        log::warn!("清理写入测试文件失败（{}）：{err}", probe.display());
-    }
-
-    Ok(dir)
-}
-
-#[tauri::command(async)]
-pub fn update_notes_dir(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<(), String> {
+#[tauri::command]
+pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String> {
     let dir = {
-        // 网络目录掉线时 create_dir_all 会阻塞很久，别让并发的笔记读写跟着卡住
-        let _guard = io_guard(&state);
-        ensure_writable_dir(&path)?
+        let handle = app.clone();
+        run_blocking(move || {
+            let state = handle.state::<AppState>();
+            // 网络目录掉线时 create_dir_all 会阻塞很久，别让并发的笔记读写跟着卡住
+            let _guard = io_guard(&state);
+            files::ensure_writable_dir(&path)
+        })
+        .await?
     };
-    state
-        .settings
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .notes_dir = dir.to_string_lossy().to_string();
+    {
+        let state = app.state::<AppState>();
+        state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .notes_dir = dir.to_string_lossy().to_string();
+    }
     persist(&app);
     log::info!("笔记目录已更新为 {}", dir.display());
     Ok(())
@@ -673,38 +367,53 @@ pub fn update_markdown_mode(
     Ok(())
 }
 
-#[tauri::command(async)]
-pub fn list_notes(
-    state: State<'_, AppState>,
+#[tauri::command]
+pub async fn list_notes(
+    app: AppHandle,
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
-    let dir = PathBuf::from(
-        &state
+    let dir = {
+        let state = app.state::<AppState>();
+        let notes_dir = state
             .settings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .notes_dir,
-    );
-    notes::load_recent(&dir, clamp_limit(limit), offset.unwrap_or(0) as usize)
-        .map_err(|err| format!("读取笔记失败：{err}"))
+            .notes_dir
+            .clone();
+        PathBuf::from(notes_dir)
+    };
+    let limit = clamp_limit(limit);
+    let offset = offset.unwrap_or(0) as usize;
+
+    run_blocking(move || {
+        notes::load_recent(&dir, limit, offset).map_err(|err| format!("读取笔记失败：{err}"))
+    })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn search_notes(
-    state: State<'_, AppState>,
+#[tauri::command]
+pub async fn search_notes(
+    app: AppHandle,
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
-    let dir = PathBuf::from(
-        &state
+    let dir = {
+        let state = app.state::<AppState>();
+        let notes_dir = state
             .settings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .notes_dir,
-    );
-    notes::search_entries(&dir, &query, clamp_limit(limit))
-        .map_err(|err| format!("搜索笔记失败：{err}"))
+            .notes_dir
+            .clone();
+        PathBuf::from(notes_dir)
+    };
+    let limit = clamp_limit(limit);
+
+    run_blocking(move || {
+        notes::search_entries(&dir, &query, limit).map_err(|err| format!("搜索笔记失败：{err}"))
+    })
+    .await
 }
 
 /// 列表条数限制在 1..=1000，缺省 200。
@@ -712,104 +421,26 @@ fn clamp_limit(limit: Option<u32>) -> usize {
     limit.unwrap_or(200).clamp(1, 1000) as usize
 }
 
-/// 把目标文件解析到笔记目录内。`..` 穿越、指向目录外的绝对路径都会被拒绝。
-fn resolve_within(dir: &Path, path: &str) -> Result<(PathBuf, PathBuf), String> {
-    let dir = dir
-        .canonicalize()
-        .map_err(|err| format!("笔记目录不可用：{err}"))?;
-    let target = PathBuf::from(path)
-        .canonicalize()
-        .map_err(|err| format!("文件不存在：{err}"))?;
-    if !target.starts_with(&dir) {
-        return Err("文件不在笔记目录中".to_string());
-    }
-    Ok((dir, target))
-}
-
-/// 在笔记目录内改写单个文件：先备份，再原子替换。
-fn rewrite_note<F>(state: &AppState, path: &str, update: F) -> Result<(), String>
-where
-    F: FnOnce(&str) -> Option<String>,
-{
-    let notes_dir = PathBuf::from(
-        &state
-            .settings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .notes_dir,
-    );
-    let (dir, target) = resolve_within(&notes_dir, path)?;
-    // 读-改-写必须独占，否则两次并发删除会互相覆盖
-    let _guard = io_guard(state);
-
-    let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
-    let updated =
-        update(&text).ok_or_else(|| "没有找到这条笔记，可能已被其他程序修改".to_string())?;
-
-    let stem = target
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("notes");
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let backup = target.with_file_name(format!("{stem}.md.bak-{stamp}"));
-    std::fs::copy(&target, &backup).map_err(|err| format!("备份失败：{err}"))?;
-
-    // 临时文件带唯一后缀：上次异常退出残留的同名 tmp 不会挡住这次写入
-    let unique = chrono::Local::now().format("%Y%m%d-%H%M%S%.6f");
-    let tmp = target.with_file_name(format!("{stem}.md.tmp-{unique}"));
-    if let Err(err) = std::fs::write(&tmp, updated.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("写入失败：{err}"));
-    }
-    if let Err(err) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("写入失败：{err}"));
-    }
-    // 解析缓存按 mtime+size 判断，但同一秒内的改写可能撞上旧值，这里直接失效
-    notes::invalidate_cache(&target);
-
-    prune_backups(&dir, stem);
-    Ok(())
-}
-
-/// 每个日期文件最多保留 5 份备份，避免长期使用后目录膨胀。
-fn prune_backups(dir: &Path, stem: &str) {
-    let prefix = format!("{stem}.md.bak-");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut backups: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix))
-        })
-        .collect();
-    backups.sort();
-    while backups.len() > 5 {
-        let oldest = backups.remove(0);
-        let _ = std::fs::remove_file(oldest);
-    }
-}
-
-#[tauri::command(async)]
-pub fn delete_note_entry(
-    state: State<'_, AppState>,
+#[tauri::command]
+pub async fn delete_note_entry(
+    app: AppHandle,
     path: String,
     date: String,
     time: String,
     content: String,
 ) -> Result<(), String> {
-    rewrite_note(&state, &path, |text| {
-        notes::remove_entry(text, &date, &time, &content)
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        files::rewrite_note(&state, &path, |text| {
+            notes::remove_entry(text, &date, &time, &content)
+        })
     })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn update_note_entry(
-    state: State<'_, AppState>,
+#[tauri::command]
+pub async fn update_note_entry(
+    app: AppHandle,
     path: String,
     date: String,
     time: String,
@@ -819,32 +450,32 @@ pub fn update_note_entry(
     if new_content.trim().is_empty() {
         return Err("内容不能为空".to_string());
     }
-    rewrite_note(&state, &path, |text| {
-        notes::replace_entry(text, &date, &time, &content, &new_content)
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        files::rewrite_note(&state, &path, |text| {
+            notes::replace_entry(text, &date, &time, &content, &new_content)
+        })
     })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn open_note_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let notes_dir = PathBuf::from(
-        &state
-            .settings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .notes_dir,
-    );
-    let (_, target) = resolve_within(&notes_dir, &path)?;
-    open_with_explorer(&target)
+#[tauri::command]
+pub async fn open_note_file(app: AppHandle, path: String) -> Result<(), String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        files::open_note_file_impl(&state, &path)
+    })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn open_today_note(app: AppHandle) -> Result<(), String> {
-    open_today_note_impl(&app)
+#[tauri::command]
+pub async fn open_today_note(app: AppHandle) -> Result<(), String> {
+    run_blocking(move || files::open_today_note_impl(&app)).await
 }
 
-#[tauri::command(async)]
-pub fn open_notes_dir(app: AppHandle) -> Result<(), String> {
-    open_notes_dir_impl(&app)
+#[tauri::command]
+pub async fn open_notes_dir(app: AppHandle) -> Result<(), String> {
+    run_blocking(move || files::open_notes_dir_impl(&app)).await
 }
 
 #[tauri::command]
@@ -861,49 +492,48 @@ pub fn take_startup_notice(state: State<'_, AppState>) -> Option<crate::StartupN
         .take()
 }
 
-pub fn open_log_dir_impl(app: &AppHandle) -> Result<(), String> {
-    let dir = app.path().app_log_dir().map_err(|err| err.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    open_with_explorer(&dir)
-}
-
 fn draft_path(app: &AppHandle) -> PathBuf {
     settings::settings_path(app).with_file_name("draft.txt")
 }
 
-#[tauri::command(async)]
-pub fn load_draft(app: AppHandle) -> Result<String, String> {
-    match std::fs::read_to_string(draft_path(&app)) {
+#[tauri::command]
+pub async fn load_draft(app: AppHandle) -> Result<String, String> {
+    run_blocking(move || match std::fs::read_to_string(draft_path(&app)) {
         Ok(text) => Ok(text),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(err) => Err(format!("读取草稿失败：{err}")),
-    }
+    })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn save_draft(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    content: String,
-) -> Result<(), String> {
-    let _guard = io_guard(&state);
-    let path = draft_path(&app);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| format!("保存草稿失败：{err}"))?;
-    }
-    let tmp = path.with_extension("txt.tmp");
-    std::fs::write(&tmp, content.as_bytes()).map_err(|err| format!("保存草稿失败：{err}"))?;
-    std::fs::rename(&tmp, &path).map_err(|err| format!("保存草稿失败：{err}"))
+#[tauri::command]
+pub async fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let _guard = io_guard(&state);
+        let path = draft_path(&app);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| format!("保存草稿失败：{err}"))?;
+        }
+        let tmp = path.with_extension("txt.tmp");
+        std::fs::write(&tmp, content.as_bytes()).map_err(|err| format!("保存草稿失败：{err}"))?;
+        std::fs::rename(&tmp, &path).map_err(|err| format!("保存草稿失败：{err}"))
+    })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn clear_draft(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let _guard = io_guard(&state);
-    match std::fs::remove_file(draft_path(&app)) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("清除草稿失败：{err}")),
-    }
+#[tauri::command]
+pub async fn clear_draft(app: AppHandle) -> Result<(), String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let _guard = io_guard(&state);
+        match std::fs::remove_file(draft_path(&app)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("清除草稿失败：{err}")),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1004,214 +634,6 @@ mod tests {
     }
 
     #[test]
-    fn allows_http_https_and_mailto() {
-        assert!(external_url_allowed("https://example.com/a?b=1"));
-        assert!(external_url_allowed("HTTP://example.com"));
-        assert!(external_url_allowed("mailto:hi@example.com"));
-    }
-
-    #[test]
-    fn rejects_other_schemes_and_control_chars() {
-        assert!(!external_url_allowed(""));
-        assert!(!external_url_allowed("#anchor"));
-        assert!(!external_url_allowed("javascript:alert(1)"));
-        assert!(!external_url_allowed(
-            "file:///C:/Windows/System32/calc.exe"
-        ));
-        // 换行属于控制字符，不能在 URL 里悄悄夹带
-        assert!(!external_url_allowed("https://example.com/\ncalc.exe"));
-        assert!(!external_url_allowed("https://example.com/\"x"));
-        assert!(!external_url_allowed(&format!(
-            "https://example.com/{}",
-            "a".repeat(2048)
-        )));
-    }
-
-    #[test]
-    fn clamp_rect_keeps_window_in_place_when_visible() {
-        let monitors = [
-            Rect {
-                x: 0,
-                y: 0,
-                w: 1920,
-                h: 1040,
-            },
-            Rect {
-                x: 1920,
-                y: 0,
-                w: 1920,
-                h: 1040,
-            },
-        ];
-
-        assert_eq!(
-            clamp_rect(
-                Rect {
-                    x: 100,
-                    y: 100,
-                    w: 480,
-                    h: 360
-                },
-                &monitors
-            ),
-            (100, 100)
-        );
-        assert_eq!(
-            clamp_rect(
-                Rect {
-                    x: 2000,
-                    y: 200,
-                    w: 480,
-                    h: 360
-                },
-                &monitors
-            ),
-            (2000, 200)
-        );
-    }
-
-    #[test]
-    fn clamp_rect_pulls_back_offscreen_window() {
-        let monitors = [Rect {
-            x: 0,
-            y: 0,
-            w: 1920,
-            h: 1040,
-        }];
-
-        let (x, y) = clamp_rect(
-            Rect {
-                x: 5000,
-                y: 5000,
-                w: 480,
-                h: 360,
-            },
-            &monitors,
-        );
-
-        assert_eq!(x, 1920 - 120);
-        assert_eq!(y, 1040 - 40);
-    }
-
-    #[test]
-    fn clamp_rect_falls_back_to_nearest_monitor_after_unplug() {
-        let monitors = [Rect {
-            x: 0,
-            y: 0,
-            w: 1920,
-            h: 1040,
-        }];
-
-        let (x, y) = clamp_rect(
-            Rect {
-                x: 2500,
-                y: 100,
-                w: 480,
-                h: 360,
-            },
-            &monitors,
-        );
-
-        assert!(x <= 1920 - 120);
-        assert!(y >= 0);
-    }
-
-    #[test]
-    fn scale_geometry_follows_dpi_changes() {
-        let rect = Rect {
-            x: 100,
-            y: 50,
-            w: 480,
-            h: 360,
-        };
-
-        let scaled = scale_geometry(rect, Some(1.0), 1.5);
-        assert_eq!(
-            (scaled.x, scaled.y, scaled.w, scaled.h),
-            (150, 75, 720, 540)
-        );
-
-        // 老配置没有 scale 字段：保持原样，不能凭空放大
-        let untouched = scale_geometry(rect, None, 2.0);
-        assert_eq!((untouched.x, untouched.y, untouched.w), (100, 50, 480));
-    }
-
-    #[test]
-    fn clamp_rect_survives_absurd_saved_size() {
-        let monitors = [Rect {
-            x: 0,
-            y: 0,
-            w: 1920,
-            h: 1040,
-        }];
-        // 手改设置塞进 u32::MAX 时不能溢出 panic
-        let (x, y) = clamp_rect(
-            Rect {
-                x: 100,
-                y: 50,
-                w: u32::MAX,
-                h: i32::MAX as u32,
-            },
-            &monitors,
-        );
-        assert_eq!(x, 100);
-        assert_eq!(y, 50);
-    }
-
-    #[test]
-    fn clamp_rect_without_monitors_is_a_no_op() {
-        let rect = Rect {
-            x: 123,
-            y: 456,
-            w: 480,
-            h: 360,
-        };
-        assert_eq!(clamp_rect(rect, &[]), (123, 456));
-    }
-
-    #[test]
-    fn clamp_size_respects_minimum_and_monitor_bounds() {
-        let monitors = [Rect {
-            x: 0,
-            y: 0,
-            w: 1920,
-            h: 1040,
-        }];
-
-        assert_eq!(clamp_size(100, 100, 10, 10, &monitors), (380, 240));
-        assert_eq!(clamp_size(4000, 3000, 10, 10, &monitors), (1920, 1040));
-    }
-
-    #[test]
-    fn ensure_writable_dir_creates_and_accepts_directory() {
-        let dir = temp_dir("writable");
-        let target = dir.join("notes");
-
-        let result = ensure_writable_dir(target.to_str().unwrap()).unwrap();
-
-        assert!(result.is_dir());
-        assert!(std::fs::read_dir(&result).unwrap().next().is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ensure_writable_dir_rejects_file_path() {
-        let dir = temp_dir("file-path");
-        let file = dir.join("not-a-dir.txt");
-        std::fs::write(&file, "x").unwrap();
-
-        assert!(ensure_writable_dir(file.to_str().unwrap()).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ensure_writable_dir_rejects_empty_path() {
-        assert!(ensure_writable_dir("   ").is_err());
-    }
-
-    #[test]
     fn clamps_list_limit() {
         assert_eq!(clamp_limit(None), 200);
         assert_eq!(clamp_limit(Some(0)), 1, "0 条应当被抬到 1");
@@ -1221,53 +643,54 @@ mod tests {
     }
 
     #[test]
-    fn resolve_within_accepts_file_in_notes_dir() {
-        let dir = temp_dir("resolve-inside");
-        let file = dir.join("2026-10-21.md");
-        std::fs::write(&file, "# 2026-10-21\n").unwrap();
+    fn settings_writes_keep_newest_successful_snapshot() {
+        let dir = temp_dir("newest");
+        let path = dir.join("settings.json");
+        let last = AtomicU64::new(0);
+        let lock = Mutex::new(());
+        let older = Settings::default();
+        let newer = Settings {
+            pinned: true,
+            ..Settings::default()
+        };
 
-        let (_, target) = resolve_within(&dir, file.to_str().unwrap()).unwrap();
-        assert_eq!(target, file.canonicalize().unwrap());
+        assert!(write_snapshot_locked(&path, 2, &newer, &last, &lock));
+        assert!(
+            !write_snapshot_locked(&path, 1, &older, &last, &lock),
+            "已有更新的快照落盘，旧快照应跳过"
+        );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_within_rejects_parent_traversal() {
-        let dir = temp_dir("resolve-traversal");
-        let notes = dir.join("notes");
-        std::fs::create_dir_all(&notes).unwrap();
-        let outside = dir.join("secret.md");
-        std::fs::write(&outside, "x").unwrap();
-
-        let sneaky = notes.join("..").join("secret.md");
-        let err = resolve_within(&notes, sneaky.to_str().unwrap()).unwrap_err();
-        assert_eq!(err, "文件不在笔记目录中");
+        let saved: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.pinned);
+        assert_eq!(last.load(Ordering::SeqCst), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_within_rejects_absolute_path_outside() {
-        let dir = temp_dir("resolve-outside");
-        let notes = dir.join("notes");
-        std::fs::create_dir_all(&notes).unwrap();
-        let outside = dir.join("elsewhere.md");
-        std::fs::write(&outside, "x").unwrap();
+    fn failed_write_does_not_block_older_snapshot() {
+        let dir = temp_dir("failure");
+        // 父路径是文件时 create_dir_all 必然失败，用来越过 settings::save 的错误分支
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let bad_path = blocker.join("settings.json");
+        let good_path = dir.join("settings.json");
+        let last = AtomicU64::new(0);
+        let lock = Mutex::new(());
+        let snapshot = Settings {
+            pinned: true,
+            ..Settings::default()
+        };
 
-        let err = resolve_within(&notes, outside.to_str().unwrap()).unwrap_err();
-        assert_eq!(err, "文件不在笔记目录中");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_within_rejects_missing_file() {
-        let dir = temp_dir("resolve-missing");
-        let missing = dir.join("nope.md");
-
-        let err = resolve_within(&dir, missing.to_str().unwrap()).unwrap_err();
-        assert!(err.starts_with("文件不存在"), "实际：{err}");
+        assert!(!write_snapshot_locked(
+            &bad_path, 2, &snapshot, &last, &lock
+        ));
+        assert_eq!(last.load(Ordering::SeqCst), 0, "失败不能推进已落盘序号");
+        assert!(
+            write_snapshot_locked(&good_path, 1, &snapshot, &last, &lock),
+            "最新快照写失败时，旧快照仍应兜底"
+        );
+        assert!(good_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

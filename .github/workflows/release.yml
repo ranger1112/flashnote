@@ -56,12 +56,16 @@ jobs:
           # PowerShell 7.4+ 的 ConvertFrom-Json 默认会因此报错，必须走 -AsHashtable
           $lockVersion = (Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable)['version']
           $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          # Cargo.lock 里的根包版本也要一致，否则 cargo --locked 会直接拒绝构建
+          $cargoLock = Get-Content src-tauri/Cargo.lock -Raw
+          $cargoLockVersion = [regex]::Match($cargoLock, '\[\[package\]\]\r?\nname = "flashnote"\r?\nversion = "([^"]+)"').Groups[1].Value
 
           foreach ($pair in @(
             @{ Name = 'src-tauri/tauri.conf.json'; Value = $configVersion },
             @{ Name = 'package.json'; Value = $pkgVersion },
             @{ Name = 'package-lock.json'; Value = $lockVersion },
-            @{ Name = 'src-tauri/Cargo.toml'; Value = $cargoVersion }
+            @{ Name = 'src-tauri/Cargo.toml'; Value = $cargoVersion },
+            @{ Name = 'src-tauri/Cargo.lock'; Value = $cargoLockVersion }
           )) {
             if ($pair.Value -ne $version) {
               throw "版本不一致：tag 为 $tag，但 $($pair.Name) 是 $($pair.Value)。请先把各处版本统一为 $version 再打 tag。"

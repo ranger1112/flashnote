@@ -1,9 +1,23 @@
-use crate::commands;
+use crate::{commands, files};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    App, Emitter,
+    App, AppHandle, Emitter,
 };
+
+/// 托盘回调跑在 UI 线程上；打开目录/文件可能落在掉线的网络盘上，
+/// 丢进阻塞线程池再执行，菜单点击后窗口不会跟着卡住。
+fn run_off_thread<F>(app: &AppHandle, task: F, context: &'static str)
+where
+    F: FnOnce(&AppHandle) -> Result<(), String> + Send + 'static,
+{
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(err) = task(&handle) {
+            log::error!("{context}：{err}");
+        }
+    });
+}
 
 pub fn create(app: &mut App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "显示速记", true, None::<&str>)?;
@@ -38,21 +52,9 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
                 commands::show_window_impl(app);
                 let _ = app.emit("open-history", ());
             }
-            "today" => {
-                if let Err(err) = commands::open_today_note_impl(app) {
-                    log::error!("打开今日笔记失败：{err}");
-                }
-            }
-            "folder" => {
-                if let Err(err) = commands::open_notes_dir_impl(app) {
-                    log::error!("打开笔记目录失败：{err}");
-                }
-            }
-            "logs" => {
-                if let Err(err) = commands::open_log_dir_impl(app) {
-                    log::error!("打开日志目录失败：{err}");
-                }
-            }
+            "today" => run_off_thread(app, files::open_today_note_impl, "打开今日笔记失败"),
+            "folder" => run_off_thread(app, files::open_notes_dir_impl, "打开笔记目录失败"),
+            "logs" => run_off_thread(app, files::open_log_dir_impl, "打开日志目录失败"),
             "settings" => {
                 commands::show_window_impl(app);
                 let _ = app.emit("open-settings", ());
