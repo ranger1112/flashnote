@@ -24,6 +24,7 @@ use reqwest::header::{
 use reqwest::{Client, Method, Response, StatusCode, Url};
 
 use super::backend::{Capabilities, Expect, RemoteMeta, RemoteVersion, SyncBackend, SyncError};
+use super::state::sha256_base64;
 
 /// 客户端只写自己的子目录，绝不碰用户放进去的其它文件。
 pub(crate) const REMOTE_SUBDIR: &str = "flashnote/notes/";
@@ -278,6 +279,33 @@ impl WebDavBackend {
         Some(entry_version(&entry))
     }
 
+    /// 没有可用的 `If-Match` 时，在写入/删除前复核远端内容。
+    ///
+    /// 服务器不给 ETag（或 ETag 无法用于条件请求）时，裸 PUT/DELETE 会静默覆盖
+    /// 另一台设备刚写入的版本。这里先 GET 一次比对明文摘要；拿不到摘要才退回
+    /// 版本令牌比对，两者都做不到就拒绝操作。
+    async fn check_version(
+        &self,
+        url: &Url,
+        version: &RemoteVersion,
+        sha256: Option<&str>,
+    ) -> Result<(), SyncError> {
+        if let Some(expected) = sha256 {
+            let (bytes, _) = self.read_bytes(url.clone()).await?;
+            if sha256_base64(&bytes) != expected {
+                return Err(SyncError::VersionMismatch);
+            }
+            return Ok(());
+        }
+        match self.stat_version(url).await {
+            Some(current) if &current == version => Ok(()),
+            Some(_) => Err(SyncError::VersionMismatch),
+            None => Err(SyncError::Unsupported(
+                "服务器不支持条件写入，无法安全覆盖".into(),
+            )),
+        }
+    }
+
     /// 弱服务器写入后回读比对：内容被改写时重写一次，仍不一致就报错。
     async fn verify_write(&self, url: &Url, data: &[u8]) -> Result<(), SyncError> {
         for attempt in 0..2 {
@@ -464,6 +492,15 @@ impl SyncBackend for WebDavBackend {
         }
     }
 
+    async fn exists(&self, name: &str) -> Result<bool, SyncError> {
+        let url = self.file_url(name)?;
+        match self.propfind(url, "0").await {
+            Ok(_) => Ok(true),
+            Err(SyncError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn put(
         &self,
         name: &str,
@@ -475,18 +512,29 @@ impl SyncBackend for WebDavBackend {
             CONTENT_TYPE,
             HeaderValue::from_static("text/markdown; charset=utf-8"),
         )];
+        // 只有真的带上了条件头，服务器才可能替我们拒绝并发写入。
+        let mut conditional = false;
         match &expect {
-            Expect::Absent => headers.push((IF_NONE_MATCH, HeaderValue::from_static("*"))),
-            Expect::Version(RemoteVersion::Etag(tag))
-                if self.caps.strong_etag && self.caps.honors_if_match =>
-            {
+            Expect::Absent => {
+                headers.push((IF_NONE_MATCH, HeaderValue::from_static("*")));
+                // If-None-Match 没有单独探测；保持旧行为，弱服务器写后回读。
+                conditional = self.caps.honors_if_match;
+            }
+            Expect::Version {
+                version: RemoteVersion::Etag(tag),
+                ..
+            } if self.caps.strong_etag && self.caps.honors_if_match => {
                 headers.push((
                     IF_MATCH,
                     HeaderValue::from_str(tag)
                         .map_err(|error| SyncError::Other(format!("ETag 不合法：{error}")))?,
                 ));
+                conditional = true;
             }
-            _ => {}
+            Expect::Version { version, sha256 } => {
+                // 没有可用的 If-Match：先确认远端仍是预期内容，避免无条件覆盖。
+                self.check_version(&url, version, sha256.as_deref()).await?;
+            }
         }
 
         let mut response = self
@@ -529,7 +577,7 @@ impl SyncBackend for WebDavBackend {
             .and_then(normalize_etag)
             .map(RemoteVersion::Etag);
 
-        if !self.caps.honors_if_match {
+        if !conditional {
             self.verify_write(&url, data).await?;
         }
 
@@ -545,13 +593,24 @@ impl SyncBackend for WebDavBackend {
     async fn delete(&self, name: &str, expect: Expect) -> Result<(), SyncError> {
         let url = self.file_url(name)?;
         let mut headers = Vec::new();
-        if let Expect::Version(RemoteVersion::Etag(tag)) = expect {
+        let mut conditional = false;
+        if let Expect::Version {
+            version: RemoteVersion::Etag(tag),
+            ..
+        } = &expect
+        {
             if self.caps.strong_etag && self.caps.honors_if_match {
                 headers.push((
                     IF_MATCH,
-                    HeaderValue::from_str(&tag)
+                    HeaderValue::from_str(tag)
                         .map_err(|error| SyncError::Other(format!("ETag 不合法：{error}")))?,
                 ));
+                conditional = true;
+            }
+        }
+        if !conditional {
+            if let Expect::Version { version, sha256 } = &expect {
+                self.check_version(&url, version, sha256.as_deref()).await?;
             }
         }
         let (response, _) = self
@@ -1026,7 +1085,75 @@ mod tests {
             .put(
                 "2026-10-23.md",
                 b"- 10:00 hi\n",
-                Expect::Version(RemoteVersion::Etag("\"v1\"".into())),
+                Expect::Version {
+                    version: RemoteVersion::Etag("\"v1\"".into()),
+                    sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(version, RemoteVersion::Etag("\"v2\"".into()));
+    }
+
+    #[tokio::test]
+    async fn hash_version_is_checked_before_overwrite() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"newer".to_vec()))
+            .mount(&server)
+            .await;
+        // 预检发现远端已变，PUT 不应发出。
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = backend_with(&server, STRONG)
+            .put(
+                "2026-10-23.md",
+                b"- 10:00 hi\n",
+                Expect::Version {
+                    version: RemoteVersion::Hash("rev-1".into()),
+                    sha256: Some(sha256_base64(b"- 10:00 base\n")),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::VersionMismatch), "{error}");
+    }
+
+    #[tokio::test]
+    async fn hash_version_is_written_when_content_matches() {
+        let server = MockServer::start().await;
+        // 预检看到旧内容，回读看到刚写入的内容。
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"- 10:00 base\n".to_vec()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"- 10:00 hi\n".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(204).insert_header("etag", "\"v2\""))
+            .mount(&server)
+            .await;
+
+        let version = backend_with(&server, STRONG)
+            .put(
+                "2026-10-23.md",
+                b"- 10:00 hi\n",
+                Expect::Version {
+                    version: RemoteVersion::Hash("rev-1".into()),
+                    sha256: Some(sha256_base64(b"- 10:00 base\n")),
+                },
             )
             .await
             .unwrap();
@@ -1361,7 +1488,13 @@ mod tests {
         assert_eq!(read, body);
 
         backend
-            .delete("2099-01-01.md", Expect::Version(version))
+            .delete(
+                "2099-01-01.md",
+                Expect::Version {
+                    version,
+                    sha256: None,
+                },
+            )
             .await
             .unwrap();
         assert!(backend.get("2099-01-01.md").await.unwrap().is_none());

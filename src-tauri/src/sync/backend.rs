@@ -46,8 +46,14 @@ pub(crate) struct RemoteMeta {
 pub(crate) enum Expect {
     /// 文件必须不存在。
     Absent,
-    /// 文件版本必须匹配（If-Match）。
-    Version(RemoteVersion),
+    /// 远端内容必须仍是这个版本。
+    ///
+    /// `sha256` 是上一轮同步时看到的明文摘要：服务器不给 ETag、或 ETag 无法用于
+    /// `If-Match` 时，后端先 GET 一次并比对摘要，避免退化成无条件覆盖。
+    Version {
+        version: RemoteVersion,
+        sha256: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +134,11 @@ pub(crate) trait SyncBackend: Send + Sync {
 
     /// 读取文件；不存在返回 `Ok(None)`。
     async fn get(&self, name: &str) -> Result<Option<(Vec<u8>, RemoteVersion)>, SyncError>;
+
+    /// 远端是否仍存在该文件；删除本地副本前用它复核列表。
+    ///
+    /// 列表可能被服务器或代理截断，而「没列出来」不能直接当成「已删除」。
+    async fn exists(&self, name: &str) -> Result<bool, SyncError>;
 
     /// 写入文件，成功返回新的版本。
     async fn put(
