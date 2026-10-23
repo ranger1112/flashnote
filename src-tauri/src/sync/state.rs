@@ -53,13 +53,24 @@ pub(crate) struct StateStore {
 
 impl StateStore {
     /// 状态目录：`<app_config_dir>/sync/<笔记目录哈希前 16 位>/`。
+    /// 只给不会访问远端的测试用；真实调用一律走 [`StateStore::with_remote`]。
+    #[cfg(test)]
     pub(crate) fn new(config_dir: &Path, notes_dir: &Path) -> Self {
-        let key = dir_key(notes_dir);
+        Self::with_remote(config_dir, notes_dir, "")
+    }
+
+    /// 远端身份也参与哈希：换服务器或换账号等于换一份状态。
+    ///
+    /// 否则新服务器上「一个文件都没有」会被当成「远端全部被删」，把本地
+    /// 笔记整批扔进 trash——这是任何情况下都不能发生的误判。
+    pub(crate) fn with_remote(config_dir: &Path, notes_dir: &Path, remote: &str) -> Self {
+        let label = format!("{}\n{}", notes_dir.to_string_lossy(), remote.trim());
         Self {
-            root: config_dir.join("sync").join(key),
+            root: config_dir.join("sync").join(key_for(&label)),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -162,10 +173,9 @@ impl StateStore {
     }
 }
 
-/// 笔记目录指纹：路径的 SHA-256 取前 16 个 Base64url 字符，可直接做目录名。
-pub(crate) fn dir_key(notes_dir: &Path) -> String {
-    let path = notes_dir.to_string_lossy();
-    let hash = sha256_base64(path.as_bytes());
+/// 状态目录名：SHA-256 取前 16 个 Base64url 字符，可直接做目录名。
+fn key_for(label: &str) -> String {
+    let hash = sha256_base64(label.as_bytes());
     hash.chars().take(16).collect()
 }
 
@@ -260,6 +270,20 @@ mod tests {
             .filter(|item| item.file_name().to_string_lossy().contains("corrupt-"))
             .collect();
         assert_eq!(backups.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_identity_changes_state_dir() {
+        let dir = temp_dir("remote-key");
+        let notes = Path::new("D:\\Notes");
+        let first = StateStore::with_remote(&dir, notes, "https://a.example.com/\nalice");
+        let second = StateStore::with_remote(&dir, notes, "https://b.example.com/\nalice");
+        assert_ne!(
+            first.root(),
+            second.root(),
+            "换服务器不能复用旧状态，否则会把本地笔记误判为远端已删除"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

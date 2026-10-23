@@ -35,6 +35,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// 请求预算的「不限」哨兵，避免用 0 兼作「已用完」。
 const UNLIMITED: usize = usize::MAX;
+/// 单次请求内最多补两次；再失败就留给下一轮同步。
+const MAX_RETRIES: u32 = 2;
+/// `Retry-After` 可能长达一小时，单轮最多等这么久，剩下的下次再说。
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const DEPTH_HEADER: HeaderName = HeaderName::from_static("depth");
 
 #[derive(Clone, Debug)]
@@ -90,7 +94,6 @@ impl WebDavBackend {
     }
 
     /// 下一轮允许发出的请求数；用尽后本轮剩余文件留到下一轮。
-    #[allow(dead_code)]
     pub(crate) fn reset_budget(&self, requests: usize) {
         self.budget.store(requests, Ordering::Relaxed);
     }
@@ -304,7 +307,57 @@ impl WebDavBackend {
     }
 
     /// 发一个请求并手动跟随重定向；跨源时不再带 Authorization。
+    /// 统一请求入口：网络抖动、429、423 自动退避重试，其它错误立刻返回。
+    /// 所有方法（GET/PUT/DELETE/PROPFIND/MKCOL）都是幂等的，重试安全。
     async fn request(
+        &self,
+        method: Method,
+        url: Url,
+        headers: Vec<(HeaderName, HeaderValue)>,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<(Response, Url), SyncError> {
+        let mut attempt = 0;
+        loop {
+            match self
+                .request_once(
+                    method.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    body.clone(),
+                    timeout,
+                )
+                .await
+            {
+                // 状态码错误由调用方映射；只有明确可重试的状态才在这里补发。
+                Ok((response, final_url)) => {
+                    let retryable = attempt < MAX_RETRIES
+                        && matches!(response.status().as_u16(), 423 | 429 | 503);
+                    if !retryable {
+                        return Ok((response, final_url));
+                    }
+                    attempt += 1;
+                    let delay = map_status("重试", &response)
+                        .backoff(attempt)
+                        .min(MAX_RETRY_DELAY);
+                    log::warn!(
+                        "WebDAV 响应 {}，{delay:?} 后第 {attempt} 次重试",
+                        response.status()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) if error.is_retryable() && attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    let delay = error.backoff(attempt).min(MAX_RETRY_DELAY);
+                    log::warn!("WebDAV 请求失败（{error}），{delay:?} 后第 {attempt} 次重试");
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn request_once(
         &self,
         method: Method,
         url: Url,
@@ -473,8 +526,8 @@ impl SyncBackend for WebDavBackend {
             .headers()
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
-            .filter(|tag| is_strong_etag(tag))
-            .map(|tag| RemoteVersion::Etag(tag.to_string()));
+            .and_then(normalize_etag)
+            .map(RemoteVersion::Etag);
 
         if !self.caps.honors_if_match {
             self.verify_write(&url, data).await?;
@@ -547,6 +600,11 @@ fn parse_root(raw: &str, allow_insecure_http: bool) -> Result<Url, SyncError> {
     Ok(url)
 }
 
+/// 只校验地址格式，不联网；保存配置前调用。
+pub(crate) fn validate_url(raw: &str, allow_insecure_http: bool) -> Result<(), SyncError> {
+    parse_root(raw, allow_insecure_http).map(|_| ())
+}
+
 fn is_loopback(url: &Url) -> bool {
     match url.host_str() {
         Some(host) => {
@@ -615,9 +673,24 @@ fn retry_after(headers: &HeaderMap) -> Option<u64> {
         .filter(|secs| *secs <= 3600)
 }
 
-fn is_strong_etag(etag: &str) -> bool {
+/// 把服务器给的 ETag 规范成带引号的形式；弱 ETag 与空值返回 None。
+///
+/// 有的服务器 PUT 响应写 `"abc"`、PROPFIND 却写 `abc`（wsgidav 就是这样）。
+/// 不统一的话，刚上传的文件下一轮会被误判成「远端已修改」而重复下载。
+fn normalize_etag(etag: &str) -> Option<String> {
     let tag = etag.trim();
-    !tag.is_empty() && !tag.starts_with("W/")
+    if tag.is_empty() || tag.starts_with("W/") || tag.starts_with("w/") {
+        return None;
+    }
+    let inner = tag.trim_matches('"');
+    if inner.is_empty() || inner.contains('"') {
+        return None;
+    }
+    Some(format!("\"{inner}\""))
+}
+
+fn is_strong_etag(etag: &str) -> bool {
+    normalize_etag(etag).is_some()
 }
 
 fn version_token(modified: Option<&str>, size: u64) -> String {
@@ -628,9 +701,9 @@ fn response_version(headers: &HeaderMap) -> RemoteVersion {
     if let Some(tag) = headers
         .get(ETAG)
         .and_then(|value| value.to_str().ok())
-        .filter(|tag| is_strong_etag(tag))
+        .and_then(normalize_etag)
     {
-        return RemoteVersion::Etag(tag.to_string());
+        return RemoteVersion::Etag(tag);
     }
     let modified = headers
         .get(LAST_MODIFIED)
@@ -644,8 +717,8 @@ fn response_version(headers: &HeaderMap) -> RemoteVersion {
 }
 
 fn entry_version(entry: &Props) -> RemoteVersion {
-    if let Some(tag) = entry.etag.as_deref().filter(|tag| is_strong_etag(tag)) {
-        return RemoteVersion::Etag(tag.to_string());
+    if let Some(tag) = entry.etag.as_deref().and_then(normalize_etag) {
+        return RemoteVersion::Etag(tag);
     }
     RemoteVersion::Hash(version_token(
         entry.modified.as_deref(),
@@ -792,6 +865,19 @@ mod tests {
             Some("2026-10-23.conflict-pc 1-20261023.md")
         );
         assert_eq!(name_from_href("/dav/notes/"), None);
+    }
+
+    #[test]
+    fn etags_are_normalized_across_quoted_and_bare_forms() {
+        assert_eq!(normalize_etag("\"abc\"").as_deref(), Some("\"abc\""));
+        assert_eq!(
+            normalize_etag("abc-123-6").as_deref(),
+            Some("\"abc-123-6\""),
+            "不带引号的 ETag 也要和带引号的形式等价"
+        );
+        assert_eq!(normalize_etag("W/\"abc\""), None, "弱 ETag 不能当版本");
+        assert_eq!(normalize_etag(""), None);
+        assert_eq!(normalize_etag("\"a\"b\""), None);
     }
 
     #[test]
@@ -962,7 +1048,7 @@ mod tests {
             .await;
 
         let version = backend_with(&server, Capabilities::default())
-            .put("2026-10-23.md", b"- 10:00 hi\n", Expect::Any)
+            .put("2026-10-23.md", b"- 10:00 hi\n", Expect::Absent)
             .await
             .unwrap();
         assert!(matches!(version, RemoteVersion::Hash(_)));
@@ -985,10 +1071,36 @@ mod tests {
             .await;
 
         let error = backend_with(&server, Capabilities::default())
-            .put("2026-10-23.md", b"- 10:00 hi\n", Expect::Any)
+            .put("2026-10-23.md", b"- 10:00 hi\n", Expect::Absent)
             .await
             .unwrap_err();
         assert!(matches!(error, SyncError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn transient_errors_are_retried_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"- 10:00 hi\n".to_vec()))
+            .mount(&server)
+            .await;
+
+        let (bytes, _) = backend_with(&server, STRONG)
+            .get("2026-10-23.md")
+            .await
+            .unwrap()
+            .expect("重试后应读到文件");
+        assert_eq!(bytes, b"- 10:00 hi\n");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "503 应被自动重试一次");
     }
 
     #[tokio::test]
@@ -1265,7 +1377,7 @@ mod tests {
             .await;
 
         let error = backend_with(&server, STRONG)
-            .delete("2026-10-23.md", Expect::Any)
+            .delete("2026-10-23.md", Expect::Absent)
             .await
             .unwrap_err();
         assert!(matches!(error, SyncError::NotFound));

@@ -1,4 +1,5 @@
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ui } from "./dom";
 import { settings } from "./settings-store";
@@ -128,7 +129,8 @@ export function initUpdater(): void {
 
   ui.updateBannerAction.addEventListener("click", () => {
     if (updateReady) {
-      void relaunch();
+      // 重启前把设置与同步状态落盘，避免更新后重复合并或重复上传。
+      void invoke("flush_sync_state").finally(() => void relaunch());
     } else {
       void installUpdate();
     }

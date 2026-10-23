@@ -44,6 +44,62 @@ pub fn clamp_opacity(value: f64) -> f64 {
     }
 }
 
+/// 云同步配置。密码不在这里：它只进 Windows 凭据管理器。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SyncSettings {
+    pub enabled: bool,
+    pub url: String,
+    pub username: String,
+    /// 自动同步间隔（分钟），只接受 5 / 15 / 60。
+    pub interval_minutes: u32,
+    /// 允许对非回环地址使用明文 `http://`。
+    pub allow_insecure_http: bool,
+    /// 冲突副本文件名里的设备标识；留空时用计算机名。
+    pub device_name: String,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            username: String::new(),
+            interval_minutes: 5,
+            allow_insecure_http: false,
+            device_name: String::new(),
+        }
+    }
+}
+
+impl SyncSettings {
+    pub fn is_configured(&self) -> bool {
+        !self.url.trim().is_empty() && !self.username.trim().is_empty()
+    }
+
+    /// 只接受 5 / 15 / 60，其余一律按 15 处理。
+    pub fn normalize_interval(value: u32) -> u32 {
+        match value {
+            5 => 5,
+            60 => 60,
+            _ => 15,
+        }
+    }
+
+    /// 生成冲突副本时使用的设备名：设置优先，其次计算机名。
+    pub fn device_label(&self) -> String {
+        let configured = self.device_name.trim();
+        if !configured.is_empty() {
+            return configured.to_string();
+        }
+        std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "device".to_string())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -66,6 +122,8 @@ pub struct Settings {
     /// 小窗与面板的背景不透明度，0.6–1.0。
     pub background_opacity: f64,
     pub window: Option<WindowGeometry>,
+    /// WebDAV 同步参数；默认关闭，不配置时不产生任何网络请求。
+    pub sync: SyncSettings,
 }
 
 impl Default for Settings {
@@ -83,6 +141,7 @@ impl Default for Settings {
             auto_hide_on_blur: false,
             background_opacity: 1.0,
             window: None,
+            sync: SyncSettings::default(),
         }
     }
 }
@@ -126,6 +185,8 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
             Ok(mut parsed) => {
                 parsed.theme = normalize_theme(&parsed.theme);
                 parsed.background_opacity = clamp_opacity(parsed.background_opacity);
+                parsed.sync.interval_minutes =
+                    SyncSettings::normalize_interval(parsed.sync.interval_minutes);
                 parsed
             }
             Err(err) => {
@@ -349,6 +410,7 @@ mod tests {
                 h: 360,
                 scale: Some(1.0),
             }),
+            sync: SyncSettings::default(),
         };
 
         save(&path, &settings).unwrap();
@@ -454,5 +516,38 @@ mod tests {
         assert_eq!(loaded.settings.hotkey, "ctrl+alt+n");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_settings_default_off_and_only_accept_known_intervals() {
+        let dir = temp_dir("sync");
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"sync":{"intervalMinutes":7}}"#).unwrap();
+
+        let loaded = load_from_path(&path);
+        assert!(!loaded.settings.sync.enabled, "同步默认关闭");
+        assert!(!loaded.settings.sync.is_configured());
+        assert_eq!(
+            loaded.settings.sync.interval_minutes, 15,
+            "未知间隔应回落到 15 分钟"
+        );
+
+        assert_eq!(SyncSettings::normalize_interval(5), 5);
+        assert_eq!(SyncSettings::normalize_interval(60), 60);
+        assert_eq!(SyncSettings::normalize_interval(0), 15);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_device_label_prefers_configured_name() {
+        let configured = SyncSettings {
+            device_name: "  Work-PC ".to_string(),
+            ..SyncSettings::default()
+        };
+        assert_eq!(configured.device_label(), "Work-PC");
+
+        let fallback = SyncSettings::default().device_label();
+        assert!(!fallback.is_empty());
     }
 }
