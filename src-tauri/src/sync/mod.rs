@@ -144,7 +144,8 @@ fn decide(
             if caps.supports_deletion() {
                 Action::DeleteRemote
             } else {
-                Action::Forget
+                // 无法传播删除；保留记录，避免下一轮把远端副本当成新文件下载回来。
+                Action::Skip
             }
         }
         (LocalState::Absent, true) => Action::RestoreLocal,
@@ -561,6 +562,17 @@ impl<B: SyncBackend> SyncEngine<B> {
                         summary
                             .warnings
                             .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
+                        return;
+                    }
+                    // 版本令牌可能来自 GET 与 PROPFIND 两个来源。内容与我们上次
+                    // 同步的完全一致时，只把列表版本补进记录，避免反复下载。
+                    if record
+                        .as_ref()
+                        .is_some_and(|record| sha256_base64(&bytes) == record.remote_sha256)
+                    {
+                        let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
+                        self.commit(name, &bytes, version, summary).await;
+                        summary.skipped += 1;
                         return;
                     }
                     // Download 的本地文件必须仍是扫描时那一份；RestoreLocal 则要求
@@ -997,6 +1009,8 @@ mod tests {
         fail_list: AtomicBool,
         /// 模拟被截断的目录列表：文件仍在，但 list() 看不到它。
         hidden: Mutex<BTreeSet<String>>,
+        /// 模拟 GET/PUT 与 PROPFIND 使用不同来源的版本令牌。
+        diverge_list: AtomicBool,
     }
 
     impl FakeBackend {
@@ -1008,6 +1022,7 @@ mod tests {
                     next: AtomicU64::new(1),
                     fail_list: AtomicBool::new(false),
                     hidden: Mutex::new(BTreeSet::new()),
+                    diverge_list: AtomicBool::new(false),
                 }),
             }
         }
@@ -1055,6 +1070,11 @@ mod tests {
         fn hide_from_list(&self, name: &str) {
             self.inner.hidden.lock().unwrap().insert(name.to_string());
         }
+
+        /// 模拟 GET/PUT 与 PROPFIND 使用不同来源的版本令牌。
+        fn diverge_list_versions(&self) {
+            self.inner.diverge_list.store(true, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -1075,10 +1095,22 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|(name, _)| !hidden.contains(name.as_str()))
-                .map(|(name, (bytes, version))| RemoteMeta {
-                    name: name.clone(),
-                    version: version.clone(),
-                    size: bytes.len() as u64,
+                .map(|(name, (bytes, version))| {
+                    let version = if self.inner.diverge_list.load(Ordering::SeqCst) {
+                        match version {
+                            RemoteVersion::Number(number) => {
+                                RemoteVersion::Hash(format!("list-{number}"))
+                            }
+                            other => other.clone(),
+                        }
+                    } else {
+                        version.clone()
+                    };
+                    RemoteMeta {
+                        name: name.clone(),
+                        version,
+                        size: bytes.len() as u64,
+                    }
                 })
                 .collect())
         }
@@ -1271,10 +1303,10 @@ mod tests {
             decide(&weak, true, LocalState::Unchanged, false, false),
             Action::Upload
         );
-        // 本地删除 → 只忘掉记录，不发 DELETE。
+        // 本地删除 → 无法传播；保留记录，避免下一轮重新下载。
         assert_eq!(
             decide(&weak, true, LocalState::Absent, true, false),
-            Action::Forget
+            Action::Skip
         );
         // 列表不可靠 → 远端缺失时不能推断删除；但本地有修改仍应尝试上传，
         // apply 会先向远端确认一次再决定是否覆盖。
@@ -1308,6 +1340,27 @@ mod tests {
         let summary = second.run();
         assert_eq!(summary.downloaded, 1, "{summary:?}");
         assert_eq!(second.read("2026-10-23.md"), text);
+    }
+
+    #[test]
+    fn version_token_mismatch_reconciles_without_rewriting() {
+        let backend = FakeBackend::strong();
+        let harness = Harness::with_backend("version-reconcile", backend.clone());
+        let text = "# 2026-10-23\n\n- 10:00 a\n";
+        harness.write("2026-10-23.md", text);
+        assert_eq!(harness.run().uploaded, 1);
+
+        // 列表开始返回与 GET/PUT 不同来源的版本令牌。
+        backend.diverge_list_versions();
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+        assert_eq!(harness.read("2026-10-23.md"), text);
+
+        // 记录已对齐列表版本，下一轮直接跳过。
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
     }
 
     #[test]
@@ -1417,6 +1470,30 @@ mod tests {
         assert_eq!(summary.uploaded, 1, "{summary:?}");
         assert!(harness.notes.join("2026-10-23.md").exists());
         assert!(backend.content("2026-10-23.md").is_some());
+    }
+
+    #[test]
+    fn weak_server_keeps_local_deletion_without_resurrection() {
+        let backend = FakeBackend::new(Capabilities {
+            strong_etag: false,
+            honors_if_match: false,
+            reliable_listing: true,
+        });
+        let harness = Harness::with_backend("weak-delete", backend.clone());
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        assert_eq!(harness.run().uploaded, 1);
+
+        fs::remove_file(harness.notes.join("2026-10-23.md")).unwrap();
+        let summary = harness.run();
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+        assert!(!harness.notes.join("2026-10-23.md").exists());
+        assert!(backend.content("2026-10-23.md").is_some());
+
+        // 下一轮也不能把远端副本当成新文件下载回来。
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert!(!harness.notes.join("2026-10-23.md").exists());
     }
 
     #[test]
