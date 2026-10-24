@@ -13,6 +13,7 @@ import {
   restoreDraft,
   scheduleDraftSave,
 } from "./draft";
+import { initSync } from "./sync";
 import { initUpdater, startAutoUpdateChecks } from "./updater";
 import {
   closeHistory,
@@ -207,6 +208,7 @@ async function showStartupNotice(): Promise<boolean> {
 initDraft();
 initHistory();
 initSettingsPanel();
+initSync();
 initUpdater();
 
 ui.welcomeStart.addEventListener("click", () => void dismissWelcome());

@@ -11,7 +11,7 @@ import type { NoteEntry } from "./lib";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(),
-  listen: vi.fn(async () => () => {}),
+  listen: vi.fn(async (_event: string, _handler: (event: unknown) => void) => () => {}),
   isEnabled: vi.fn(async () => false),
   enable: vi.fn(async () => {}),
   disable: vi.fn(async () => {}),
@@ -61,7 +61,40 @@ const baseSettings = {
   autoHideOnBlur: false,
   backgroundOpacity: 1,
   window: null,
+  sync: {
+    enabled: false,
+    url: "",
+    username: "",
+    intervalMinutes: 5,
+    allowInsecureHttp: false,
+    deviceName: "",
+  },
 };
+
+interface TestSyncStatus {
+  configured: boolean;
+  enabled: boolean;
+  running: boolean;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  degraded: string | null;
+  summary: unknown;
+  conflicts: number;
+}
+
+function syncStatus(overrides: Partial<TestSyncStatus> = {}): TestSyncStatus {
+  return {
+    configured: false,
+    enabled: false,
+    running: false,
+    lastSyncAt: null,
+    lastError: null,
+    degraded: null,
+    summary: null,
+    conflicts: 0,
+    ...overrides,
+  };
+}
 
 function entry(time: string, content: string): NoteEntry {
   return {
@@ -96,6 +129,12 @@ function defaultHandlers(): Handlers {
     open_note_file: () => null,
     open_notes_dir: () => null,
     complete_onboarding: () => null,
+    get_sync_status: () => syncStatus(),
+    update_sync_config: () => syncStatus({ configured: true, enabled: true }),
+    save_sync_password: () => ({ persistent: true, warning: null }),
+    clear_sync_password: () => null,
+    test_sync_connection: () => ({ files: 0, degraded: null, message: "连接成功" }),
+    sync_now: () => null,
   };
 }
 
@@ -115,6 +154,8 @@ async function boot(
 
   const routes = { ...defaultHandlers(), ...handlers };
   mocks.invoke.mockReset();
+  // 每个用例的模块实例都绑定到新的 DOM，旧的监听回调不能留在调用记录里
+  mocks.listen.mockClear();
   mocks.invoke.mockImplementation(async (cmd, args) => {
     const handler = routes[cmd];
     if (!handler) throw new Error(`unexpected invoke: ${cmd}`);
@@ -300,6 +341,111 @@ describe("历史面板错误态", () => {
 
     expect(document.querySelector(".history-error")).toBeNull();
     expect(entries()).toHaveLength(2);
+  });
+});
+
+describe("云同步", () => {
+  async function openSettings(): Promise<void> {
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+  }
+
+  function statusHandler(): (event: { payload: TestSyncStatus }) => void {
+    const call = mocks.listen.mock.calls.find(([name]) => name === "sync-status");
+    if (!call) throw new Error("没有监听 sync-status");
+    return call[1] as unknown as (event: { payload: TestSyncStatus }) => void;
+  }
+
+  it("保存时提交表单，密码单独落盘并清空输入框", async () => {
+    let saved: Record<string, unknown> | undefined;
+    await boot({
+      update_sync_config: (args) => {
+        saved = args?.config as Record<string, unknown>;
+        return syncStatus({ configured: true, enabled: true });
+      },
+    });
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").value = "  https://dav.example.com/ ";
+    node<HTMLInputElement>("#sync-username").value = " alice ";
+    node<HTMLInputElement>("#sync-enabled").checked = true;
+    node<HTMLSelectElement>("#sync-interval").value = "15";
+    node<HTMLInputElement>("#sync-password").value = "secret";
+
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(saved).toMatchObject({
+      url: "https://dav.example.com/",
+      username: "alice",
+      enabled: true,
+      intervalMinutes: 15,
+    });
+    expect(mocks.invoke).toHaveBeenCalledWith("save_sync_password", {
+      password: "secret",
+    });
+    expect(node<HTMLInputElement>("#sync-password").value).toBe("");
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("已保存");
+  });
+
+  it("保存失败时保留输入并显示后端错误", async () => {
+    await boot({
+      update_sync_config: () => Promise.reject("地址格式不正确"),
+    });
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").value = "http://dav.example.com/";
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(node<HTMLElement>("#sync-error").textContent).toContain("地址格式不正确");
+    expect(node<HTMLInputElement>("#sync-url").value).toBe("http://dav.example.com/");
+  });
+
+  it("测试连接失败显示在错误行，按钮恢复可用", async () => {
+    await boot({
+      test_sync_connection: () => Promise.reject("认证失败：401"),
+    });
+    await openSettings();
+
+    node<HTMLButtonElement>("#sync-test").click();
+    await flush();
+
+    expect(node<HTMLElement>("#sync-error").textContent).toContain("认证失败");
+    expect(node<HTMLButtonElement>("#sync-test").disabled).toBe(false);
+  });
+
+  it("收到状态广播后更新文案与冲突入口", async () => {
+    await boot();
+    await openSettings();
+
+    const handler = statusHandler();
+    handler({
+      payload: syncStatus({
+        configured: true,
+        enabled: true,
+        lastSyncAt: "2026-10-23T09:00:00Z",
+        conflicts: 2,
+      }),
+    });
+    await flush();
+
+    expect(node<HTMLElement>("#sync-status-text").textContent).toContain("上次同步");
+    const conflicts = node<HTMLButtonElement>("#sync-conflicts");
+    expect(conflicts.hidden).toBe(false);
+    expect(conflicts.textContent).toContain("2 个冲突副本");
+
+    conflicts.click();
+    await flush();
+    expect(mocks.invoke).toHaveBeenCalledWith("open_notes_dir");
+  });
+
+  it("历史面板底部显示云同步未启用", async () => {
+    await boot();
+    await openHistory();
+
+    expect(node<HTMLElement>("#sync-foot-status").textContent).toBe("云同步未启用");
+    expect(node<HTMLButtonElement>("#sync-conflicts").hidden).toBe(true);
   });
 });
 

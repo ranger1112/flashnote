@@ -152,6 +152,63 @@
             <input id="bg-opacity" type="range" min="60" max="100" step="1" />
           </div>
 
+          <div class="field sync-section">
+            <span class="section-title">云同步（WebDAV）</span>
+            <label class="check" title="默认关闭；不启用时不会发起任何网络请求">
+              <input id="sync-enabled" type="checkbox" />
+              启用云同步
+            </label>
+            <label for="sync-url">WebDAV 地址</label>
+            <input
+              id="sync-url"
+              class="text-input"
+              type="url"
+              placeholder="https://dav.example.com/dav/"
+              spellcheck="false"
+            />
+            <label for="sync-username">用户名</label>
+            <input
+              id="sync-username"
+              class="text-input"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <label for="sync-password">密码 / 应用密码</label>
+            <input
+              id="sync-password"
+              class="text-input"
+              type="password"
+              placeholder="留空则不修改已保存的密码"
+              autocomplete="off"
+            />
+            <div class="row">
+              <select id="sync-interval" class="select" aria-label="自动同步间隔">
+                <option value="5">每 5 分钟</option>
+                <option value="15">每 15 分钟</option>
+                <option value="60">每 60 分钟</option>
+              </select>
+              <input
+                id="sync-device"
+                class="text-input"
+                type="text"
+                placeholder="设备名（可选）"
+                spellcheck="false"
+              />
+            </div>
+            <label class="check" title="http:// 会明文传输账号密码，仅限可信内网">
+              <input id="sync-allow-http" type="checkbox" />
+              允许明文 http://
+            </label>
+            <div class="row">
+              <button id="sync-save" class="btn primary" type="button">保存</button>
+              <button id="sync-test" class="btn" type="button">测试连接</button>
+              <button id="sync-now" class="btn" type="button">立即同步</button>
+            </div>
+            <p id="sync-status-text" class="sync-status" aria-live="polite"></p>
+            <p id="sync-error" class="error"></p>
+          </div>
+
           <div class="field">
             <div class="row">
               <span class="tip">当前版本 <span id="app-version">—</span></span>
@@ -206,6 +263,14 @@
 
         <div class="history-foot">
           <span id="history-count" aria-live="polite"></span>
+          <span id="sync-foot-status" class="sync-foot-status"></span>
+          <button
+            id="sync-conflicts"
+            class="btn tiny"
+            type="button"
+            title="打开笔记文件夹查看冲突副本"
+            hidden
+          ></button>
           <button id="history-folder" class="btn">打开文件夹</button>
         </div>
       </section>

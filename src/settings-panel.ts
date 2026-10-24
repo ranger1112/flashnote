@@ -11,6 +11,7 @@ import { paintSettings, refreshSettings, settings } from "./settings-store";
 import { applyTheme, paintOpacity } from "./appearance";
 import { hidePanel, showPanel } from "./panels";
 import { toast } from "./toast";
+import { paintSyncForm, refreshSyncStatus } from "./sync";
 import { startAutoUpdateChecks } from "./updater";
 
 let recording = false;
@@ -59,6 +60,8 @@ export function handleRecordingKey(event: KeyboardEvent): void {
 
 export function showSettingsPanel(): void {
   paintSettings();
+  paintSyncForm();
+  void refreshSyncStatus();
   ui.hotkeyError.textContent = "";
   showPanel(ui.settingsPanel);
   ui.settingsClose.focus();

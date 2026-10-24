@@ -8,6 +8,15 @@ import {
 import { applyTheme, paintOpacity } from "./appearance";
 import { ui } from "./dom";
 
+export interface SyncSettings {
+  enabled: boolean;
+  url: string;
+  username: string;
+  intervalMinutes: number;
+  allowInsecureHttp: boolean;
+  deviceName: string;
+}
+
 export interface Settings {
   notesDir: string;
   hotkey: string;
@@ -21,6 +30,7 @@ export interface Settings {
   autoHideOnBlur: boolean;
   backgroundOpacity: number;
   window: unknown;
+  sync: SyncSettings;
 }
 
 export let settings: Settings = {
@@ -36,6 +46,14 @@ export let settings: Settings = {
   autoHideOnBlur: false,
   backgroundOpacity: 1,
   window: null,
+  sync: {
+    enabled: false,
+    url: "",
+    username: "",
+    intervalMinutes: 5,
+    allowInsecureHttp: false,
+    deviceName: "",
+  },
 };
 
 /** 把当前 settings 回填到设置面板的各个控件。 */

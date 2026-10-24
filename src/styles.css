@@ -833,6 +833,35 @@ kbd {
   outline-offset: 2px;
 }
 
+.text-input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+  background: var(--hover);
+  color: var(--text);
+  font: 12px/1.4 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+}
+
+.text-input:focus {
+  border-color: var(--muted);
+}
+
+.text-input::placeholder {
+  color: var(--muted);
+}
+
+.row .text-input {
+  flex: 1;
+}
+
+.row .select {
+  flex: 1;
+  width: auto;
+}
+
 .select {
   width: 100%;
   padding: 7px 9px;
@@ -956,6 +985,45 @@ input[type="range"] {
   font-size: 11px;
   line-height: 1.6;
   color: var(--muted);
+}
+
+/* 云同步区：与其他设置之间留一条分隔线 */
+.sync-section {
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.sync-status {
+  margin: 0;
+  min-height: 14px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.sync-status.warn {
+  color: var(--accent-text);
+}
+
+.sync-status.bad {
+  color: var(--danger);
+}
+
+.sync-foot-status {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .update-banner {
