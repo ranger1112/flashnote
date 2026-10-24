@@ -44,8 +44,6 @@ pub(crate) struct RemoteMeta {
 /// 写入时要求的前置条件。
 #[derive(Clone, Debug)]
 pub(crate) enum Expect {
-    /// 不检查版本。
-    Any,
     /// 文件必须不存在。
     Absent,
     /// 文件版本必须匹配（If-Match）。
@@ -75,13 +73,11 @@ pub(crate) enum SyncError {
 }
 
 impl SyncError {
+    /// 只有网络抖动、限流与文件锁值得自动重试；配置错误重试多少次都一样。
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
-            SyncError::Network(_)
-                | SyncError::RateLimited { .. }
-                | SyncError::Locked
-                | SyncError::Other(_)
+            SyncError::Network(_) | SyncError::RateLimited { .. } | SyncError::Locked
         )
     }
 

@@ -9,11 +9,10 @@
 //! - 单轮删除超过 5 个且超过已同步文件 30% 时中止；
 //! - 服务器不支持条件写入时只上传/下载，绝不传播删除。
 
-// 引擎在 PR4 接线前只有测试会调用它。
-#![allow(dead_code)]
-
 pub(crate) mod backend;
 pub(crate) mod merge;
+pub(crate) mod runtime;
+pub(crate) mod secrets;
 pub(crate) mod state;
 pub(crate) mod webdav;
 
@@ -145,8 +144,6 @@ fn decide(
 pub(crate) struct LocalFile {
     pub bytes: Vec<u8>,
     pub text: String,
-    pub size: u64,
-    pub mtime_ns: u64,
     pub sha256: String,
 }
 
@@ -227,8 +224,6 @@ fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
             name,
             LocalFile {
                 sha256: sha256_base64(&bytes),
-                size: bytes.len() as u64,
-                mtime_ns: mtime_ns(meta.modified().unwrap_or(UNIX_EPOCH)),
                 bytes,
                 text,
             },
@@ -266,10 +261,6 @@ impl<B: SyncBackend> SyncEngine<B> {
             state_warning,
             io,
         }
-    }
-
-    pub(crate) fn capabilities(&self) -> Capabilities {
-        self.backend.capabilities()
     }
 
     /// 跑一轮同步。除「目录不可用」外不返回 Err：单个文件的失败记在汇总里，
@@ -410,6 +401,18 @@ impl<B: SyncBackend> SyncEngine<B> {
         trash_dir: &mut Option<PathBuf>,
         summary: &mut SyncSummary,
     ) {
+        // 远端文件超限时直接跳过：既不下载，也不推断删除。
+        let reads_remote = matches!(
+            action,
+            Action::Download | Action::RestoreLocal | Action::Merge
+        );
+        if reads_remote && remote.is_some_and(|meta| meta.size > MAX_FILE_BYTES) {
+            summary
+                .warnings
+                .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
+            return;
+        }
+
         match action {
             Action::Skip => summary.skipped += 1,
             Action::Upload | Action::UploadRevive => {
@@ -742,6 +745,16 @@ mod tests {
 
         fn remove(&self, name: &str) {
             self.inner.files.lock().unwrap().remove(name);
+        }
+
+        /// 直接往「远端」放一个文件，模拟别的客户端上传。
+        fn put_remote(&self, name: &str, bytes: Vec<u8>) {
+            let version = RemoteVersion::Number(self.inner.next.fetch_add(1, Ordering::SeqCst));
+            self.inner
+                .files
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), (bytes, version));
         }
 
         fn set_fail_list(&self, value: bool) {
@@ -1100,6 +1113,26 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("UTF-8")));
         assert!(harness.backend.content("2026-10-23.md").is_some());
+    }
+
+    #[test]
+    fn oversized_remote_file_is_skipped() {
+        let harness = Harness::new("oversize-remote");
+        harness
+            .backend
+            .put_remote("2026-10-23.md", vec![b'a'; MAX_FILE_BYTES as usize + 1]);
+
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("2 MiB")));
+        assert!(!harness.notes.join("2026-10-23.md").exists());
+        assert!(
+            harness.backend.content("2026-10-23.md").is_some(),
+            "不能删远端"
+        );
     }
 
     #[test]

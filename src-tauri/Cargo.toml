@@ -29,9 +29,12 @@ log = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy", "charset"] }
 quick-xml = "0.42"
 percent-encoding = "2"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# 密码只进 Windows 凭据管理器，设置文件里不存明文。
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 [profile.release]
 codegen-units = 1

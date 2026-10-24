@@ -6,10 +6,11 @@
 use crate::{
     files::{self, io_guard},
     notes,
-    settings::{self, Settings},
+    settings::{self, Settings, SyncSettings},
+    sync::{self, backend::SyncBackend, runtime::SyncStatus, webdav},
     AppState,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -120,6 +121,8 @@ pub fn persist_on_exit(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         crate::geometry::persist_geometry(app, &window);
     }
+    // 先让调度线程停下，避免退出过程中再起一轮同步。
+    app.state::<AppState>().sync.stop();
     persist_sync(app);
 }
 
@@ -245,6 +248,8 @@ pub async fn save_note(app: AppHandle, content: String) -> Result<SavedNote, Str
             let _guard = io_guard(&state);
             notes::append_note(&dir, &date, &entry).map_err(|err| format!("写入失败：{err}"))?
         };
+        // 落盘成功后再排一轮同步：防抖 5 秒，连续记录只跑一次。
+        state.sync.schedule();
 
         Ok(SavedNote {
             path: path.to_string_lossy().to_string(),
@@ -284,6 +289,8 @@ pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .notes_dir = dir.to_string_lossy().to_string();
+        // 目录变了等于换了一份同步状态，让调度下一轮按新目录重新开始。
+        state.sync.schedule();
     }
     persist(&app);
     log::info!("笔记目录已更新为 {}", dir.display());
@@ -431,9 +438,13 @@ pub async fn delete_note_entry(
 ) -> Result<(), String> {
     run_blocking(move || {
         let state = app.state::<AppState>();
-        files::rewrite_note(&state, &path, |text| {
+        let result = files::rewrite_note(&state, &path, |text| {
             notes::remove_entry(text, &date, &time, &content)
-        })
+        });
+        if result.is_ok() {
+            state.sync.schedule();
+        }
+        result
     })
     .await
 }
@@ -452,9 +463,13 @@ pub async fn update_note_entry(
     }
     run_blocking(move || {
         let state = app.state::<AppState>();
-        files::rewrite_note(&state, &path, |text| {
+        let result = files::rewrite_note(&state, &path, |text| {
             notes::replace_entry(text, &date, &time, &content, &new_content)
-        })
+        });
+        if result.is_ok() {
+            state.sync.schedule();
+        }
+        result
     })
     .await
 }
@@ -616,6 +631,222 @@ pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opa
     applied
 }
 
+/// 前端提交的同步配置。密码不在这里，走 `save_sync_password`。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConfigInput {
+    pub enabled: bool,
+    pub url: String,
+    pub username: String,
+    pub interval_minutes: u32,
+    pub allow_insecure_http: bool,
+    pub device_name: String,
+}
+
+impl SyncConfigInput {
+    /// 校验并规范化；启用时必须填全地址与用户名。
+    fn normalize(self) -> Result<SyncSettings, String> {
+        let url = self.url.trim().to_string();
+        let username = self.username.trim().to_string();
+        if !url.is_empty() {
+            webdav::validate_url(&url, self.allow_insecure_http)
+                .map_err(|error| error.to_string())?;
+        }
+        if self.enabled && (url.is_empty() || username.is_empty()) {
+            return Err("启用同步前请填写 WebDAV 地址和用户名".to_string());
+        }
+        Ok(SyncSettings {
+            enabled: self.enabled,
+            url,
+            username,
+            interval_minutes: SyncSettings::normalize_interval(self.interval_minutes),
+            allow_insecure_http: self.allow_insecure_http,
+            device_name: self.device_name.trim().to_string(),
+        })
+    }
+}
+
+/// 保存密码的结果：凭据管理器不可用时只在本次会话内有效。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordSaveResult {
+    pub persistent: bool,
+    pub warning: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncTestResult {
+    pub files: usize,
+    pub degraded: Option<String>,
+    pub message: String,
+}
+
+#[tauri::command]
+pub async fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
+    run_blocking(move || Ok(sync::runtime::status(&app))).await
+}
+
+#[tauri::command]
+pub fn update_sync_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: SyncConfigInput,
+) -> Result<SyncStatus, String> {
+    let next = config.normalize()?;
+    let previous = {
+        let mut settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = settings.sync.clone();
+        settings.sync = next.clone();
+        previous
+    };
+
+    // 换服务器或换账号后旧密码不再适用，顺手清掉，免得留下孤儿凭据。
+    if previous.url != next.url || previous.username != next.username {
+        state.sync.forget_password();
+        if previous.is_configured() {
+            if let Err(error) = sync::secrets::clear(&previous.url, &previous.username) {
+                log::warn!("清理旧同步密码失败：{error}");
+            }
+        }
+    }
+
+    persist(&app);
+    state.sync.schedule();
+    sync::runtime::emit_status(&app);
+    Ok(sync::runtime::status(&app))
+}
+
+#[tauri::command]
+pub fn save_sync_password(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<PasswordSaveResult, String> {
+    if password.is_empty() {
+        return Err("密码不能为空".to_string());
+    }
+    let sync = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sync
+        .clone();
+    if !sync.is_configured() {
+        return Err("请先填写 WebDAV 地址和用户名".to_string());
+    }
+
+    // 先记在内存里：凭据管理器被禁用时，本次会话仍然能同步。
+    state.sync.remember_password(&password);
+    // 密码补上后立刻可以同步，不用等下一个定时点。
+    state.sync.schedule();
+    match sync::secrets::save(&sync.url, &sync.username, &password) {
+        Ok(()) => Ok(PasswordSaveResult {
+            persistent: true,
+            warning: None,
+        }),
+        Err(error) => {
+            log::warn!("保存同步密码到凭据管理器失败：{error}");
+            Ok(PasswordSaveResult {
+                persistent: false,
+                warning: Some(format!("{error}；本次会话仍可同步，退出后需要重新输入")),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+pub fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let sync = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sync
+        .clone();
+    state.sync.forget_password();
+    if sync.is_configured() {
+        sync::secrets::clear(&sync.url, &sync.username)?;
+    }
+    sync::runtime::emit_status(&app);
+    Ok(())
+}
+
+/// 测试连接：只探测与列目录，不改动本地状态。
+#[tauri::command]
+pub async fn test_sync_connection(
+    app: AppHandle,
+    config: SyncConfigInput,
+    password: Option<String>,
+) -> Result<SyncTestResult, String> {
+    let sync = config.normalize()?;
+    if !sync.is_configured() {
+        return Err("请先填写 WebDAV 地址和用户名".to_string());
+    }
+
+    let runtime = app.state::<AppState>().sync.clone();
+    let password = match password.filter(|value| !value.is_empty()) {
+        Some(password) => password,
+        None => match runtime.cached_password() {
+            Some(password) => password,
+            None => sync::secrets::load(&sync.url, &sync.username)?
+                .ok_or_else(|| "还没有保存密码".to_string())?,
+        },
+    };
+
+    let backend = webdav::WebDavBackend::connect(webdav::WebDavConfig {
+        url: sync.url.clone(),
+        username: sync.username.clone(),
+        password,
+        allow_insecure_http: sync.allow_insecure_http,
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let degraded = sync::runtime::capability_note(&backend.capabilities());
+    let files = backend
+        .list()
+        .await
+        .map_err(|error| error.to_string())?
+        .len();
+    let message = match &degraded {
+        Some(note) => format!("{note}；远端已有 {files} 个笔记文件"),
+        None => format!("连接成功，远端已有 {files} 个笔记文件"),
+    };
+
+    Ok(SyncTestResult {
+        files,
+        degraded,
+        message,
+    })
+}
+
+#[tauri::command]
+pub fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let sync = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sync
+        .clone();
+    if !sync.is_configured() {
+        return Err("请先在设置里填写 WebDAV 地址和用户名".to_string());
+    }
+    if !sync.enabled {
+        return Err("云同步已关闭".to_string());
+    }
+    sync::runtime::trigger(&app);
+    Ok(())
+}
+
+/// 更新程序重启前调用：把还没落盘的设置同步写掉。
+#[tauri::command]
+pub fn flush_sync_state(app: AppHandle) -> Result<(), String> {
+    persist_sync(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -631,6 +862,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn sync_input(url: &str, enabled: bool) -> SyncConfigInput {
+        SyncConfigInput {
+            enabled,
+            url: url.to_string(),
+            username: " ranger ".to_string(),
+            interval_minutes: 7,
+            allow_insecure_http: false,
+            device_name: " home-pc ".to_string(),
+        }
+    }
+
+    #[test]
+    fn sync_config_rejects_plain_http_without_permission() {
+        let error = sync_input("http://dav.example.com/", true)
+            .normalize()
+            .unwrap_err();
+        assert!(error.contains("http"), "{error}");
+
+        let allowed = sync_input("http://127.0.0.1:5000/", true)
+            .normalize()
+            .unwrap();
+        assert!(allowed.enabled);
+    }
+
+    #[test]
+    fn sync_config_trims_and_normalizes() {
+        let sync = sync_input("https://dav.example.com", true)
+            .normalize()
+            .unwrap();
+        assert_eq!(sync.username, "ranger");
+        assert_eq!(sync.device_name, "home-pc");
+        assert_eq!(sync.interval_minutes, 15, "未知间隔回落到 15");
+    }
+
+    #[test]
+    fn enabling_requires_url_and_username() {
+        assert!(sync_input("", true).normalize().is_err());
+        assert!(sync_input("", false).normalize().is_ok(), "关闭时允许留空");
     }
 
     #[test]

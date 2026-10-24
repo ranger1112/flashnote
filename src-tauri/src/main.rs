@@ -9,7 +9,7 @@ mod source;
 mod sync;
 mod tray;
 
-use std::sync::{atomic::AtomicU64, Mutex};
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -68,7 +68,10 @@ pub struct AppState {
     pub settings_path: std::path::PathBuf,
     pub last_source: Mutex<Option<String>>,
     /// 串行化笔记文件读写：命令改成 async 后可能真正并发，追加与改写不能交叉。
-    pub io: Mutex<()>,
+    /// 用 `Arc` 是为了让同步引擎共用同一把锁。
+    pub io: Arc<Mutex<()>>,
+    /// 云同步运行时：调度、单飞与状态。
+    pub(crate) sync: Arc<sync::runtime::SyncRuntime>,
     /// 设置写入序号：每次持久化分配一个递增序号。
     pub settings_write_seq: AtomicU64,
     /// 最近一次真正写成功的序号；旧快照据此跳过，写入失败时不会误伤兜底。
@@ -178,7 +181,8 @@ fn main() {
                 settings: Mutex::new(settings),
                 settings_path,
                 last_source: Mutex::new(None),
-                io: Mutex::new(()),
+                io: Arc::new(Mutex::new(())),
+                sync: Arc::new(sync::runtime::SyncRuntime::new()),
                 settings_write_seq: AtomicU64::new(0),
                 settings_last_saved_seq: AtomicU64::new(0),
                 settings_write_lock: Mutex::new(()),
@@ -187,6 +191,7 @@ fn main() {
 
             geometry::apply_initial_geometry(&handle);
             tray::create(app)?;
+            sync::runtime::start(&handle);
 
             if open_settings || first_run {
                 commands::show_window_impl(&handle);
@@ -236,6 +241,13 @@ fn main() {
             commands::update_theme,
             commands::update_auto_hide,
             commands::update_background_opacity,
+            commands::get_sync_status,
+            commands::update_sync_config,
+            commands::save_sync_password,
+            commands::clear_sync_password,
+            commands::test_sync_connection,
+            commands::sync_now,
+            commands::flush_sync_state,
             commands::app_version,
         ])
         .build(tauri::generate_context!());
