@@ -112,9 +112,16 @@ fn merge_parsed(base: &Parsed, local: &Parsed, remote: &Parsed) -> MergeResult {
         }
     }
 
-    // 远端要删的块：本地删掉的条目，在远端原文里按出现顺序各删一份。
-    // 远端已改写的条目不会被点名，因此「本地删除 vs 远端修改」时远端修改保留。
-    let mut pending = removed_by_local.clone();
+    // 远端要删的块：本地相对 base 少掉的条目，扣掉远端自己也已经删掉的部分。
+    // 否则双方各删一份重复条目时，会把对方保留的最后一份也删掉。
+    let mut pending: HashMap<Identity, usize> = removed_by_local
+        .iter()
+        .filter_map(|(identity, &count)| {
+            let already_removed = removed_by_remote.get(identity).copied().unwrap_or(0);
+            let left = count.saturating_sub(already_removed);
+            (left > 0).then(|| (identity.clone(), left))
+        })
+        .collect();
     let mut remove = vec![false; remote.spans.len()];
     for (index, identity) in remote.entries.iter().enumerate() {
         if let Some(left) = pending.get_mut(identity) {
@@ -446,6 +453,16 @@ mod tests {
         let local = "# 2026-10-23\n\n- 10:00 x\n";
         let result = merged(base, local, base);
         assert_eq!(result.text, "# 2026-10-23\n\n- 10:00 x\n");
+    }
+
+    #[test]
+    fn both_sides_deleting_one_duplicate_keeps_the_last_copy() {
+        let base = "# 2026-10-23\n\n- 10:00 x\n\n- 10:00 x\n";
+        let local = "# 2026-10-23\n\n- 10:00 x\n";
+        let remote = "# 2026-10-23\n\n- 10:00 x\n";
+        let result = merged(base, local, remote);
+        assert_eq!(result.text, "# 2026-10-23\n\n- 10:00 x\n");
+        assert_eq!(result.conflicts, 0);
     }
 
     #[test]

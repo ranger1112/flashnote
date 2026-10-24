@@ -8,8 +8,11 @@ use super::state::sha256_base64;
 const SERVICE: &str = "flashnote-sync";
 
 /// 凭据账号名：URL 与用户名一起哈希，换服务器或换账号都不会串到旧密码。
+///
+/// URL 末尾斜杠不改变远端身份，哈希时统一去掉，避免「补一个 /」就找不到密码。
 pub(crate) fn account(url: &str, username: &str) -> String {
-    sha256_base64(format!("{}\n{}", url.trim(), username.trim()).as_bytes())
+    let url = url.trim().trim_end_matches('/');
+    sha256_base64(format!("{}\n{}", url, username.trim()).as_bytes())
 }
 
 /// 保存密码；覆盖已有凭据。
@@ -85,6 +88,11 @@ mod tests {
     fn account_is_stable_and_sensitive_to_both_inputs() {
         let a = account("https://dav.example.com/", "alice");
         assert_eq!(a, account(" https://dav.example.com/ ", " alice "));
+        assert_eq!(
+            account("https://dav.example.com/dav", "alice"),
+            account("https://dav.example.com/dav/", "alice"),
+            "末尾斜杠不应改变凭据身份"
+        );
         assert_ne!(a, account("https://dav.example.com/", "bob"));
         assert_ne!(a, account("https://other.example.com/", "alice"));
         assert_eq!(a.len(), 43, "SHA-256 的 Base64url 长度");

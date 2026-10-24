@@ -70,6 +70,10 @@ pub(crate) enum SyncError {
     NotFound,
     /// 412：版本不匹配，下一轮会重新合并。
     VersionMismatch,
+    /// 本轮请求预算用尽；剩余文件留到下一轮，不算同步失败。
+    Budget,
+    /// 远端文件超过单文件上限；跳过即可，不算同步失败。
+    TooLarge,
     /// 405 / 501：服务器不支持该操作。
     Unsupported(String),
     Io(String),
@@ -115,6 +119,8 @@ impl fmt::Display for SyncError {
             SyncError::Quota => write!(f, "远端空间不足"),
             SyncError::NotFound => write!(f, "远端文件不存在"),
             SyncError::VersionMismatch => write!(f, "远端文件已被修改"),
+            SyncError::Budget => write!(f, "本轮请求数已达上限，剩余文件留待下一轮"),
+            SyncError::TooLarge => write!(f, "远端文件超过 2 MiB，已跳过"),
             SyncError::Unsupported(message) => write!(f, "服务器不支持：{message}"),
             SyncError::Io(message) => write!(f, "本地文件错误：{message}"),
             SyncError::Aborted(message) => write!(f, "同步已中止：{message}"),

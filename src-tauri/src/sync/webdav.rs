@@ -25,6 +25,7 @@ use reqwest::{Client, Method, Response, StatusCode, Url};
 
 use super::backend::{Capabilities, Expect, RemoteMeta, RemoteVersion, SyncBackend, SyncError};
 use super::state::sha256_base64;
+use super::MAX_FILE_BYTES;
 
 /// 客户端只写自己的子目录，绝不碰用户放进去的其它文件。
 pub(crate) const REMOTE_SUBDIR: &str = "flashnote/notes/";
@@ -111,9 +112,7 @@ impl WebDavBackend {
             })
             .unwrap_or(UNLIMITED);
         if previous == 0 {
-            return Err(SyncError::Other(
-                "本轮请求数已达上限，剩余文件留待下一轮".into(),
-            ));
+            return Err(SyncError::Budget);
         }
         Ok(())
     }
@@ -254,7 +253,7 @@ impl WebDavBackend {
     }
 
     async fn read_bytes(&self, url: Url) -> Result<(Vec<u8>, RemoteVersion), SyncError> {
-        let (response, _) = self
+        let (mut response, _) = self
             .request(Method::GET, url, Vec::new(), None, TRANSFER_TIMEOUT)
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -264,11 +263,19 @@ impl WebDavBackend {
             return Err(map_status("下载", &response));
         }
         let version = response_version(response.headers());
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
             .map_err(|error| SyncError::Network(format!("读取响应失败：{error}")))?
-            .to_vec();
+        {
+            // 按块读取并在超限时立刻停下：Content-Length 缺失或被伪造时，
+            // 也不会把整个超大响应读进内存。
+            if bytes.len() as u64 + chunk.len() as u64 > MAX_FILE_BYTES {
+                return Err(SyncError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         Ok((bytes, version))
     }
 
@@ -437,11 +444,23 @@ impl WebDavBackend {
             let Ok(next) = current.join(location) else {
                 return Ok((response, current));
             };
+            let next_method = if status == StatusCode::SEE_OTHER {
+                Method::GET
+            } else {
+                method.clone()
+            };
             if origin_of(&next) != origin {
+                // 跨源重定向只允许安全方法：否则笔记正文（PUT）或删除请求
+                // 会被交给另一个主机。
+                if next_method != Method::GET && next_method != Method::HEAD {
+                    return Err(SyncError::Other(
+                        "拒绝把带正文的请求重定向到其他主机".into(),
+                    ));
+                }
                 with_auth = false;
             }
             if status == StatusCode::SEE_OTHER {
-                method = Method::GET;
+                method = next_method;
                 body = None;
             }
             drop(response);
@@ -1298,6 +1317,60 @@ mod tests {
         assert!(origin_requests[0].headers.get("authorization").is_some());
         let target_requests = target.received_requests().await.unwrap();
         assert!(target_requests[0].headers.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_does_not_receive_the_body() {
+        let target = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&target)
+            .await;
+
+        let origin = MockServer::start().await;
+        let location = format!("{}/flashnote/notes/2026-10-23.md", target.uri());
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", location))
+            .mount(&origin)
+            .await;
+
+        let error = backend_with(&origin, STRONG)
+            .put("2026-10-23.md", b"- 10:00 hi\n", Expect::Absent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::Other(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_is_reported_as_budget() {
+        let server = MockServer::start().await;
+        let backend = backend_with(&server, STRONG);
+        backend.reset_budget(0);
+
+        let error = backend.list().await.unwrap_err();
+        assert!(matches!(error, SyncError::Budget), "{error}");
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_stopped_while_streaming() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b'a';
+                (MAX_FILE_BYTES + 1)
+                    as usize
+            ]))
+            .mount(&server)
+            .await;
+
+        let error = backend_with(&server, STRONG)
+            .get("2026-10-23.md")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::TooLarge), "{error}");
     }
 
     #[tokio::test]

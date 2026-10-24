@@ -31,7 +31,7 @@ use state::{mtime_ns, now_iso, sha256_base64, write_atomic, FileRecord, StateSto
 use crate::notes;
 
 /// 与协议一致：单个笔记文件明文上限 2 MiB。
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 删除安全阀：超过这个数量、且占比超过阈值才中止。
 const DELETE_MIN_FILES: usize = 5;
 const DELETE_RATIO_PERCENT: usize = 30;
@@ -62,6 +62,16 @@ impl SyncSummary {
 
     fn error(&mut self, name: &str, error: impl std::fmt::Display) {
         self.errors.push(format!("{name}：{error}"));
+    }
+
+    /// 预期内的「这一轮做不完」不算失败：预算耗尽与超大文件只记警告。
+    fn record(&mut self, name: &str, error: SyncError) {
+        match error {
+            SyncError::Budget | SyncError::TooLarge => {
+                self.warnings.push(format!("{name}：{error}"));
+            }
+            other => self.error(name, other),
+        }
     }
 }
 
@@ -107,9 +117,13 @@ fn decide(
     }
 
     if !remote_present {
-        // 列表不可靠时不能把「没列出来」当成删除。
+        // 列表不可靠时不能把「没列出来」当成删除；但本地有修改仍应尝试上传，
+        // apply 会先向远端确认一次，确认存在就放弃覆盖。
         if !caps.reliable_listing {
-            return Action::Skip;
+            return match local {
+                LocalState::Changed => Action::UploadRevive,
+                _ => Action::Skip,
+            };
         }
         return match local {
             LocalState::Absent => Action::Forget,
@@ -500,6 +514,10 @@ impl<B: SyncBackend> SyncEngine<B> {
                             return;
                         }
                         Ok(false) => {}
+                        Err(error @ SyncError::Budget) => {
+                            summary.warnings.push(format!("{name}：{error}"));
+                            return;
+                        }
                         Err(error) => {
                             summary.error(name, format!("无法确认远端状态，未上传：{error}"));
                             return;
@@ -518,11 +536,18 @@ impl<B: SyncBackend> SyncEngine<B> {
                         self.commit(name, &local.bytes, version, summary);
                         summary.uploaded += 1;
                     }
-                    Err(error) => summary.error(name, error),
+                    Err(error) => summary.record(name, error),
                 }
             }
             Action::Download | Action::RestoreLocal => match self.backend.get(name).await {
                 Ok(Some((bytes, version))) => {
+                    // 列表里的 size 可能缺失或被服务器写错，收到内容后再复查一次。
+                    if bytes.len() as u64 > MAX_FILE_BYTES {
+                        summary
+                            .warnings
+                            .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
+                        return;
+                    }
                     // Download 的本地文件必须仍是扫描时那一份；RestoreLocal 则要求
                     // 它仍未出现。两种情况都不能覆盖网络阶段里用户新写的笔记。
                     let expect = match local {
@@ -533,6 +558,9 @@ impl<B: SyncBackend> SyncEngine<B> {
                         summary.error(name, error);
                         return;
                     }
+                    // 优先记录列表里的版本：下一轮 remote_changed 比较的正是列表版本，
+                    // 而 GET/PUT 的版本来源不一定相同。
+                    let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
                     self.commit(name, &bytes, version, summary);
                     summary.downloaded += 1;
                 }
@@ -541,7 +569,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                         .warnings
                         .push(format!("{name}：远端文件已消失，留待下一轮"));
                 }
-                Err(error) => summary.error(name, error),
+                Err(error) => summary.record(name, error),
             },
             Action::Merge => {
                 let Some(local) = local else {
@@ -557,10 +585,16 @@ impl<B: SyncBackend> SyncEngine<B> {
                         return;
                     }
                     Err(error) => {
-                        summary.error(name, error);
+                        summary.record(name, error);
                         return;
                     }
                 };
+                if remote_bytes.len() as u64 > MAX_FILE_BYTES {
+                    summary
+                        .warnings
+                        .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
+                    return;
+                }
                 let Some(remote_text) = String::from_utf8(remote_bytes).ok() else {
                     summary.error(name, "远端文件不是 UTF-8，已跳过");
                     return;
@@ -600,7 +634,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                                 summary.merged += 1;
                                 summary.conflicts += result.conflicts;
                             }
-                            Err(error) => summary.error(name, error),
+                            Err(error) => summary.record(name, error),
                         }
                     }
                     None => {
@@ -632,7 +666,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                         self.forget(name);
                         summary.deleted += 1;
                     }
-                    Err(error) => summary.error(name, error),
+                    Err(error) => summary.record(name, error),
                 }
             }
             Action::TrashLocal => {
@@ -647,6 +681,10 @@ impl<B: SyncBackend> SyncEngine<B> {
                         summary
                             .warnings
                             .push(format!("{name}：远端仍存在，本轮不删除本地副本"));
+                        return;
+                    }
+                    Err(error @ SyncError::Budget) => {
+                        summary.warnings.push(format!("{name}：{error}"));
                         return;
                     }
                     Err(error) => {
@@ -715,7 +753,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                     .warnings
                     .push(format!("{name}：无法逐条合并，远端内容已保存为 {conflict}"));
             }
-            Err(error) => summary.error(name, error),
+            Err(error) => summary.record(name, error),
         }
     }
 
@@ -854,7 +892,8 @@ fn conflict_name(name: &str, slug: &str) -> Option<String> {
     if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
         return None;
     }
-    let stamp = Local::now().format("%Y%m%d%H%M%S");
+    // 带毫秒：同一秒内生成两个冲突副本时不能互相覆盖。
+    let stamp = Local::now().format("%Y%m%d%H%M%S%3f");
     Some(format!("{date}.conflict-{slug}-{stamp}.md"))
 }
 
@@ -1156,7 +1195,8 @@ mod tests {
             decide(&weak, true, LocalState::Absent, true, false),
             Action::Forget
         );
-        // 列表不可靠 → 远端缺失一律不动。
+        // 列表不可靠 → 远端缺失时不能推断删除；但本地有修改仍应尝试上传，
+        // apply 会先向远端确认一次再决定是否覆盖。
         let blind = Capabilities {
             strong_etag: false,
             honors_if_match: false,
@@ -1165,6 +1205,10 @@ mod tests {
         assert_eq!(
             decide(&blind, true, LocalState::Unchanged, false, false),
             Action::Skip
+        );
+        assert_eq!(
+            decide(&blind, true, LocalState::Changed, false, false),
+            Action::UploadRevive
         );
     }
 
@@ -1509,6 +1553,29 @@ mod tests {
             .content("2026-10-23.md")
             .unwrap()
             .contains("- 10:00 a"));
+    }
+
+    #[test]
+    fn unreliable_listing_still_uploads_local_changes() {
+        let backend = FakeBackend::new(Capabilities {
+            strong_etag: false,
+            honors_if_match: false,
+            reliable_listing: false,
+        });
+        let harness = Harness::with_backend("blind-upload", backend.clone());
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        assert_eq!(harness.run().uploaded, 1);
+
+        // 远端确实被删掉了；列表不可靠，但本地有修改，仍应尝试复活上传。
+        harness.backend.remove("2026-10-23.md");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n\n- 11:00 b\n");
+        let summary = harness.run();
+
+        assert_eq!(summary.uploaded, 1, "{summary:?}");
+        assert!(backend
+            .content("2026-10-23.md")
+            .unwrap()
+            .contains("- 11:00 b"));
     }
 
     #[test]

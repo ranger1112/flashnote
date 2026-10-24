@@ -121,11 +121,20 @@ function readSyncForm() {
   };
 }
 
+/** 只差末尾斜杠的地址是同一个远端。 */
+function normalizeSyncUrl(value: string): string {
+  return value.trim().replace(/\/+$/, "");
+}
+
 async function saveSyncConfig(): Promise<void> {
   ui.syncError.textContent = "";
+  const form = readSyncForm();
+  const identityChanged =
+    normalizeSyncUrl(settings.sync.url) !== normalizeSyncUrl(form.url) ||
+    settings.sync.username.trim() !== form.username;
   try {
     const status = await invoke<SyncStatus>("update_sync_config", {
-      config: readSyncForm(),
+      config: form,
     });
     // 配置先落盘，再单独保存密码：凭据管理器失败不该回滚服务器地址。
     const password = ui.syncPassword.value;
@@ -142,6 +151,12 @@ async function saveSyncConfig(): Promise<void> {
     await refreshSettings();
     paintSyncStatus(status);
     toast("云同步设置已保存");
+    if (identityChanged && !password) {
+      // 后端已清掉旧凭据，这里必须明确告诉用户，否则下一轮只会看到“同步失败”。
+      const message = "地址或用户名已变更，请重新填写密码";
+      ui.syncError.textContent = message;
+      toast(message, true, 6000);
+    }
   } catch (error) {
     ui.syncError.textContent = String(error);
     toast(String(error), true);
