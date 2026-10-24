@@ -140,21 +140,50 @@ pub(crate) struct RawEntry {
     pub lines: Vec<String>,
 }
 
-/// 把文件拆成「头部 + 条目块」。代码围栏内的标题行不会被当作新条目。
-pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
+/// 文件里的一个条目块，以及它在原文中的行区间。
+///
+/// `start_line` 指向条目首行，`end_line` 是块内最后一个非空行的下一行——块尾的空行
+/// 属于块与块之间的分隔，不计入区间，这样删块时不会连带吞掉相邻块的空行。
+pub(crate) struct BlockSpan {
+    // 行号目前只有同步合并在用；引擎接线前先让死代码检查通过。
+    #[allow(dead_code)]
+    pub start_line: usize,
+    #[allow(dead_code)]
+    pub end_line: usize,
+    pub entry: RawEntry,
+}
+
+/// `split_spans` 的结果：头部与带行号的条目块。
+pub(crate) struct NoteLayout {
+    pub header: Vec<String>,
+    pub spans: Vec<BlockSpan>,
+}
+
+/// 把文件拆成「头部 + 条目块」，并记录每个块在原文中的行号。
+/// 代码围栏内的标题行不会被当作新条目。
+pub(crate) fn split_spans(text: &str) -> NoteLayout {
+    struct Pending {
+        start: usize,
+        last_content: usize,
+        entry: RawEntry,
+    }
+
     let mut header = Vec::new();
-    let mut blocks: Vec<RawEntry> = Vec::new();
-    let mut current: Option<RawEntry> = None;
+    let mut spans: Vec<BlockSpan> = Vec::new();
+    let mut current: Option<Pending> = None;
     let mut open_fence: Option<Fence> = None;
     let mut previous_blank = true;
 
-    for raw in text.lines() {
+    for (index, raw) in text.lines().enumerate() {
         let line = raw.trim_end_matches('\r').to_string();
         let is_blank = line.trim().is_empty();
 
         if let Some(open) = open_fence {
-            if let Some(entry) = current.as_mut() {
-                entry.lines.push(line.clone());
+            if let Some(pending) = current.as_mut() {
+                pending.entry.lines.push(line.clone());
+                if !is_blank {
+                    pending.last_content = index;
+                }
             }
             if closes_fence(&line, open) {
                 open_fence = None;
@@ -165,27 +194,38 @@ pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
 
         let current_is_markdown = current
             .as_ref()
-            .and_then(|entry| entry.lines.first())
+            .and_then(|pending| pending.entry.lines.first())
             .is_some_and(|line| markdown_time(line).is_some());
 
         if let Some((time, head)) = entry_header(&line, current_is_markdown, previous_blank) {
             if let Some(done) = current.take() {
-                blocks.push(done);
+                spans.push(BlockSpan {
+                    start_line: done.start,
+                    end_line: done.last_content + 1,
+                    entry: done.entry,
+                });
             }
             // 紧凑列表的围栏可能直接写在条目头里：`- 10:00 ```js`
             open_fence = fence_marker(&head);
-            current = Some(RawEntry {
-                time,
-                lines: vec![line],
+            current = Some(Pending {
+                start: index,
+                last_content: index,
+                entry: RawEntry {
+                    time,
+                    lines: vec![line],
+                },
             });
             previous_blank = is_blank;
             continue;
         }
 
         match current.as_mut() {
-            Some(entry) => {
+            Some(pending) => {
                 open_fence = fence_marker(&line);
-                entry.lines.push(line);
+                pending.entry.lines.push(line);
+                if !is_blank {
+                    pending.last_content = index;
+                }
             }
             None => header.push(line),
         }
@@ -193,19 +233,32 @@ pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
     }
 
     if let Some(done) = current {
-        blocks.push(done);
+        spans.push(BlockSpan {
+            start_line: done.start,
+            end_line: done.last_content + 1,
+            entry: done.entry,
+        });
     }
 
-    for block in &mut blocks {
-        while block.lines.last().is_some_and(|line| line.is_empty()) {
-            block.lines.pop();
+    for span in &mut spans {
+        while span.entry.lines.last().is_some_and(|line| line.is_empty()) {
+            span.entry.lines.pop();
         }
     }
     while header.last().is_some_and(|line| line.is_empty()) {
         header.pop();
     }
 
-    (header, blocks)
+    NoteLayout { header, spans }
+}
+
+/// 把文件拆成「头部 + 条目块」。代码围栏内的标题行不会被当作新条目。
+pub(crate) fn split_entries(text: &str) -> (Vec<String>, Vec<RawEntry>) {
+    let layout = split_spans(text);
+    (
+        layout.header,
+        layout.spans.into_iter().map(|span| span.entry).collect(),
+    )
 }
 
 fn content_line(line: &str, compact: bool) -> String {
@@ -216,7 +269,7 @@ fn content_line(line: &str, compact: bool) -> String {
     }
 }
 
-fn parse_block(block: &RawEntry) -> Option<(String, String, Option<String>)> {
+pub(crate) fn parse_block(block: &RawEntry) -> Option<(String, String, Option<String>)> {
     let first = block.lines.first()?;
     let mut content: Vec<String> = Vec::new();
     let mut source = None;
@@ -343,7 +396,7 @@ pub fn parse_entries(text: &str) -> Vec<(String, String, Option<String>)> {
 }
 
 /// 用头部与条目块重建整个文件。
-fn render_file(date: &str, header: &[String], blocks: &[RawEntry]) -> String {
+pub(crate) fn render_file(date: &str, header: &[String], blocks: &[RawEntry]) -> String {
     let head = if header.is_empty() {
         format!("# {date}")
     } else {
@@ -671,6 +724,33 @@ mod tests {
             format_entry_markdown("09:05", "  第一行\n第二行  ", None),
             "### 09:05\n第一行\n第二行"
         );
+    }
+
+    #[test]
+    fn split_spans_tracks_line_ranges() {
+        let text = "# 2026-10-23\n\n- 10:00 a\n  b\n\n\n- 11:00 c\n";
+        let layout = split_spans(text);
+        assert_eq!(layout.header, vec!["# 2026-10-23"]);
+        assert_eq!(layout.spans.len(), 2);
+        assert_eq!(layout.spans[0].start_line, 2);
+        assert_eq!(layout.spans[0].end_line, 4);
+        assert_eq!(layout.spans[1].start_line, 6);
+        assert_eq!(layout.spans[1].end_line, 7);
+        assert_eq!(layout.spans[1].entry.lines, vec!["- 11:00 c"]);
+    }
+
+    #[test]
+    fn split_spans_matches_split_entries() {
+        let text = "# 2026-10-23\r\n\r\n### 10:00\r\n正文\r\n\r\n- 11:00 b\r\n";
+        let layout = split_spans(text);
+        let (header, blocks) = split_entries(text);
+        assert_eq!(layout.header, header);
+        let entries: Vec<_> = layout.spans.into_iter().map(|span| span.entry).collect();
+        assert_eq!(entries.len(), blocks.len());
+        for (left, right) in entries.iter().zip(blocks.iter()) {
+            assert_eq!(left.time, right.time);
+            assert_eq!(left.lines, right.lines);
+        }
     }
 
     #[test]
