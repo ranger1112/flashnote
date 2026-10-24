@@ -202,7 +202,7 @@ pub(crate) async fn run_round(app: AppHandle) {
         return;
     }
 
-    emit_status(&app);
+    emit_status(&app).await;
     loop {
         let outcome = round(&app, &runtime).await;
         runtime.apply(outcome);
@@ -215,7 +215,7 @@ pub(crate) async fn run_round(app: AppHandle) {
     if runtime.pending.swap(false, Ordering::SeqCst) {
         trigger(&app);
     }
-    emit_status(&app);
+    emit_status(&app).await;
 }
 
 async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
@@ -253,9 +253,23 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let notes_dir = PathBuf::from(&settings.notes_dir);
-    let remote_key = format!("{}\n{}", sync.url, sync.username);
+    // 只差末尾斜杠的地址是同一个远端，状态目录不能因此换一份。
+    let remote_key = format!(
+        "{}\n{}",
+        sync.url.trim_end_matches('/'),
+        sync.username.trim()
+    );
     let store = StateStore::with_remote(&config_dir, &notes_dir, &remote_key);
-    let mut engine = SyncEngine::new(backend, store, notes_dir, &sync.device_label(), io);
+    let device = sync.device_label();
+    // StateStore::load 会读 state.json；连同引擎构造一起放进阻塞线程池。
+    let mut engine = match tauri::async_runtime::spawn_blocking(move || {
+        SyncEngine::new(backend, store, notes_dir, &device, io)
+    })
+    .await
+    {
+        Ok(engine) => engine,
+        Err(error) => return RoundOutcome::Failed(format!("同步引擎初始化失败：{error}")),
+    };
 
     RoundOutcome::Done(engine.run().await, degraded)
 }
@@ -312,9 +326,17 @@ pub(crate) fn status(app: &AppHandle) -> SyncStatus {
     }
 }
 
-pub(crate) fn emit_status(app: &AppHandle) {
-    let status = status(app);
-    if let Err(error) = app.emit("sync-status", status) {
+/// 状态计算会扫描笔记目录；必须放进阻塞线程池，不能卡住调用方。
+pub(crate) async fn emit_status(app: &AppHandle) {
+    let handle = app.clone();
+    let snapshot = match tauri::async_runtime::spawn_blocking(move || status(&handle)).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log::warn!("计算同步状态失败：{error}");
+            return;
+        }
+    };
+    if let Err(error) = app.emit("sync-status", snapshot) {
         log::warn!("广播同步状态失败：{error}");
     }
 }

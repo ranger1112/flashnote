@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-23
+
+### 新增
+
+- 可选的 WebDAV 云同步：使用自己的存储（坚果云、Nextcloud、NAS、dufs 等），默认关闭，不配置不联网。
+- 条目级三方合并：两端同时修改同一天笔记时按「时间 + 正文 + 来源」合并，双方新增都保留；无法安全合并时把远端内容另存为 `YYYY-MM-DD.conflict-<设备>-<时间>.md`。
+- 删除双向传播与本地 trash；单轮拟删除超过 5 个且超过已同步文件 30% 时中止（安全阀）。
+- 能力探测与降级：没有强 ETag、忽略条件写入或列表不可靠的服务器只上传/下载，不传播删除，设置页标注原因。
+- 触发：保存/删除/编辑后 5 秒防抖、启动 60 秒后首轮、每 5/15/60 分钟轮询、托盘「立即同步」。
+- 设置面板新增「云同步（WebDAV）」；历史面板底部显示同步状态与冲突副本入口。
+- 密码只存 Windows 凭据管理器（`flashnote-sync`），`settings.json` 不含密码，界面不回显已保存的密码。
+- 同步状态按「笔记目录 + 远端身份」隔离，换服务器或账号不会复用旧记录、更不会误删本地笔记。
+
+### 修复
+
+- 统一 ETag 引号形式：部分服务器（如 wsgidav）PUT 响应带引号、PROPFIND 不带，之前会导致刚上传的文件每轮被重复下载。
+- WebDAV 请求对 429 / 423 / 503 与网络抖动自动退避重试；`Retry-After` 单轮最多等待 30 秒。
+
+### 文档
+
+- README 新增「云同步（WebDAV）」章节：坚果云应用密码、明文存储提示、降级与限流说明。
+- 新增 `docs/sync-protocol.md`，定义同步协议 v1；WebDAV 复用其中的版本与合并规则，账号与加密部分供 0.6.0 的闪记云使用。
+
 ## [0.4.0] - 2026-10-23
 
 ### 变更
@@ -116,7 +139,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.3.0

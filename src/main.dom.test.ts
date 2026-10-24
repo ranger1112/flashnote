@@ -402,6 +402,39 @@ describe("云同步", () => {
     expect(node<HTMLInputElement>("#sync-url").value).toBe("http://dav.example.com/");
   });
 
+  it("地址变化且密码留空时提示重新输入密码", async () => {
+    await boot();
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").value = "https://dav.example.com/dav/";
+    node<HTMLInputElement>("#sync-username").value = "alice";
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(node<HTMLElement>("#sync-error").textContent).toContain("重新填写密码");
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("重新填写密码");
+  });
+
+  it("只给地址补末尾斜杠不触发重新输入密码", async () => {
+    await boot({
+      get_settings: () => ({
+        ...baseSettings,
+        sync: {
+          ...baseSettings.sync,
+          url: "https://dav.example.com/dav",
+          username: "alice",
+        },
+      }),
+    });
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").value = "https://dav.example.com/dav/";
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(node<HTMLElement>("#sync-error").textContent).not.toContain("重新填写密码");
+  });
+
   it("测试连接失败显示在错误行，按钮恢复可用", async () => {
     await boot({
       test_sync_connection: () => Promise.reject("认证失败：401"),

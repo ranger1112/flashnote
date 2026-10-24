@@ -21,6 +21,7 @@ Press the global hotkey and a small window floats above the current window; jot 
 - **Automatic source capture**: grabs the foreground window title when summoned and writes it into the entry when saving (Windows; can be disabled in settings).
 - **Drafts never lost**: unsaved content is preserved when you dismiss with `Esc` and survives an app restart; drafts live in the app's config directory, so clearing browser data won't lose them.
 - **Local-first**: Markdown split into files by day, readable directly with Obsidian, VS Code, and similar tools.
+- **Optional cloud sync**: sync your notes directory to your own WebDAV storage (Jianguoyun, Nextcloud, NAS, …); off by default, no network traffic until configured. Concurrent edits are merged entry by entry, with conflict copies when a merge is unsafe.
 - **Markdown mode**: optional block-based writing so code blocks, tables, and headings render correctly from the very first line.
 - **Note history**: the note button in the title bar opens a history panel with reverse-chronological browsing, full-text search (across all date files), and loading of older entries; you can toggle a rendered Markdown preview and edit or delete individual entries directly.
 - **System tray**: left-click to summon; right-click to open today's notes, the notes folder, settings, or quit.
@@ -53,6 +54,7 @@ Left-clicking the tray icon summons the popover directly; the right-click menu c
 - **View Notes**: summons the window and opens the note history panel.
 - **Open Today's Note**: opens today's Markdown file with the system default application (usually VS Code / Typora; the file is created automatically if it doesn't exist).
 - **Open Notes Folder**: opens the current notes directory.
+- **Sync Now**: runs one sync round immediately; opens settings when sync is not configured or disabled.
 - **Settings…**: summons the window and opens the settings panel.
 - **Open Logs Folder**: opens the log directory, for troubleshooting.
 - **Quit**: exits the application and releases the global hotkey.
@@ -70,6 +72,7 @@ Left-clicking the tray icon summons the popover directly; the right-click menu c
 | Hide when focus is lost | Tucks the window away when you click another application; off by default. Ignored in pin mode and while a panel is open. |
 | Theme | System, light, or dark; system mode follows Windows light/dark changes live. |
 | Background opacity | 60%–100%, applied to the window and its panels alike; 100% (opaque) by default. |
+| Cloud sync (WebDAV) | Enable switch, URL, account, password, sync interval, and device name; off by default. See "Cloud sync (WebDAV)" below. |
 
 Settings are stored at:
 
@@ -103,6 +106,7 @@ Rules:
 - The source line uses the format `  _来源：窗口标题_` and is written only when capture succeeds; newlines in the title are collapsed into spaces.
 - New notes are always appended; editing or deleting in the history panel rewrites only that day's file, creating a `2026-10-21.md.bak-<timestamp>` backup first (at most 5 kept per date).
 - Files are UTF-8 without BOM with `\n` line endings.
+- Cloud sync only handles `YYYY-MM-DD.md` and `YYYY-MM-DD.conflict-*.md`; `.bak-*`, `.tmp-*`, drafts, and settings are never uploaded.
 
 ### History panel
 
@@ -130,6 +134,51 @@ const a = 1;
 
 This mode is off by default and can be toggled in settings. When off, the compact list format above is used; the two formats can coexist, and older entries are never rewritten.
 
+## Cloud sync (WebDAV)
+
+Off by default. Sync uses only your own WebDAV storage; notes are written as **plain-text Markdown** under:
+
+```
+<your URL>/flashnote/notes/YYYY-MM-DD.md
+```
+
+Nothing outside that prefix is touched, and settings, drafts, and `.bak-*` files are never uploaded.
+
+### Setup (Jianguoyun example)
+
+1. Sign in to Jianguoyun on the web → "Account info" → "Security" → "Add app password" to get a dedicated password;
+2. Open FlashNote settings → "Cloud sync (WebDAV)";
+3. Use `https://dav.jianguoyun.com/dav/` as the URL, your Jianguoyun login email as the username, and the **app password** (not your login password);
+4. Click "Test connection", then "Save" and enable "Cloud sync".
+
+Nextcloud, NAS WebDAV, [dufs](https://github.com/sigoden/dufs), and `rclone serve webdav` work the same way — enter the DAV root URL (the directory, not a file).
+
+### Behavior
+
+- Triggers: 5 seconds after save / delete / edit; first round 60 seconds after launch; then every 5 / 15 / 60 minutes; the tray's "Sync Now" at any time.
+- Only one round runs at a time; triggers during a round queue a follow-up round.
+- Local deletions propagate to the remote; remote deletions move the local copy into `%APPDATA%\com.phoebe.flashnote\sync\<hash>\trash\<timestamp>\`.
+- Edits on both sides of the same day are merged entry by entry (time + content + source); when a merge is unsafe, the remote content is saved as `YYYY-MM-DD.conflict-<device>-<timestamp>.md` and the history panel shows "N conflict copies".
+- Safety valve: a round that would delete more than 5 files and more than 30% of tracked files aborts; an unreadable notes directory or a truncated remote listing also disables all deletions for that round.
+- Weak servers (no strong ETag, ignored conditional writes, unreliable listings) are detected automatically and degrade to upload/download only — deletions are never propagated, and the reason is shown in settings.
+- Each round has a request budget; leftover files wait for the next round to avoid rate limits.
+
+### Credentials and privacy
+
+- The password lives only in Windows Credential Manager (service `flashnote-sync`); `settings.json` contains just the URL, username, and non-sensitive options, and the UI never displays a saved password.
+- If Credential Manager is disabled by group policy you get a clear error; sync still works for the current session but the password must be re-entered after restart.
+- **Synced content is plain text**: your WebDAV provider can read the notes. End-to-end encryption is planned for "FlashNote Cloud" in 0.6.0.
+- Changing the URL or username removes the old password automatically, so credentials are never sent to a different server.
+
+### Troubleshooting
+
+- "Authentication failed": Jianguoyun requires an app password; also make sure the URL ends with `/dav/`.
+- "Too many requests": the provider is rate-limiting; FlashNote backs off according to `Retry-After`. Increase the interval or use fewer clients.
+- Conflict copies are never cleaned up automatically; review and merge or delete them manually.
+- Sync state and failure reasons appear at the bottom of settings and the history panel.
+
+Protocol details (decision table, merge rules, state file) are in [docs/sync-protocol.md](docs/sync-protocol.md) (in Chinese); the WebDAV mode does not use its account or encryption sections.
+
 ## Installation
 
 Download from [Releases](https://github.com/ranger1112/flashnote/releases/latest):
@@ -142,7 +191,7 @@ Download from [Releases](https://github.com/ranger1112/flashnote/releases/latest
 Each release ships with a `SHA256SUMS.txt` that you can use to verify the download:
 
 ```powershell
-Get-FileHash .\FlashNote_0.4.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.5.0_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the output with the corresponding line in `SHA256SUMS.txt`.
@@ -154,7 +203,7 @@ Uninstall: Windows "Settings → Apps", or run `uninstall.exe` in the install di
 An installer built from source is located at:
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.4.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\闪记_0.5.0_x64-setup.exe
 ```
 
 ## Development
@@ -197,7 +246,7 @@ npm run tauri build
 Outputs:
 
 - Executable: `src-tauri\target\release\flashnote.exe`
-- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.4.0_x64-setup.exe`
+- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.5.0_x64-setup.exe`
 
 ### Testing
 
@@ -248,6 +297,7 @@ flashnote/
 │  ├─ settings-store.ts        # In-memory settings state and loading
 │  ├─ appearance.ts            # Theme and background opacity
 │  ├─ draft.ts                 # Draft autosave and restore
+│  ├─ sync.ts                  # Cloud sync settings, status subscription, conflict hint
 │  ├─ updater.ts               # Update checks, install, notice banner
 │  ├─ welcome.ts               # First-run guide
 │  ├─ toast.ts                 # Toasts and undo bar
@@ -264,6 +314,14 @@ flashnote/
 │  │  ├─ notes.rs              # Markdown entry formatting and per-day appending (with tests)
 │  │  ├─ settings.rs           # Atomic settings.json read/write and defaults
 │  │  ├─ source.rs             # Foreground window title capture (Win32)
+│  │  ├─ sync/
+│  │  │  ├─ mod.rs             # Sync engine: scan, decision table, conflict copies, safety valve
+│  │  │  ├─ backend.rs         # Backend abstraction: versions, preconditions, errors, capabilities
+│  │  │  ├─ webdav.rs          # WebDAV client, capability probe, XML parsing
+│  │  │  ├─ state.rs           # state.json, base copies, trash
+│  │  │  ├─ merge.rs           # Entry-level three-way merge (line-span splicing)
+│  │  │  ├─ runtime.rs         # Scheduling, single-flight, status broadcast
+│  │  │  └─ secrets.rs         # Password storage (Windows Credential Manager)
 │  │  └─ tray.rs               # Tray icon and menu
 │  ├─ capabilities/default.json
 │  ├─ icons/
@@ -281,6 +339,7 @@ flashnote/
 - **Window**: borderless with a transparent background; 10px of padding on all sides leaves room for CSS-drawn rounded corners and shadow; `skipTaskbar` keeps it out of the taskbar.
 - **Source capture**: `GetForegroundWindow` + `GetWindowTextW`, excluding FlashNote itself by PID; if capture fails, the previous source is reused.
 - **Saving**: appends to a file per date and replaces the settings file atomically; file I/O and directory creation run on the blocking pool, and settings are flushed asynchronously with only the newest snapshot winning, so the UI thread never waits on disk.
+- **Cloud sync**: `reqwest` (system certificates) plus `quick-xml` for PROPFIND; sync state is keyed by notes directory **and** remote identity, so switching servers never reuses old records; passwords are stored in Windows Credential Manager via `keyring`, never in plain text.
 - **Logging**: written to `%LOCALAPPDATA%\com.phoebe.flashnote\logs`, rotating when a single file exceeds 2MB and keeping the 3 most recent files; openable directly from the tray menu. Logs never contain note bodies.
 
 ## Platform support
@@ -289,7 +348,8 @@ Currently verified only on **Windows 10/11**. Source-window capture relies on th
 
 ## Known limitations
 
-- No cloud sync or export yet; search scans files one by one, so it gets slower with very large note collections.
+- No export yet; search scans files one by one, so it gets slower with very large note collections.
+- Cloud sync supports WebDAV only, and content is stored as plain text in your own storage; there is no end-to-end encryption or real-time push.
 - If another application has claimed the global hotkey, you need to change it in settings.
 - Note files are append-only and never rotated, so a single day's file grows gradually over long-term use.
 - The installers are not code-signed, so the first install triggers a SmartScreen warning; see [docs/code-signing.md](docs/code-signing.md) for the research and the adoption path.
@@ -318,7 +378,15 @@ No. Auto-update only replaces program files; notes, settings, and drafts all liv
 
 **Does it still go online after I turn off "Check for updates automatically"?**
 
-No proactive network access. Once disabled, it only contacts GitHub Releases when you click "Check for updates" manually.
+No proactive network access. Once disabled, it only contacts GitHub Releases when you click "Check for updates" manually. Cloud sync is off by default and makes no requests until configured.
+
+**Where does cloud sync send my notes?**
+
+Only to the `flashnote/notes/` directory under the WebDAV URL you enter, as plain-text Markdown. FlashNote has no cloud server of its own. To use a second computer, enter the same URL and account there and the notes are pulled down.
+
+**Can two computers editing the same day lose notes?**
+
+No whole-file overwrites. FlashNote merges both sides' additions and edits entry by entry; when a merge is unsafe it keeps your local version and saves the remote content as `YYYY-MM-DD.conflict-<device>-<timestamp>.md`. The "N conflict copies" button at the bottom of the history panel opens the folder.
 
 ## Contributing
 

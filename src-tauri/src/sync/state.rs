@@ -47,6 +47,7 @@ impl Default for SyncState {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct StateStore {
     root: PathBuf,
 }

@@ -31,7 +31,7 @@ use state::{mtime_ns, now_iso, sha256_base64, write_atomic, FileRecord, StateSto
 use crate::notes;
 
 /// 与协议一致：单个笔记文件明文上限 2 MiB。
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 删除安全阀：超过这个数量、且占比超过阈值才中止。
 const DELETE_MIN_FILES: usize = 5;
 const DELETE_RATIO_PERCENT: usize = 30;
@@ -62,6 +62,16 @@ impl SyncSummary {
 
     fn error(&mut self, name: &str, error: impl std::fmt::Display) {
         self.errors.push(format!("{name}：{error}"));
+    }
+
+    /// 预期内的「这一轮做不完」不算失败：预算耗尽与超大文件只记警告。
+    fn record(&mut self, name: &str, error: SyncError) {
+        match error {
+            SyncError::Budget | SyncError::TooLarge => {
+                self.warnings.push(format!("{name}：{error}"));
+            }
+            other => self.error(name, other),
+        }
     }
 }
 
@@ -107,9 +117,13 @@ fn decide(
     }
 
     if !remote_present {
-        // 列表不可靠时不能把「没列出来」当成删除。
+        // 列表不可靠时不能把「没列出来」当成删除；但本地有修改仍应尝试上传，
+        // apply 会先向远端确认一次，确认存在就放弃覆盖。
         if !caps.reliable_listing {
-            return Action::Skip;
+            return match local {
+                LocalState::Changed => Action::UploadRevive,
+                _ => Action::Skip,
+            };
         }
         return match local {
             LocalState::Absent => Action::Forget,
@@ -130,7 +144,8 @@ fn decide(
             if caps.supports_deletion() {
                 Action::DeleteRemote
             } else {
-                Action::Forget
+                // 无法传播删除；保留记录，避免下一轮把远端副本当成新文件下载回来。
+                Action::Skip
             }
         }
         (LocalState::Absent, true) => Action::RestoreLocal,
@@ -155,8 +170,49 @@ struct LocalScan {
     warnings: Vec<String>,
 }
 
-/// 只同步日期笔记与冲突副本；`.bak-*`、`.tmp-*`、其它 Markdown 不碰。
-fn is_sync_name(name: &str) -> bool {
+/// 改写/删除本地文件前对当前内容的期望。
+///
+/// 决策基于同步开始时的一次扫描；网络阶段可能持续数秒到数分钟，期间用户完全
+/// 可能又保存了笔记。真正落盘前必须在同一把锁内复核，否则会用旧快照覆盖新内容。
+enum LocalExpect {
+    /// 文件必须仍不存在。
+    Absent,
+    /// 文件内容必须仍是扫描时的摘要。
+    Sha(String),
+    /// 不检查（新建文件）。
+    Any,
+}
+
+/// 把本地文件 I/O 放进阻塞线程池；网络请求仍然保持 async。
+async fn blocking<T, F>(task: F) -> Result<T, SyncError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| SyncError::Io(format!("后台任务失败：{error}")))
+}
+
+/// 笔记文件名的白名单校验。
+///
+/// 远端列表是不可信输入，而名字会直接参与 `notes_dir`、`base/`、`trash/` 的
+/// 路径拼接：必须先拒绝分隔符、`..` 和协议之外的冲突后缀，否则一个
+/// `%2e%2e%2f` 编码的 href 就能把文件写到笔记目录之外。
+pub(crate) fn is_valid_note_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    if name.starts_with('.') || name.contains("..") {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|ch| ch.is_control() || ch == '/' || ch == '\\')
+    {
+        return false;
+    }
+
     let Some(stem) = name.strip_suffix(".md") else {
         return false;
     };
@@ -166,7 +222,26 @@ fn is_sync_name(name: &str) -> bool {
     if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
         return false;
     }
-    stem.len() == 10 || stem[10..].starts_with(".conflict-")
+    if stem.len() == 10 {
+        return true;
+    }
+
+    let Some(suffix) = stem
+        .get(10..)
+        .and_then(|rest| rest.strip_prefix(".conflict-"))
+    else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 48
+        && suffix
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+/// 只同步日期笔记与协议允许的冲突副本；`.bak-*`、`.tmp-*`、其它 Markdown 不碰。
+fn is_sync_name(name: &str) -> bool {
+    is_valid_note_name(name)
 }
 
 fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
@@ -174,11 +249,16 @@ fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
         .map_err(|error| SyncError::Aborted(format!("无法读取笔记目录：{error}")))?;
     let mut scan = LocalScan::default();
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan.warnings
+                    .push(format!("读取目录项失败（{error}），已忽略"));
+                continue;
+            }
+        };
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             scan.warnings
                 .push("跳过文件名不是 UTF-8 的文件".to_string());
@@ -189,7 +269,9 @@ fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
         }
         let name = name.to_string();
 
-        let meta = match fs::metadata(&path) {
+        // 元数据读取失败时按「未知」处理：不参与删除判断，否则一次瞬时错误
+        // 会被当成「本地文件已删」并传播到远端。
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(error) => {
                 scan.warnings
@@ -198,6 +280,12 @@ fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
                 continue;
             }
         };
+        if !meta.is_file() {
+            // 目录或其它类型占用了笔记名：同样按未知处理，绝不当作已删除。
+            scan.warnings.push(format!("{name}：不是普通文件，已跳过"));
+            scan.skipped.insert(name);
+            continue;
+        }
         if meta.len() > MAX_FILE_BYTES {
             scan.warnings.push(format!("{name}：超过 2 MiB，已跳过"));
             scan.skipped.insert(name);
@@ -271,15 +359,15 @@ impl<B: SyncBackend> SyncEngine<B> {
             summary.warnings.push(warning);
         }
 
-        if !self.notes_dir.is_dir() {
-            summary.aborted = true;
-            summary.error("笔记目录", "不存在或不可读取，本轮已中止");
-            summary.finished_at = Some(now_iso());
-            return summary;
-        }
-
-        let scan = match scan_local(&self.notes_dir) {
-            Ok(scan) => scan,
+        let notes_dir = self.notes_dir.clone();
+        let scan = match blocking(move || scan_local(&notes_dir)).await {
+            Ok(Ok(scan)) => scan,
+            Ok(Err(error)) => {
+                summary.aborted = true;
+                summary.error("笔记目录", error);
+                summary.finished_at = Some(now_iso());
+                return summary;
+            }
             Err(error) => {
                 summary.aborted = true;
                 summary.error("笔记目录", error);
@@ -383,8 +471,12 @@ impl<B: SyncBackend> SyncEngine<B> {
         }
 
         self.state.last_sync_at = Some(now_iso());
-        if let Err(error) = self.store.save(&self.state) {
-            summary.error("同步状态", error);
+        let store = self.store.clone();
+        let snapshot = self.state.clone();
+        match blocking(move || store.save(&snapshot)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => summary.error("同步状态", error),
+            Err(error) => summary.error("同步状态", error),
         }
         summary.finished_at = Some(now_iso());
         summary
@@ -401,6 +493,14 @@ impl<B: SyncBackend> SyncEngine<B> {
         trash_dir: &mut Option<PathBuf>,
         summary: &mut SyncSummary,
     ) {
+        // 名字可能来自远端列表或状态文件，落盘前先过白名单：这是路径穿越的最后一道闸。
+        if !is_valid_note_name(name) {
+            summary
+                .warnings
+                .push(format!("{name}：文件名不合法，已跳过"));
+            return;
+        }
+
         // 远端文件超限时直接跳过：既不下载，也不推断删除。
         let reads_remote = matches!(
             action,
@@ -420,27 +520,75 @@ impl<B: SyncBackend> SyncEngine<B> {
                     summary.skipped += 1;
                     return;
                 };
-                let expect = match (action, &record, remote) {
-                    (Action::Upload, Some(record), Some(_)) => {
-                        Expect::Version(record.remote_version.clone())
+                // 列表可能漏掉远端文件；复活写入前确认一次，避免覆盖另一台设备。
+                if action == Action::UploadRevive {
+                    match self.backend.exists(name).await {
+                        Ok(true) => {
+                            summary
+                                .warnings
+                                .push(format!("{name}：远端仍存在，本轮不覆盖"));
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(error @ SyncError::Budget) => {
+                            summary.warnings.push(format!("{name}：{error}"));
+                            return;
+                        }
+                        Err(error) => {
+                            summary.error(name, format!("无法确认远端状态，未上传：{error}"));
+                            return;
+                        }
                     }
+                }
+                let expect = match (action, &record, remote) {
+                    (Action::Upload, Some(record), Some(_)) => Expect::Version {
+                        version: record.remote_version.clone(),
+                        sha256: Some(record.remote_sha256.clone()),
+                    },
                     _ => Expect::Absent,
                 };
                 match self.backend.put(name, &local.bytes, expect).await {
                     Ok(version) => {
-                        self.commit(name, &local.bytes, version, summary);
+                        self.commit(name, &local.bytes, version, summary).await;
                         summary.uploaded += 1;
                     }
-                    Err(error) => summary.error(name, error),
+                    Err(error) => summary.record(name, error),
                 }
             }
             Action::Download | Action::RestoreLocal => match self.backend.get(name).await {
                 Ok(Some((bytes, version))) => {
-                    if let Err(error) = self.write_local(name, &bytes) {
+                    // 列表里的 size 可能缺失或被服务器写错，收到内容后再复查一次。
+                    if bytes.len() as u64 > MAX_FILE_BYTES {
+                        summary
+                            .warnings
+                            .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
+                        return;
+                    }
+                    // 版本令牌可能来自 GET 与 PROPFIND 两个来源。内容与我们上次
+                    // 同步的完全一致时，只把列表版本补进记录，避免反复下载。
+                    if record
+                        .as_ref()
+                        .is_some_and(|record| sha256_base64(&bytes) == record.remote_sha256)
+                    {
+                        let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
+                        self.commit(name, &bytes, version, summary).await;
+                        summary.skipped += 1;
+                        return;
+                    }
+                    // Download 的本地文件必须仍是扫描时那一份；RestoreLocal 则要求
+                    // 它仍未出现。两种情况都不能覆盖网络阶段里用户新写的笔记。
+                    let expect = match local {
+                        Some(file) => LocalExpect::Sha(file.sha256.clone()),
+                        None => LocalExpect::Absent,
+                    };
+                    if let Err(error) = self.write_local(name, bytes.clone(), expect).await {
                         summary.error(name, error);
                         return;
                     }
-                    self.commit(name, &bytes, version, summary);
+                    // 优先记录列表里的版本：下一轮 remote_changed 比较的正是列表版本，
+                    // 而 GET/PUT 的版本来源不一定相同。
+                    let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
+                    self.commit(name, &bytes, version, summary).await;
                     summary.downloaded += 1;
                 }
                 Ok(None) => {
@@ -448,7 +596,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                         .warnings
                         .push(format!("{name}：远端文件已消失，留待下一轮"));
                 }
-                Err(error) => summary.error(name, error),
+                Err(error) => summary.record(name, error),
             },
             Action::Merge => {
                 let Some(local) = local else {
@@ -464,49 +612,76 @@ impl<B: SyncBackend> SyncEngine<B> {
                         return;
                     }
                     Err(error) => {
-                        summary.error(name, error);
+                        summary.record(name, error);
                         return;
                     }
                 };
+                if remote_bytes.len() as u64 > MAX_FILE_BYTES {
+                    summary
+                        .warnings
+                        .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
+                    return;
+                }
                 let Some(remote_text) = String::from_utf8(remote_bytes).ok() else {
                     summary.error(name, "远端文件不是 UTF-8，已跳过");
                     return;
                 };
-                let base = self
-                    .store
-                    .read_base(name)
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .unwrap_or_default();
+                let store = self.store.clone();
+                let base_name = name.to_string();
+                let base = blocking(move || {
+                    store
+                        .read_base(&base_name)
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
 
-                match merge::merge(&base, &local.text, &remote_text) {
-                    Some(result) => {
-                        if result.text != local.text
-                            && self.write_local(name, result.text.as_bytes()).is_err()
-                        {
-                            summary.error(name, "写入合并结果失败");
-                            return;
+                let local_text = local.text.clone();
+                let remote_for_merge = remote_text.clone();
+                let merged =
+                    blocking(move || merge::merge(&base, &local_text, &remote_for_merge)).await;
+                match merged {
+                    Ok(Some(result)) => {
+                        if result.text != local.text {
+                            if let Err(error) = self
+                                .write_local(
+                                    name,
+                                    result.text.as_bytes().to_vec(),
+                                    LocalExpect::Sha(local.sha256.clone()),
+                                )
+                                .await
+                            {
+                                summary.error(name, error);
+                                return;
+                            }
                         }
                         match self
                             .backend
                             .put(
                                 name,
                                 result.text.as_bytes(),
-                                Expect::Version(remote_version),
+                                Expect::Version {
+                                    version: remote_version,
+                                    sha256: Some(sha256_base64(remote_text.as_bytes())),
+                                },
                             )
                             .await
                         {
                             Ok(version) => {
-                                self.commit(name, result.text.as_bytes(), version, summary);
+                                self.commit(name, result.text.as_bytes(), version, summary)
+                                    .await;
                                 summary.merged += 1;
                                 summary.conflicts += result.conflicts;
                             }
-                            Err(error) => summary.error(name, error),
+                            Err(error) => summary.record(name, error),
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         self.conflict_copy(name, local, &remote_text, remote_version, summary)
                             .await
                     }
+                    Err(error) => summary.error(name, error),
                 }
             }
             Action::DeleteRemote => {
@@ -515,46 +690,86 @@ impl<B: SyncBackend> SyncEngine<B> {
                 };
                 match self
                     .backend
-                    .delete(name, Expect::Version(record.remote_version))
+                    .delete(
+                        name,
+                        Expect::Version {
+                            version: record.remote_version,
+                            sha256: Some(record.remote_sha256),
+                        },
+                    )
                     .await
                 {
                     Ok(()) => {
-                        self.forget(name);
+                        self.forget(name).await;
                         summary.deleted += 1;
                     }
                     Err(SyncError::NotFound) => {
-                        self.forget(name);
+                        self.forget(name).await;
                         summary.deleted += 1;
                     }
-                    Err(error) => summary.error(name, error),
+                    Err(error) => summary.record(name, error),
                 }
             }
             Action::TrashLocal => {
                 let Some(local) = local else {
                     return;
                 };
+                // 目录列表可能被服务器或代理截断。删除本地副本前先直接确认一次
+                // 远端确实不在了；确认失败就本轮不动，宁可少同步一次。
+                match self.backend.exists(name).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        summary
+                            .warnings
+                            .push(format!("{name}：远端仍存在，本轮不删除本地副本"));
+                        return;
+                    }
+                    Err(error @ SyncError::Budget) => {
+                        summary.warnings.push(format!("{name}：{error}"));
+                        return;
+                    }
+                    Err(error) => {
+                        summary.error(name, format!("无法确认远端状态，未删除本地副本：{error}"));
+                        return;
+                    }
+                }
                 if trash_dir.is_none() {
-                    match self.store.new_trash_dir() {
-                        Ok(dir) => *trash_dir = Some(dir),
-                        Err(error) => {
+                    let store = self.store.clone();
+                    match blocking(move || store.new_trash_dir()).await {
+                        Ok(Ok(dir)) => *trash_dir = Some(dir),
+                        Ok(Err(error)) => {
                             summary.error(name, format!("创建 trash 目录失败：{error}"));
+                            return;
+                        }
+                        Err(error) => {
+                            summary.error(name, error);
                             return;
                         }
                     }
                 }
-                let dir = trash_dir.as_ref().expect("trash 目录已创建");
-                if let Err(error) = self.store.trash(dir, name, &local.bytes) {
-                    summary.error(name, format!("备份到 trash 失败：{error}"));
-                    return;
+                let dir = trash_dir.clone().expect("trash 目录已创建");
+                let store = self.store.clone();
+                let trash_name = name.to_string();
+                let trash_bytes = local.bytes.clone();
+                match blocking(move || store.trash(&dir, &trash_name, &trash_bytes)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        summary.error(name, format!("备份到 trash 失败：{error}"));
+                        return;
+                    }
+                    Err(error) => {
+                        summary.error(name, error);
+                        return;
+                    }
                 }
-                if let Err(error) = self.remove_local(name) {
+                if let Err(error) = self.remove_local(name, Some(local.sha256.clone())).await {
                     summary.error(name, error);
                     return;
                 }
-                self.forget(name);
+                self.forget(name).await;
                 summary.deleted += 1;
             }
-            Action::Forget => self.forget(name),
+            Action::Forget => self.forget(name).await,
         }
     }
 
@@ -571,92 +786,175 @@ impl<B: SyncBackend> SyncEngine<B> {
             summary.error(name, "无法生成冲突副本名");
             return;
         };
-        if let Err(error) = self.write_local(&conflict, remote_text.as_bytes()) {
+        if let Err(error) = self
+            .write_local(&conflict, remote_text.as_bytes().to_vec(), LocalExpect::Any)
+            .await
+        {
             summary.error(name, error);
             return;
         }
         match self
             .backend
-            .put(name, &local.bytes, Expect::Version(remote_version))
+            .put(
+                name,
+                &local.bytes,
+                Expect::Version {
+                    version: remote_version,
+                    sha256: Some(sha256_base64(remote_text.as_bytes())),
+                },
+            )
             .await
         {
             Ok(version) => {
-                self.commit(name, &local.bytes, version, summary);
+                self.commit(name, &local.bytes, version, summary).await;
                 summary.conflicts += 1;
                 summary
                     .warnings
                     .push(format!("{name}：无法逐条合并，远端内容已保存为 {conflict}"));
             }
-            Err(error) => summary.error(name, error),
+            Err(error) => summary.record(name, error),
         }
     }
 
-    fn commit(
+    async fn commit(
         &mut self,
         name: &str,
         bytes: &[u8],
         version: RemoteVersion,
         summary: &mut SyncSummary,
     ) {
-        let path = self.notes_dir.join(name);
-        let (size, modified) = match fs::metadata(&path) {
-            Ok(meta) => (meta.len(), mtime_ns(meta.modified().unwrap_or(UNIX_EPOCH))),
-            Err(_) => (bytes.len() as u64, 0),
-        };
-        let sha = sha256_base64(bytes);
-        if let Err(error) = self.store.write_base(name, bytes) {
-            summary
-                .warnings
-                .push(format!("{name}：保存 base 副本失败（{error}）"));
-        }
-        self.state.files.insert(
-            name.to_string(),
-            FileRecord {
+        let notes_dir = self.notes_dir.clone();
+        let store = self.store.clone();
+        let owned_name = name.to_string();
+        let owned_bytes = bytes.to_vec();
+        let prepared = blocking(move || {
+            let path = notes_dir.join(&owned_name);
+            let (size, modified) = match fs::metadata(&path) {
+                Ok(meta) => (meta.len(), mtime_ns(meta.modified().unwrap_or(UNIX_EPOCH))),
+                Err(_) => (owned_bytes.len() as u64, 0),
+            };
+            let sha = sha256_base64(&owned_bytes);
+            let base_result = store.write_base(&owned_name, &owned_bytes);
+            let record = FileRecord {
                 local_mtime_ns: modified,
                 local_size: size,
                 local_sha256: sha.clone(),
                 remote_version: version,
                 remote_sha256: sha,
                 synced_at: now_iso(),
-            },
-        );
-        if let Err(error) = self.store.save(&self.state) {
-            summary.error(name, format!("保存同步状态失败：{error}"));
+            };
+            (record, base_result)
+        })
+        .await;
+
+        let (record, base_result) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                summary.error(name, error);
+                return;
+            }
+        };
+        if let Err(error) = base_result {
+            summary
+                .warnings
+                .push(format!("{name}：保存 base 副本失败（{error}）"));
+        }
+        self.state.files.insert(name.to_string(), record);
+
+        let store = self.store.clone();
+        let snapshot = self.state.clone();
+        match blocking(move || store.save(&snapshot)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => summary.error(name, format!("保存同步状态失败：{error}")),
+            Err(error) => summary.error(name, error),
         }
     }
 
-    fn forget(&mut self, name: &str) {
+    async fn forget(&mut self, name: &str) {
         self.state.files.remove(name);
-        self.store.remove_base(name);
-        let _ = self.store.save(&self.state);
+        let store = self.store.clone();
+        let owned_name = name.to_string();
+        let snapshot = self.state.clone();
+        let _ = blocking(move || {
+            store.remove_base(&owned_name);
+            let _ = store.save(&snapshot);
+        })
+        .await;
     }
 
-    fn write_local(&self, name: &str, bytes: &[u8]) -> Result<(), SyncError> {
-        let path = self.notes_dir.join(name);
-        {
-            let _guard = self
-                .io
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            write_atomic(&path, bytes)
-                .map_err(|error| SyncError::Io(format!("写入 {name} 失败：{error}")))?;
-        }
-        notes::invalidate_cache(&path);
-        Ok(())
+    async fn write_local(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        expect: LocalExpect,
+    ) -> Result<(), SyncError> {
+        let notes_dir = self.notes_dir.clone();
+        let io = self.io.clone();
+        let owned_name = name.to_string();
+        blocking(move || {
+            if !is_valid_note_name(&owned_name) {
+                return Err(SyncError::Other(format!("文件名不合法：{owned_name}")));
+            }
+            let path = notes_dir.join(&owned_name);
+            {
+                let _guard = io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                match expect {
+                    LocalExpect::Absent => {
+                        if path.exists() {
+                            return Err(SyncError::Other(format!(
+                                "{owned_name}：本地文件在同步期间出现，已跳过写入"
+                            )));
+                        }
+                    }
+                    LocalExpect::Sha(expected) => {
+                        let current = fs::read(&path).map_err(|error| {
+                            SyncError::Io(format!("读取 {owned_name} 失败：{error}"))
+                        })?;
+                        if sha256_base64(&current) != expected {
+                            return Err(SyncError::Other(format!(
+                                "{owned_name}：本地文件在同步期间被修改，已跳过写入"
+                            )));
+                        }
+                    }
+                    LocalExpect::Any => {}
+                }
+                write_atomic(&path, &bytes)
+                    .map_err(|error| SyncError::Io(format!("写入 {owned_name} 失败：{error}")))?;
+            }
+            notes::invalidate_cache(&path);
+            Ok(())
+        })
+        .await?
     }
 
-    fn remove_local(&self, name: &str) -> Result<(), SyncError> {
-        let path = self.notes_dir.join(name);
-        {
-            let _guard = self
-                .io
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            fs::remove_file(&path)
-                .map_err(|error| SyncError::Io(format!("删除 {name} 失败：{error}")))?;
-        }
-        notes::invalidate_cache(&path);
-        Ok(())
+    async fn remove_local(&self, name: &str, expected: Option<String>) -> Result<(), SyncError> {
+        let notes_dir = self.notes_dir.clone();
+        let io = self.io.clone();
+        let owned_name = name.to_string();
+        blocking(move || {
+            if !is_valid_note_name(&owned_name) {
+                return Err(SyncError::Other(format!("文件名不合法：{owned_name}")));
+            }
+            let path = notes_dir.join(&owned_name);
+            {
+                let _guard = io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(expected) = expected {
+                    let current = fs::read(&path).map_err(|error| {
+                        SyncError::Io(format!("读取 {owned_name} 失败：{error}"))
+                    })?;
+                    if sha256_base64(&current) != expected {
+                        return Err(SyncError::Other(format!(
+                            "{owned_name}：本地文件在同步期间被修改，已取消删除"
+                        )));
+                    }
+                }
+                fs::remove_file(&path)
+                    .map_err(|error| SyncError::Io(format!("删除 {owned_name} 失败：{error}")))?;
+            }
+            notes::invalidate_cache(&path);
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -687,7 +985,8 @@ fn conflict_name(name: &str, slug: &str) -> Option<String> {
     if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
         return None;
     }
-    let stamp = Local::now().format("%Y%m%d%H%M%S");
+    // 带毫秒：同一秒内生成两个冲突副本时不能互相覆盖。
+    let stamp = Local::now().format("%Y%m%d%H%M%S%3f");
     Some(format!("{date}.conflict-{slug}-{stamp}.md"))
 }
 
@@ -708,6 +1007,10 @@ mod tests {
         files: Mutex<BTreeMap<String, (Vec<u8>, RemoteVersion)>>,
         next: AtomicU64,
         fail_list: AtomicBool,
+        /// 模拟被截断的目录列表：文件仍在，但 list() 看不到它。
+        hidden: Mutex<BTreeSet<String>>,
+        /// 模拟 GET/PUT 与 PROPFIND 使用不同来源的版本令牌。
+        diverge_list: AtomicBool,
     }
 
     impl FakeBackend {
@@ -718,6 +1021,8 @@ mod tests {
                     files: Mutex::new(BTreeMap::new()),
                     next: AtomicU64::new(1),
                     fail_list: AtomicBool::new(false),
+                    hidden: Mutex::new(BTreeSet::new()),
+                    diverge_list: AtomicBool::new(false),
                 }),
             }
         }
@@ -760,6 +1065,16 @@ mod tests {
         fn set_fail_list(&self, value: bool) {
             self.inner.fail_list.store(value, Ordering::SeqCst);
         }
+
+        /// 模拟「列表里看不到、但远端仍然存在」。
+        fn hide_from_list(&self, name: &str) {
+            self.inner.hidden.lock().unwrap().insert(name.to_string());
+        }
+
+        /// 模拟 GET/PUT 与 PROPFIND 使用不同来源的版本令牌。
+        fn diverge_list_versions(&self) {
+            self.inner.diverge_list.store(true, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -772,22 +1087,40 @@ mod tests {
             if self.inner.fail_list.load(Ordering::SeqCst) {
                 return Err(SyncError::Network("列表失败".into()));
             }
+            let hidden = self.inner.hidden.lock().unwrap().clone();
             Ok(self
                 .inner
                 .files
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(name, (bytes, version))| RemoteMeta {
-                    name: name.clone(),
-                    version: version.clone(),
-                    size: bytes.len() as u64,
+                .filter(|(name, _)| !hidden.contains(name.as_str()))
+                .map(|(name, (bytes, version))| {
+                    let version = if self.inner.diverge_list.load(Ordering::SeqCst) {
+                        match version {
+                            RemoteVersion::Number(number) => {
+                                RemoteVersion::Hash(format!("list-{number}"))
+                            }
+                            other => other.clone(),
+                        }
+                    } else {
+                        version.clone()
+                    };
+                    RemoteMeta {
+                        name: name.clone(),
+                        version,
+                        size: bytes.len() as u64,
+                    }
                 })
                 .collect())
         }
 
         async fn get(&self, name: &str) -> Result<Option<(Vec<u8>, RemoteVersion)>, SyncError> {
             Ok(self.inner.files.lock().unwrap().get(name).cloned())
+        }
+
+        async fn exists(&self, name: &str) -> Result<bool, SyncError> {
+            Ok(self.inner.files.lock().unwrap().contains_key(name))
         }
 
         async fn put(
@@ -802,8 +1135,15 @@ mod tests {
                     Expect::Absent if files.contains_key(name) => {
                         return Err(SyncError::VersionMismatch)
                     }
-                    Expect::Version(version) => match files.get(name) {
-                        Some((_, current)) if current == version => {}
+                    Expect::Version { version, sha256 } => match files.get(name) {
+                        Some((bytes, current)) if current == version => {
+                            if sha256
+                                .as_deref()
+                                .is_some_and(|expected| sha256_base64(bytes) != expected)
+                            {
+                                return Err(SyncError::VersionMismatch);
+                            }
+                        }
                         _ => return Err(SyncError::VersionMismatch),
                     },
                     _ => {}
@@ -817,9 +1157,16 @@ mod tests {
         async fn delete(&self, name: &str, expect: Expect) -> Result<(), SyncError> {
             let mut files = self.inner.files.lock().unwrap();
             if self.inner.caps.honors_if_match {
-                if let Expect::Version(version) = &expect {
+                if let Expect::Version { version, sha256 } = &expect {
                     match files.get(name) {
-                        Some((_, current)) if current == version => {}
+                        Some((bytes, current)) if current == version => {
+                            if sha256
+                                .as_deref()
+                                .is_some_and(|expected| sha256_base64(bytes) != expected)
+                            {
+                                return Err(SyncError::VersionMismatch);
+                            }
+                        }
                         _ => return Err(SyncError::VersionMismatch),
                     }
                 }
@@ -956,12 +1303,13 @@ mod tests {
             decide(&weak, true, LocalState::Unchanged, false, false),
             Action::Upload
         );
-        // 本地删除 → 只忘掉记录，不发 DELETE。
+        // 本地删除 → 无法传播；保留记录，避免下一轮重新下载。
         assert_eq!(
             decide(&weak, true, LocalState::Absent, true, false),
-            Action::Forget
+            Action::Skip
         );
-        // 列表不可靠 → 远端缺失一律不动。
+        // 列表不可靠 → 远端缺失时不能推断删除；但本地有修改仍应尝试上传，
+        // apply 会先向远端确认一次再决定是否覆盖。
         let blind = Capabilities {
             strong_etag: false,
             honors_if_match: false,
@@ -970,6 +1318,10 @@ mod tests {
         assert_eq!(
             decide(&blind, true, LocalState::Unchanged, false, false),
             Action::Skip
+        );
+        assert_eq!(
+            decide(&blind, true, LocalState::Changed, false, false),
+            Action::UploadRevive
         );
     }
 
@@ -988,6 +1340,27 @@ mod tests {
         let summary = second.run();
         assert_eq!(summary.downloaded, 1, "{summary:?}");
         assert_eq!(second.read("2026-10-23.md"), text);
+    }
+
+    #[test]
+    fn version_token_mismatch_reconciles_without_rewriting() {
+        let backend = FakeBackend::strong();
+        let harness = Harness::with_backend("version-reconcile", backend.clone());
+        let text = "# 2026-10-23\n\n- 10:00 a\n";
+        harness.write("2026-10-23.md", text);
+        assert_eq!(harness.run().uploaded, 1);
+
+        // 列表开始返回与 GET/PUT 不同来源的版本令牌。
+        backend.diverge_list_versions();
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+        assert_eq!(harness.read("2026-10-23.md"), text);
+
+        // 记录已对齐列表版本，下一轮直接跳过。
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
     }
 
     #[test]
@@ -1097,6 +1470,30 @@ mod tests {
         assert_eq!(summary.uploaded, 1, "{summary:?}");
         assert!(harness.notes.join("2026-10-23.md").exists());
         assert!(backend.content("2026-10-23.md").is_some());
+    }
+
+    #[test]
+    fn weak_server_keeps_local_deletion_without_resurrection() {
+        let backend = FakeBackend::new(Capabilities {
+            strong_etag: false,
+            honors_if_match: false,
+            reliable_listing: true,
+        });
+        let harness = Harness::with_backend("weak-delete", backend.clone());
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        assert_eq!(harness.run().uploaded, 1);
+
+        fs::remove_file(harness.notes.join("2026-10-23.md")).unwrap();
+        let summary = harness.run();
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+        assert!(!harness.notes.join("2026-10-23.md").exists());
+        assert!(backend.content("2026-10-23.md").is_some());
+
+        // 下一轮也不能把远端副本当成新文件下载回来。
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert!(!harness.notes.join("2026-10-23.md").exists());
     }
 
     #[test]
@@ -1210,5 +1607,149 @@ mod tests {
         assert_eq!(device_slug("DESKTOP-ABC"), "desktop-abc");
         assert_eq!(device_slug("  笔记本  "), "device");
         assert_eq!(device_slug("a/b\\c"), "a-b-c");
+    }
+
+    #[test]
+    fn note_names_reject_traversal_and_bad_suffixes() {
+        assert!(is_valid_note_name("2026-10-23.md"));
+        assert!(is_valid_note_name(
+            "2026-10-23.conflict-pc-20261023101010.md"
+        ));
+
+        for bad in [
+            "2026-10-23.conflict-x/../../evil.md",
+            "2026-10-23.conflict-x\\..\\..\\evil.md",
+            "2026-10-23.conflict-%2e%2e%2fevil.md",
+            ".2026-10-23.md",
+            "2026-10-23.conflict-UPPER.md",
+            "2026-10-23.conflict-.md",
+            "2026-10-23.md.md",
+            "2026-10-23.conflict-x.md.bak",
+            "2026-13-40.md",
+        ] {
+            assert!(!is_valid_note_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unsafe_remote_names_are_ignored() {
+        let harness = Harness::new("unsafe-name");
+        harness
+            .backend
+            .put_remote("2026-10-23.conflict-x/../../evil.md", b"evil".to_vec());
+
+        let summary = harness.run();
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("文件名不合法")));
+        assert!(!harness.root.join("evil.md").exists());
+    }
+
+    #[test]
+    fn scan_marks_non_file_entries_as_skipped() {
+        let harness = Harness::new("scan-nonfile");
+        fs::create_dir_all(harness.notes.join("2026-10-23.md")).unwrap();
+
+        let scan = scan_local(&harness.notes).unwrap();
+        assert!(scan.skipped.contains("2026-10-23.md"));
+        assert!(!scan.files.contains_key("2026-10-23.md"));
+    }
+
+    #[test]
+    fn write_local_refuses_stale_snapshot() {
+        let harness = Harness::new("stale-write");
+        harness.write("2026-10-23.md", "old\n");
+        let stale = sha256_base64(b"old\n");
+        let engine = harness.engine();
+        harness.write("2026-10-23.md", "new\n");
+
+        let error = tauri::async_runtime::block_on(engine.write_local(
+            "2026-10-23.md",
+            b"remote\n".to_vec(),
+            LocalExpect::Sha(stale),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("同步期间被修改"), "{error}");
+        assert_eq!(harness.read("2026-10-23.md"), "new\n");
+    }
+
+    #[test]
+    fn remove_local_refuses_stale_snapshot() {
+        let harness = Harness::new("stale-remove");
+        harness.write("2026-10-23.md", "old\n");
+        let stale = sha256_base64(b"old\n");
+        let engine = harness.engine();
+        harness.write("2026-10-23.md", "new\n");
+
+        let error =
+            tauri::async_runtime::block_on(engine.remove_local("2026-10-23.md", Some(stale)))
+                .unwrap_err();
+        assert!(error.to_string().contains("同步期间被修改"), "{error}");
+        assert!(harness.notes.join("2026-10-23.md").exists());
+    }
+
+    #[test]
+    fn upload_revive_rechecks_remote_presence() {
+        let harness = Harness::new("revive-recheck");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        assert_eq!(harness.run().uploaded, 1);
+
+        harness.backend.hide_from_list("2026-10-23.md");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n\n- 11:00 b\n");
+        let summary = harness.run();
+
+        assert_eq!(summary.uploaded, 0, "{summary:?}");
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("远端仍存在")));
+        assert!(harness.read("2026-10-23.md").contains("- 11:00 b"));
+        assert!(harness
+            .backend
+            .content("2026-10-23.md")
+            .unwrap()
+            .contains("- 10:00 a"));
+    }
+
+    #[test]
+    fn unreliable_listing_still_uploads_local_changes() {
+        let backend = FakeBackend::new(Capabilities {
+            strong_etag: false,
+            honors_if_match: false,
+            reliable_listing: false,
+        });
+        let harness = Harness::with_backend("blind-upload", backend.clone());
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        assert_eq!(harness.run().uploaded, 1);
+
+        // 远端确实被删掉了；列表不可靠，但本地有修改，仍应尝试复活上传。
+        harness.backend.remove("2026-10-23.md");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n\n- 11:00 b\n");
+        let summary = harness.run();
+
+        assert_eq!(summary.uploaded, 1, "{summary:?}");
+        assert!(backend
+            .content("2026-10-23.md")
+            .unwrap()
+            .contains("- 11:00 b"));
+    }
+
+    #[test]
+    fn trash_local_rechecks_remote_presence() {
+        let harness = Harness::new("trash-recheck");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        assert_eq!(harness.run().uploaded, 1);
+
+        // 列表被截断：文件还在远端，但 list() 看不到它。
+        harness.backend.hide_from_list("2026-10-23.md");
+        let summary = harness.run();
+
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert!(harness.notes.join("2026-10-23.md").exists());
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("远端仍存在")));
     }
 }

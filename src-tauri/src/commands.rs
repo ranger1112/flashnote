@@ -687,8 +687,14 @@ pub async fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
     run_blocking(move || Ok(sync::runtime::status(&app))).await
 }
 
+/// 两个同步配置是否指向同一远端账号；只差 URL 末尾斜杠视为相同。
+fn same_sync_identity(left: &settings::SyncSettings, right: &settings::SyncSettings) -> bool {
+    left.url.trim().trim_end_matches('/') == right.url.trim().trim_end_matches('/')
+        && left.username.trim() == right.username.trim()
+}
+
 #[tauri::command]
-pub fn update_sync_config(
+pub async fn update_sync_config(
     app: AppHandle,
     state: State<'_, AppState>,
     config: SyncConfigInput,
@@ -705,7 +711,7 @@ pub fn update_sync_config(
     };
 
     // 换服务器或换账号后旧密码不再适用，顺手清掉，免得留下孤儿凭据。
-    if previous.url != next.url || previous.username != next.username {
+    if !same_sync_identity(&previous, &next) {
         state.sync.forget_password();
         if previous.is_configured() {
             if let Err(error) = sync::secrets::clear(&previous.url, &previous.username) {
@@ -716,8 +722,10 @@ pub fn update_sync_config(
 
     persist(&app);
     state.sync.schedule();
-    sync::runtime::emit_status(&app);
-    Ok(sync::runtime::status(&app))
+    sync::runtime::emit_status(&app).await;
+    // 状态计算会扫描笔记目录，放回阻塞线程池再返回。
+    let handle = app.clone();
+    run_blocking(move || Ok(sync::runtime::status(&handle))).await
 }
 
 #[tauri::command]
@@ -758,7 +766,7 @@ pub fn save_sync_password(
 }
 
 #[tauri::command]
-pub fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let sync = state
         .settings
         .lock()
@@ -769,7 +777,7 @@ pub fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> Result
     if sync.is_configured() {
         sync::secrets::clear(&sync.url, &sync.username)?;
     }
-    sync::runtime::emit_status(&app);
+    sync::runtime::emit_status(&app).await;
     Ok(())
 }
 
@@ -785,14 +793,26 @@ pub async fn test_sync_connection(
         return Err("请先填写 WebDAV 地址和用户名".to_string());
     }
 
+    let saved = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sync
+        .clone();
+    let same_identity = same_sync_identity(&saved, &sync);
     let runtime = app.state::<AppState>().sync.clone();
     let password = match password.filter(|value| !value.is_empty()) {
         Some(password) => password,
-        None => match runtime.cached_password() {
+        // 表单地址与已保存配置不一致时，绝不能把缓存里的旧密码发给新地址；
+        // 只允许使用新地址自己在凭据管理器里保存过的密码。
+        None if same_identity => match runtime.cached_password() {
             Some(password) => password,
             None => sync::secrets::load(&sync.url, &sync.username)?
                 .ok_or_else(|| "还没有保存密码".to_string())?,
         },
+        None => sync::secrets::load(&sync.url, &sync.username)?
+            .ok_or_else(|| "地址或用户名已修改，请重新输入密码".to_string())?,
     };
 
     let backend = webdav::WebDavBackend::connect(webdav::WebDavConfig {
@@ -902,6 +922,33 @@ mod tests {
     fn enabling_requires_url_and_username() {
         assert!(sync_input("", true).normalize().is_err());
         assert!(sync_input("", false).normalize().is_ok(), "关闭时允许留空");
+    }
+
+    #[test]
+    fn sync_identity_ignores_trailing_slash_but_not_host_or_user() {
+        let base = settings::SyncSettings {
+            url: "https://dav.example.com/dav/".to_string(),
+            username: "alice".to_string(),
+            ..settings::SyncSettings::default()
+        };
+        let same = settings::SyncSettings {
+            url: " https://dav.example.com/dav ".to_string(),
+            username: " alice ".to_string(),
+            ..settings::SyncSettings::default()
+        };
+        assert!(same_sync_identity(&base, &same));
+
+        let other_host = settings::SyncSettings {
+            url: "https://other.example.com/dav/".to_string(),
+            ..base.clone()
+        };
+        assert!(!same_sync_identity(&base, &other_host));
+
+        let other_user = settings::SyncSettings {
+            username: "bob".to_string(),
+            ..base.clone()
+        };
+        assert!(!same_sync_identity(&base, &other_user));
     }
 
     #[test]
