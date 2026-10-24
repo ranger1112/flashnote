@@ -173,13 +173,24 @@ struct LocalScan {
 ///
 /// 决策基于同步开始时的一次扫描；网络阶段可能持续数秒到数分钟，期间用户完全
 /// 可能又保存了笔记。真正落盘前必须在同一把锁内复核，否则会用旧快照覆盖新内容。
-enum LocalExpect<'a> {
+enum LocalExpect {
     /// 文件必须仍不存在。
     Absent,
     /// 文件内容必须仍是扫描时的摘要。
-    Sha(&'a str),
+    Sha(String),
     /// 不检查（新建文件）。
     Any,
+}
+
+/// 把本地文件 I/O 放进阻塞线程池；网络请求仍然保持 async。
+async fn blocking<T, F>(task: F) -> Result<T, SyncError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| SyncError::Io(format!("后台任务失败：{error}")))
 }
 
 /// 笔记文件名的白名单校验。
@@ -347,15 +358,15 @@ impl<B: SyncBackend> SyncEngine<B> {
             summary.warnings.push(warning);
         }
 
-        if !self.notes_dir.is_dir() {
-            summary.aborted = true;
-            summary.error("笔记目录", "不存在或不可读取，本轮已中止");
-            summary.finished_at = Some(now_iso());
-            return summary;
-        }
-
-        let scan = match scan_local(&self.notes_dir) {
-            Ok(scan) => scan,
+        let notes_dir = self.notes_dir.clone();
+        let scan = match blocking(move || scan_local(&notes_dir)).await {
+            Ok(Ok(scan)) => scan,
+            Ok(Err(error)) => {
+                summary.aborted = true;
+                summary.error("笔记目录", error);
+                summary.finished_at = Some(now_iso());
+                return summary;
+            }
             Err(error) => {
                 summary.aborted = true;
                 summary.error("笔记目录", error);
@@ -459,8 +470,12 @@ impl<B: SyncBackend> SyncEngine<B> {
         }
 
         self.state.last_sync_at = Some(now_iso());
-        if let Err(error) = self.store.save(&self.state) {
-            summary.error("同步状态", error);
+        let store = self.store.clone();
+        let snapshot = self.state.clone();
+        match blocking(move || store.save(&snapshot)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => summary.error("同步状态", error),
+            Err(error) => summary.error("同步状态", error),
         }
         summary.finished_at = Some(now_iso());
         summary
@@ -533,7 +548,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                 };
                 match self.backend.put(name, &local.bytes, expect).await {
                     Ok(version) => {
-                        self.commit(name, &local.bytes, version, summary);
+                        self.commit(name, &local.bytes, version, summary).await;
                         summary.uploaded += 1;
                     }
                     Err(error) => summary.record(name, error),
@@ -551,17 +566,17 @@ impl<B: SyncBackend> SyncEngine<B> {
                     // Download 的本地文件必须仍是扫描时那一份；RestoreLocal 则要求
                     // 它仍未出现。两种情况都不能覆盖网络阶段里用户新写的笔记。
                     let expect = match local {
-                        Some(file) => LocalExpect::Sha(file.sha256.as_str()),
+                        Some(file) => LocalExpect::Sha(file.sha256.clone()),
                         None => LocalExpect::Absent,
                     };
-                    if let Err(error) = self.write_local(name, &bytes, expect) {
+                    if let Err(error) = self.write_local(name, bytes.clone(), expect).await {
                         summary.error(name, error);
                         return;
                     }
                     // 优先记录列表里的版本：下一轮 remote_changed 比较的正是列表版本，
                     // 而 GET/PUT 的版本来源不一定相同。
                     let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
-                    self.commit(name, &bytes, version, summary);
+                    self.commit(name, &bytes, version, summary).await;
                     summary.downloaded += 1;
                 }
                 Ok(None) => {
@@ -599,20 +614,32 @@ impl<B: SyncBackend> SyncEngine<B> {
                     summary.error(name, "远端文件不是 UTF-8，已跳过");
                     return;
                 };
-                let base = self
-                    .store
-                    .read_base(name)
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .unwrap_or_default();
+                let store = self.store.clone();
+                let base_name = name.to_string();
+                let base = blocking(move || {
+                    store
+                        .read_base(&base_name)
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
 
-                match merge::merge(&base, &local.text, &remote_text) {
-                    Some(result) => {
+                let local_text = local.text.clone();
+                let remote_for_merge = remote_text.clone();
+                let merged =
+                    blocking(move || merge::merge(&base, &local_text, &remote_for_merge)).await;
+                match merged {
+                    Ok(Some(result)) => {
                         if result.text != local.text {
-                            if let Err(error) = self.write_local(
-                                name,
-                                result.text.as_bytes(),
-                                LocalExpect::Sha(local.sha256.as_str()),
-                            ) {
+                            if let Err(error) = self
+                                .write_local(
+                                    name,
+                                    result.text.as_bytes().to_vec(),
+                                    LocalExpect::Sha(local.sha256.clone()),
+                                )
+                                .await
+                            {
                                 summary.error(name, error);
                                 return;
                             }
@@ -630,17 +657,19 @@ impl<B: SyncBackend> SyncEngine<B> {
                             .await
                         {
                             Ok(version) => {
-                                self.commit(name, result.text.as_bytes(), version, summary);
+                                self.commit(name, result.text.as_bytes(), version, summary)
+                                    .await;
                                 summary.merged += 1;
                                 summary.conflicts += result.conflicts;
                             }
                             Err(error) => summary.record(name, error),
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         self.conflict_copy(name, local, &remote_text, remote_version, summary)
                             .await
                     }
+                    Err(error) => summary.error(name, error),
                 }
             }
             Action::DeleteRemote => {
@@ -659,11 +688,11 @@ impl<B: SyncBackend> SyncEngine<B> {
                     .await
                 {
                     Ok(()) => {
-                        self.forget(name);
+                        self.forget(name).await;
                         summary.deleted += 1;
                     }
                     Err(SyncError::NotFound) => {
-                        self.forget(name);
+                        self.forget(name).await;
                         summary.deleted += 1;
                     }
                     Err(error) => summary.record(name, error),
@@ -693,27 +722,42 @@ impl<B: SyncBackend> SyncEngine<B> {
                     }
                 }
                 if trash_dir.is_none() {
-                    match self.store.new_trash_dir() {
-                        Ok(dir) => *trash_dir = Some(dir),
-                        Err(error) => {
+                    let store = self.store.clone();
+                    match blocking(move || store.new_trash_dir()).await {
+                        Ok(Ok(dir)) => *trash_dir = Some(dir),
+                        Ok(Err(error)) => {
                             summary.error(name, format!("创建 trash 目录失败：{error}"));
+                            return;
+                        }
+                        Err(error) => {
+                            summary.error(name, error);
                             return;
                         }
                     }
                 }
-                let dir = trash_dir.as_ref().expect("trash 目录已创建");
-                if let Err(error) = self.store.trash(dir, name, &local.bytes) {
-                    summary.error(name, format!("备份到 trash 失败：{error}"));
-                    return;
+                let dir = trash_dir.clone().expect("trash 目录已创建");
+                let store = self.store.clone();
+                let trash_name = name.to_string();
+                let trash_bytes = local.bytes.clone();
+                match blocking(move || store.trash(&dir, &trash_name, &trash_bytes)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        summary.error(name, format!("备份到 trash 失败：{error}"));
+                        return;
+                    }
+                    Err(error) => {
+                        summary.error(name, error);
+                        return;
+                    }
                 }
-                if let Err(error) = self.remove_local(name, Some(local.sha256.as_str())) {
+                if let Err(error) = self.remove_local(name, Some(local.sha256.clone())).await {
                     summary.error(name, error);
                     return;
                 }
-                self.forget(name);
+                self.forget(name).await;
                 summary.deleted += 1;
             }
-            Action::Forget => self.forget(name),
+            Action::Forget => self.forget(name).await,
         }
     }
 
@@ -730,7 +774,10 @@ impl<B: SyncBackend> SyncEngine<B> {
             summary.error(name, "无法生成冲突副本名");
             return;
         };
-        if let Err(error) = self.write_local(&conflict, remote_text.as_bytes(), LocalExpect::Any) {
+        if let Err(error) = self
+            .write_local(&conflict, remote_text.as_bytes().to_vec(), LocalExpect::Any)
+            .await
+        {
             summary.error(name, error);
             return;
         }
@@ -747,7 +794,7 @@ impl<B: SyncBackend> SyncEngine<B> {
             .await
         {
             Ok(version) => {
-                self.commit(name, &local.bytes, version, summary);
+                self.commit(name, &local.bytes, version, summary).await;
                 summary.conflicts += 1;
                 summary
                     .warnings
@@ -757,111 +804,145 @@ impl<B: SyncBackend> SyncEngine<B> {
         }
     }
 
-    fn commit(
+    async fn commit(
         &mut self,
         name: &str,
         bytes: &[u8],
         version: RemoteVersion,
         summary: &mut SyncSummary,
     ) {
-        let path = self.notes_dir.join(name);
-        let (size, modified) = match fs::metadata(&path) {
-            Ok(meta) => (meta.len(), mtime_ns(meta.modified().unwrap_or(UNIX_EPOCH))),
-            Err(_) => (bytes.len() as u64, 0),
-        };
-        let sha = sha256_base64(bytes);
-        if let Err(error) = self.store.write_base(name, bytes) {
-            summary
-                .warnings
-                .push(format!("{name}：保存 base 副本失败（{error}）"));
-        }
-        self.state.files.insert(
-            name.to_string(),
-            FileRecord {
+        let notes_dir = self.notes_dir.clone();
+        let store = self.store.clone();
+        let owned_name = name.to_string();
+        let owned_bytes = bytes.to_vec();
+        let prepared = blocking(move || {
+            let path = notes_dir.join(&owned_name);
+            let (size, modified) = match fs::metadata(&path) {
+                Ok(meta) => (meta.len(), mtime_ns(meta.modified().unwrap_or(UNIX_EPOCH))),
+                Err(_) => (owned_bytes.len() as u64, 0),
+            };
+            let sha = sha256_base64(&owned_bytes);
+            let base_result = store.write_base(&owned_name, &owned_bytes);
+            let record = FileRecord {
                 local_mtime_ns: modified,
                 local_size: size,
                 local_sha256: sha.clone(),
                 remote_version: version,
                 remote_sha256: sha,
                 synced_at: now_iso(),
-            },
-        );
-        if let Err(error) = self.store.save(&self.state) {
-            summary.error(name, format!("保存同步状态失败：{error}"));
+            };
+            (record, base_result)
+        })
+        .await;
+
+        let (record, base_result) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                summary.error(name, error);
+                return;
+            }
+        };
+        if let Err(error) = base_result {
+            summary
+                .warnings
+                .push(format!("{name}：保存 base 副本失败（{error}）"));
+        }
+        self.state.files.insert(name.to_string(), record);
+
+        let store = self.store.clone();
+        let snapshot = self.state.clone();
+        match blocking(move || store.save(&snapshot)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => summary.error(name, format!("保存同步状态失败：{error}")),
+            Err(error) => summary.error(name, error),
         }
     }
 
-    fn forget(&mut self, name: &str) {
+    async fn forget(&mut self, name: &str) {
         self.state.files.remove(name);
-        self.store.remove_base(name);
-        let _ = self.store.save(&self.state);
+        let store = self.store.clone();
+        let owned_name = name.to_string();
+        let snapshot = self.state.clone();
+        let _ = blocking(move || {
+            store.remove_base(&owned_name);
+            let _ = store.save(&snapshot);
+        })
+        .await;
     }
 
-    fn write_local(
+    async fn write_local(
         &self,
         name: &str,
-        bytes: &[u8],
-        expect: LocalExpect<'_>,
+        bytes: Vec<u8>,
+        expect: LocalExpect,
     ) -> Result<(), SyncError> {
-        if !is_valid_note_name(name) {
-            return Err(SyncError::Other(format!("文件名不合法：{name}")));
-        }
-        let path = self.notes_dir.join(name);
-        {
-            let _guard = self
-                .io
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match expect {
-                LocalExpect::Absent => {
-                    if path.exists() {
-                        return Err(SyncError::Other(format!(
-                            "{name}：本地文件在同步期间出现，已跳过写入"
-                        )));
-                    }
-                }
-                LocalExpect::Sha(expected) => {
-                    let current = fs::read(&path)
-                        .map_err(|error| SyncError::Io(format!("读取 {name} 失败：{error}")))?;
-                    if sha256_base64(&current) != expected {
-                        return Err(SyncError::Other(format!(
-                            "{name}：本地文件在同步期间被修改，已跳过写入"
-                        )));
-                    }
-                }
-                LocalExpect::Any => {}
+        let notes_dir = self.notes_dir.clone();
+        let io = self.io.clone();
+        let owned_name = name.to_string();
+        blocking(move || {
+            if !is_valid_note_name(&owned_name) {
+                return Err(SyncError::Other(format!("文件名不合法：{owned_name}")));
             }
-            write_atomic(&path, bytes)
-                .map_err(|error| SyncError::Io(format!("写入 {name} 失败：{error}")))?;
-        }
-        notes::invalidate_cache(&path);
-        Ok(())
+            let path = notes_dir.join(&owned_name);
+            {
+                let _guard = io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                match expect {
+                    LocalExpect::Absent => {
+                        if path.exists() {
+                            return Err(SyncError::Other(format!(
+                                "{owned_name}：本地文件在同步期间出现，已跳过写入"
+                            )));
+                        }
+                    }
+                    LocalExpect::Sha(expected) => {
+                        let current = fs::read(&path).map_err(|error| {
+                            SyncError::Io(format!("读取 {owned_name} 失败：{error}"))
+                        })?;
+                        if sha256_base64(&current) != expected {
+                            return Err(SyncError::Other(format!(
+                                "{owned_name}：本地文件在同步期间被修改，已跳过写入"
+                            )));
+                        }
+                    }
+                    LocalExpect::Any => {}
+                }
+                write_atomic(&path, &bytes)
+                    .map_err(|error| SyncError::Io(format!("写入 {owned_name} 失败：{error}")))?;
+            }
+            notes::invalidate_cache(&path);
+            Ok(())
+        })
+        .await?
     }
 
-    fn remove_local(&self, name: &str, expected: Option<&str>) -> Result<(), SyncError> {
-        if !is_valid_note_name(name) {
-            return Err(SyncError::Other(format!("文件名不合法：{name}")));
-        }
-        let path = self.notes_dir.join(name);
-        {
-            let _guard = self
-                .io
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(expected) = expected {
-                let current = fs::read(&path)
-                    .map_err(|error| SyncError::Io(format!("读取 {name} 失败：{error}")))?;
-                if sha256_base64(&current) != expected {
-                    return Err(SyncError::Other(format!(
-                        "{name}：本地文件在同步期间被修改，已取消删除"
-                    )));
-                }
+    async fn remove_local(&self, name: &str, expected: Option<String>) -> Result<(), SyncError> {
+        let notes_dir = self.notes_dir.clone();
+        let io = self.io.clone();
+        let owned_name = name.to_string();
+        blocking(move || {
+            if !is_valid_note_name(&owned_name) {
+                return Err(SyncError::Other(format!("文件名不合法：{owned_name}")));
             }
-            fs::remove_file(&path)
-                .map_err(|error| SyncError::Io(format!("删除 {name} 失败：{error}")))?;
-        }
-        notes::invalidate_cache(&path);
-        Ok(())
+            let path = notes_dir.join(&owned_name);
+            {
+                let _guard = io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(expected) = expected {
+                    let current = fs::read(&path).map_err(|error| {
+                        SyncError::Io(format!("读取 {owned_name} 失败：{error}"))
+                    })?;
+                    if sha256_base64(&current) != expected {
+                        return Err(SyncError::Other(format!(
+                            "{owned_name}：本地文件在同步期间被修改，已取消删除"
+                        )));
+                    }
+                }
+                fs::remove_file(&path)
+                    .map_err(|error| SyncError::Io(format!("删除 {owned_name} 失败：{error}")))?;
+            }
+            notes::invalidate_cache(&path);
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -1506,13 +1587,12 @@ mod tests {
         let engine = harness.engine();
         harness.write("2026-10-23.md", "new\n");
 
-        let error = engine
-            .write_local(
-                "2026-10-23.md",
-                b"remote\n",
-                LocalExpect::Sha(stale.as_str()),
-            )
-            .unwrap_err();
+        let error = tauri::async_runtime::block_on(engine.write_local(
+            "2026-10-23.md",
+            b"remote\n".to_vec(),
+            LocalExpect::Sha(stale),
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("同步期间被修改"), "{error}");
         assert_eq!(harness.read("2026-10-23.md"), "new\n");
     }
@@ -1525,9 +1605,9 @@ mod tests {
         let engine = harness.engine();
         harness.write("2026-10-23.md", "new\n");
 
-        let error = engine
-            .remove_local("2026-10-23.md", Some(stale.as_str()))
-            .unwrap_err();
+        let error =
+            tauri::async_runtime::block_on(engine.remove_local("2026-10-23.md", Some(stale)))
+                .unwrap_err();
         assert!(error.to_string().contains("同步期间被修改"), "{error}");
         assert!(harness.notes.join("2026-10-23.md").exists());
     }

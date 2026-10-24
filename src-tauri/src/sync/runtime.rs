@@ -260,7 +260,16 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
         sync.username.trim()
     );
     let store = StateStore::with_remote(&config_dir, &notes_dir, &remote_key);
-    let mut engine = SyncEngine::new(backend, store, notes_dir, &sync.device_label(), io);
+    let device = sync.device_label();
+    // StateStore::load 会读 state.json；连同引擎构造一起放进阻塞线程池。
+    let mut engine = match tauri::async_runtime::spawn_blocking(move || {
+        SyncEngine::new(backend, store, notes_dir, &device, io)
+    })
+    .await
+    {
+        Ok(engine) => engine,
+        Err(error) => return RoundOutcome::Failed(format!("同步引擎初始化失败：{error}")),
+    };
 
     RoundOutcome::Done(engine.run().await, degraded)
 }
