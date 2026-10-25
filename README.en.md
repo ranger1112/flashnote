@@ -203,7 +203,7 @@ Uninstall: Windows "Settings → Apps", or run `uninstall.exe` in the install di
 An installer built from source is located at:
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.5.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\FlashNote_0.5.0_x64-setup.exe
 ```
 
 ## Development
@@ -246,7 +246,7 @@ npm run tauri build
 Outputs:
 
 - Executable: `src-tauri\target\release\flashnote.exe`
-- NSIS installer: `src-tauri\target\release\bundle\nsis\闪记_0.5.0_x64-setup.exe`
+- NSIS installer: `src-tauri\target\release\bundle\nsis\FlashNote_0.5.0_x64-setup.exe`
 
 ### Testing
 
@@ -366,7 +366,7 @@ By default in `%USERPROFILE%\Documents\FlashNote`, one Markdown file per date; y
 
 **How do I uninstall it?**
 
-Uninstall "闪记" from Windows "Settings → Apps", or run `uninstall.exe` in the install directory (`%LOCALAPPDATA%\闪记`). Your notes directory is not deleted; remove it manually if needed.
+Uninstall "FlashNote" (闪记) from Windows "Settings → Apps", or run `uninstall.exe` in the install directory (`%LOCALAPPDATA%\FlashNote`). Your notes directory is not deleted; remove it manually if needed.
 
 **Why does Windows say "Windows protected your PC"?**
 

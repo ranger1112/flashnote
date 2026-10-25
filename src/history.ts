@@ -11,6 +11,7 @@ import { ui } from "./dom";
 import { settings } from "./settings-store";
 import { hideUndoBar, showUndoBar, toast } from "./toast";
 import { hidePanel, showPanel } from "./panels";
+import { markSyncPending } from "./sync";
 
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
@@ -111,6 +112,7 @@ async function commitPendingDelete(): Promise<void> {
       time: pending.note.time,
       content: pending.note.content,
     });
+    markSyncPending();
     // 删除完成前发出的列表请求，返回结果里还带着这条笔记，直接作废
     searchSeq += 1;
     // 服务端少了一条，后续分页偏移要跟着回退，否则「加载更多」会跳过一条
@@ -190,6 +192,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
         content: note.content,
         newContent: value,
       });
+      markSyncPending();
       // 只更新内存里的这条并局部重渲，保留分页 offset 与滚动位置
       note.content = value;
       close();

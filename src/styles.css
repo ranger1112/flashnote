@@ -229,14 +229,54 @@ footer {
 }
 
 .source {
-  max-width: 55%;
+  max-width: 45%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.sync-indicator {
+  flex-shrink: 0;
+  margin-right: auto;
+  white-space: nowrap;
+}
+
+.sync-indicator::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: 1px;
+}
+
+.sync-indicator:empty::before {
+  display: none;
+}
+
+.sync-indicator.pending,
+.sync-indicator.running {
+  color: var(--accent-text);
+}
+
+.sync-indicator.error {
+  color: var(--danger);
+}
+
+.sync-indicator.synced {
+  opacity: 0.75;
+}
+
 .hint {
   white-space: nowrap;
+}
+
+@media (max-width: 450px) {
+  .hint {
+    display: none;
+  }
 }
 
 kbd {

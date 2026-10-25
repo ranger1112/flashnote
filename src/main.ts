@@ -13,7 +13,7 @@ import {
   restoreDraft,
   scheduleDraftSave,
 } from "./draft";
-import { initSync } from "./sync";
+import { initSync, markSyncPending } from "./sync";
 import { initUpdater, startAutoUpdateChecks } from "./updater";
 import {
   closeHistory,
@@ -108,6 +108,8 @@ async function saveNote(): Promise<void> {
   saving = true;
   try {
     const saved = await invoke<SavedNote>("save_note", { content });
+    // 已经在磁盘上产生变更，先标记待同步；真正的同步结果由 sync-status 广播回来。
+    markSyncPending();
     // 保存期间用户可能继续输入：只有内容没变时才清空，否则保留新内容并补一次草稿
     if (ui.textarea.value.trim() === content) {
       ui.textarea.value = "";

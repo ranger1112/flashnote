@@ -53,6 +53,56 @@ function formatTime(iso: string): string {
   return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
+let pendingSince: number | null = null;
+let lastStatus: SyncStatus | null = null;
+
+/** 本地写入成功后调用：下一轮同步开始前显示「待同步」。 */
+export function markSyncPending(): void {
+  if (!settings.sync.enabled) return;
+  pendingSince = Date.now();
+  if (lastStatus) paintSyncIndicator(lastStatus);
+}
+
+function paintSyncIndicator(status: SyncStatus): void {
+  const el = ui.syncIndicator;
+  el.className = "sync-indicator";
+  el.removeAttribute("title");
+  if (!status.configured || !status.enabled) {
+    el.textContent = "";
+    pendingSince = null;
+    return;
+  }
+  if (status.running) {
+    el.textContent = "同步中";
+    el.classList.add("running");
+    return;
+  }
+  if (status.lastError) {
+    el.textContent = "同步失败";
+    el.classList.add("error");
+    el.title = status.lastError;
+    return;
+  }
+  if (pendingSince !== null) {
+    const started = status.summary?.startedAt ? Date.parse(status.summary.startedAt) : NaN;
+    if (!Number.isNaN(started) && started >= pendingSince) {
+      pendingSince = null;
+    }
+  }
+  if (pendingSince !== null) {
+    el.textContent = "待同步";
+    el.classList.add("pending");
+    return;
+  }
+  if (status.lastSyncAt) {
+    el.textContent = "已同步";
+    el.classList.add("synced");
+    el.title = `上次同步 ${formatTime(status.lastSyncAt)}`;
+  } else {
+    el.textContent = "等待同步";
+  }
+}
+
 /** 一句话状态：设置区显示完整版，历史面板只显示第一段。 */
 export function describeStatus(status: SyncStatus): string[] {
   const parts: string[] = [];
@@ -87,6 +137,9 @@ export function describeStatus(status: SyncStatus): string[] {
 }
 
 export function paintSyncStatus(status: SyncStatus): void {
+  lastStatus = status;
+  paintSyncIndicator(status);
+
   ui.syncStatusText.textContent = describeStatus(status).join(" · ");
   ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded));
   ui.syncStatusText.classList.toggle("bad", Boolean(status.lastError));

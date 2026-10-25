@@ -203,7 +203,7 @@ Get-FileHash .\FlashNote_0.5.0_x64-setup.exe -Algorithm SHA256
 从源码构建的安装包位于：
 
 ```
-src-tauri\target\release\bundle\nsis\闪记_0.5.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\FlashNote_0.5.0_x64-setup.exe
 ```
 
 ## 开发
@@ -246,7 +246,7 @@ npm run tauri build
 产物：
 
 - 可执行文件：`src-tauri\target\release\flashnote.exe`
-- NSIS 安装包：`src-tauri\target\release\bundle\nsis\闪记_0.5.0_x64-setup.exe`
+- NSIS 安装包：`src-tauri\target\release\bundle\nsis\FlashNote_0.5.0_x64-setup.exe`
 
 ### 测试
 
@@ -366,7 +366,7 @@ flashnote/
 
 **怎么卸载？**
 
-Windows「设置 → 应用」里卸载「闪记」，或运行安装目录（`%LOCALAPPDATA%\闪记`）下的 `uninstall.exe`。笔记目录不会被删除，需要时手动清理即可。
+Windows「设置 → 应用」里卸载「FlashNote」（闪记），或运行安装目录（`%LOCALAPPDATA%\FlashNote`）下的 `uninstall.exe`。笔记目录不会被删除，需要时手动清理即可。
 
 **为什么 Windows 提示「Windows 已保护你的电脑」？**
 

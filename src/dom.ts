@@ -58,6 +58,7 @@ export const ui = {
   updateBannerAction: el<HTMLButtonElement>("update-banner-action"),
   updateBannerDismiss: el<HTMLButtonElement>("update-banner-dismiss"),
   sourceLabel: el<HTMLSpanElement>("source"),
+  syncIndicator: el<HTMLSpanElement>("sync-indicator"),
   card: el<HTMLDivElement>("card"),
   toastEl: el<HTMLDivElement>("toast"),
   toastMessage: el<HTMLSpanElement>("toast-message"),

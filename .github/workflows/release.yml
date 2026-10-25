@@ -117,8 +117,9 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
-      # 安装包内部文件名是「闪记_<版本>_x64-setup.exe」，上传前统一改成 ASCII，
-      # 避免中文文件名在下载、命令行引用和校验时被转义或剥离。
+      # 安装包内部文件名由 productName 决定，现在是 ASCII 的
+      # 「FlashNote_<版本>_x64-setup.exe」；仍用 assetNamePattern 固定命名，
+      # 避免以后改产品名时影响下载链接。
       - name: 构建并创建 Release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
@@ -153,7 +154,7 @@ jobs:
 
             - 支持 Windows 10 / 11，需要 WebView2 运行时（系统一般已自带）。
             - 安装包未做代码签名，首次运行可能出现 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
-            - 便携版的自动更新会安装到 `%LOCALAPPDATA%\闪记`，届时会变成安装版；想保持纯便携请手动替换 `flashnote.exe`。
+            - 便携版的自动更新会安装到 `%LOCALAPPDATA%\FlashNote`，届时会变成安装版；想保持纯便携请手动替换 `flashnote.exe`。
             - 完整变更见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/CHANGELOG.md)。
 
       - name: 打包便携版
@@ -181,7 +182,7 @@ jobs:
           $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${version}_x64-setup.exe" |
             Select-Object -First 1
           if (-not $installer) {
-            throw "找不到 NSIS 安装包（闪记_${version}_x64-setup.exe）"
+            throw "找不到 NSIS 安装包（FlashNote_${version}_x64-setup.exe）"
           }
 
           $entries = @(

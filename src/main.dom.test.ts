@@ -480,6 +480,56 @@ describe("云同步", () => {
     expect(node<HTMLElement>("#sync-foot-status").textContent).toBe("云同步未启用");
     expect(node<HTMLButtonElement>("#sync-conflicts").hidden).toBe(true);
   });
+
+  it("保存后显示待同步，同步完成后显示已同步", async () => {
+    await boot({
+      get_settings: () => ({
+        ...baseSettings,
+        sync: {
+          ...baseSettings.sync,
+          enabled: true,
+          url: "https://dav.example.com/",
+          username: "alice",
+        },
+      }),
+    });
+    const handler = statusHandler();
+    handler({ payload: syncStatus({ configured: true, enabled: true }) });
+    await flush();
+
+    const textarea = node<HTMLTextAreaElement>("#note");
+    textarea.value = "测试同步状态";
+    textarea.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+
+    expect(node<HTMLElement>("#sync-indicator").textContent).toBe("待同步");
+
+    handler({
+      payload: syncStatus({
+        configured: true,
+        enabled: true,
+        lastSyncAt: "2026-10-25T10:00:00Z",
+        summary: {
+          uploaded: 1,
+          downloaded: 0,
+          merged: 0,
+          deleted: 0,
+          skipped: 0,
+          conflicts: 0,
+          aborted: false,
+          errors: [],
+          warnings: [],
+          startedAt: new Date(Date.now() + 1000).toISOString(),
+          finishedAt: new Date(Date.now() + 2000).toISOString(),
+        },
+      }),
+    });
+    await flush();
+
+    expect(node<HTMLElement>("#sync-indicator").textContent).toBe("已同步");
+  });
 });
 
 describe("草稿", () => {
