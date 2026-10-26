@@ -15,6 +15,13 @@ pub(crate) fn account(url: &str, username: &str) -> String {
     sha256_base64(super::remote_identity(url, username).as_bytes())
 }
 
+/// 0.5.0 的账号名算法：原始 URL 只去掉末尾斜杠。升级后先按新名字查，查不到
+/// 再回退到旧名字，命中后迁移，避免老用户突然「没有保存密码」。
+fn legacy_account(url: &str, username: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    sha256_base64(format!("{}\n{}", url, username.trim()).as_bytes())
+}
+
 /// 保存密码；覆盖已有凭据。
 pub(crate) fn save(url: &str, username: &str, password: &str) -> Result<(), String> {
     imp::save(url, username, password)
@@ -46,9 +53,27 @@ mod imp {
     }
 
     pub(super) fn load(url: &str, username: &str) -> Result<Option<String>, String> {
-        match entry(url, username)?.get_password() {
+        let current = entry(url, username)?;
+        match current.get_password() {
             Ok(password) => Ok(Some(password)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring::Error::NoEntry) => {
+                let legacy_id = legacy_account(url, username);
+                if legacy_id == account(url, username) {
+                    return Ok(None);
+                }
+                let legacy = keyring::Entry::new(SERVICE, &legacy_id)
+                    .map_err(|error| format!("系统凭据存储不可用：{error}"))?;
+                match legacy.get_password() {
+                    Ok(password) => {
+                        // 顺手迁移到新账号名，之后就不用再回退。
+                        let _ = current.set_password(&password);
+                        let _ = legacy.delete_credential();
+                        Ok(Some(password))
+                    }
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(error) => Err(format!("读取密码失败：{error}")),
+                }
+            }
             Err(error) => Err(format!("读取密码失败：{error}")),
         }
     }
@@ -106,6 +131,19 @@ mod tests {
         assert_ne!(a, account("https://dav.example.com/", "bob"));
         assert_ne!(a, account("https://other.example.com/", "alice"));
         assert_eq!(a.len(), 43, "SHA-256 的 Base64url 长度");
+    }
+
+    #[test]
+    fn legacy_account_matches_the_0_5_0_algorithm() {
+        assert_eq!(
+            legacy_account(" https://dav.example.com/dav/ ", " alice "),
+            sha256_base64(b"https://dav.example.com/dav\nalice")
+        );
+        // 大写域名在旧算法里会得到不同的账号，升级时确实需要回退查找。
+        assert_ne!(
+            legacy_account("https://DAV.example.com/dav", "alice"),
+            account("https://DAV.example.com/dav", "alice")
+        );
     }
 
     /// 手动验证 Windows 凭据管理器：`cargo test keyring_round_trip -- --ignored`

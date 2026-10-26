@@ -71,6 +71,24 @@ impl StateStore {
         }
     }
 
+    /// 0.5.0 用「原始 URL」做身份；升级后身份算法变了，旧状态目录会被当成新目录。
+    /// 新目录还不存在时，把旧目录整体改名过来，避免一次全量重合并。
+    pub(crate) fn with_remote_migrating(
+        config_dir: &Path,
+        notes_dir: &Path,
+        remote: &str,
+        legacy_remote: &str,
+    ) -> Self {
+        let store = Self::with_remote(config_dir, notes_dir, remote);
+        if !store.root.exists() && !legacy_remote.trim().is_empty() {
+            let legacy = Self::with_remote(config_dir, notes_dir, legacy_remote);
+            if legacy.root != store.root && legacy.root.exists() {
+                let _ = fs::rename(&legacy.root, &store.root);
+            }
+        }
+        store
+    }
+
     #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
@@ -289,6 +307,30 @@ mod tests {
             second.root(),
             "换服务器不能复用旧状态，否则会把本地笔记误判为远端已删除"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_state_dir_is_reused_after_identity_normalization() {
+        let dir = temp_dir("migrate");
+        let notes = Path::new("D:\\Notes");
+        let legacy_remote = "https://DAV.example.com/dav\nalice";
+        let legacy = StateStore::with_remote(&dir, notes, legacy_remote);
+        fs::create_dir_all(legacy.root()).unwrap();
+        fs::write(legacy.root().join("state.json"), b"{}").unwrap();
+
+        let migrated = StateStore::with_remote_migrating(
+            &dir,
+            notes,
+            "https://dav.example.com/dav\nalice",
+            legacy_remote,
+        );
+        assert!(
+            migrated.root().join("state.json").exists(),
+            "旧状态应被复用"
+        );
+        assert!(!legacy.root().exists(), "旧目录应已改名");
+
         let _ = fs::remove_dir_all(&dir);
     }
 

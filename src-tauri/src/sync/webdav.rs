@@ -443,7 +443,6 @@ impl WebDavBackend {
         timeout: Duration,
     ) -> Result<(Response, Url), SyncError> {
         let origin = origin_of(&url);
-        let secure_origin = url.scheme() == "https";
         let mut current = url;
         let mut method = method;
         let mut body = body;
@@ -508,17 +507,16 @@ impl WebDavBackend {
                     ));
                 }
                 // 恶意或配置错误的服务端可以把 GET 引到内网/回环地址，响应体还会
-                // 被当成笔记内容写盘。跨源目标必须是公网 https。
+                // 被当成笔记内容写盘。跨源目标必须是 https，且不能是字面量私网 IP
+                // （域名不做 DNS 预解析，见协议文档的限制说明）。
                 if next.scheme() != "https" || is_private_host(&next) {
                     return Err(SyncError::Other(
                         "拒绝把请求重定向到非公网 https 目标".into(),
                     ));
                 }
                 with_auth = false;
-            } else if secure_origin && next.scheme() != "https" {
-                // 同源也不允许 https → http 降级：正文与 Basic Auth 会明文出网。
-                return Err(SyncError::Other("拒绝把 https 重定向降级为 http".into()));
             }
+            // 协议降级必然跨源（origin 含 scheme），上面的分支已经拒绝 https→http。
             if status == StatusCode::SEE_OTHER {
                 method = next_method;
                 body = None;
@@ -574,8 +572,8 @@ impl SyncBackend for WebDavBackend {
     async fn exists(&self, name: &str) -> Result<bool, SyncError> {
         let url = self.file_url(name)?;
         match self.propfind(url, "0").await {
-            // 有的服务器用 `207` + 内嵌 404 propstat 表示资源不存在；解析器会把
-            // 这类 response 过滤掉，所以看解析结果而不是只看 HTTP 状态。
+            // 有的服务器用 `207` + 内嵌 404 propstat 表示资源不存在；解析器给每个
+            // response 记了 ok/missing 标记，这里据此判断，而不是只看 HTTP 状态。
             Ok((xml, _)) => match parse_multistatus(&xml) {
                 // 只有明确看到「全是 404」才算不存在；解析成功但没有条目、或同一资源
                 // 有一条非 404 的 response 时，保守当作存在，避免误覆盖远端。
@@ -633,8 +631,8 @@ impl SyncBackend for WebDavBackend {
             }
         }
 
-        // 预留「写 + 回读（+ 补写）」的预算：写到一半没预算会让记录不提交。
-        self.reserve_budget(if conditional { 1 } else { 3 })?;
+        // 预留「写 + 回读（+ 补写 + 再回读）」的预算：写到一半没预算会让记录不提交。
+        self.reserve_budget(if conditional { 1 } else { 4 })?;
         let mut response = self
             .request(
                 Method::PUT,
@@ -711,8 +709,8 @@ impl SyncBackend for WebDavBackend {
                 self.check_version(&url, version, sha256.as_deref()).await?;
             }
         }
-        // 条件删除 1 个请求；非条件删除前面还要 GET 复核，预留 2 个。
-        self.reserve_budget(if conditional { 1 } else { 2 })?;
+        // 无论条件与否，这里都只剩 DELETE 本身（非条件路径的 GET 复核已经执行过）。
+        self.reserve_budget(1)?;
         let (response, _) = self
             .request(Method::DELETE, url, headers, None, REQUEST_TIMEOUT)
             .await?;
@@ -782,13 +780,27 @@ fn parse_ip(host: &str) -> Option<std::net::IpAddr> {
 fn is_private_host(url: &Url) -> bool {
     match url.host_str() {
         Some(host) if host.eq_ignore_ascii_case("localhost") => true,
-        Some(host) => parse_ip(host).is_some_and(|ip| match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        }),
+        // 只判断字面量 IP：在请求路径里做 DNS 解析既阻塞又可能被 DNS 重绑定绕过。
+        Some(host) => parse_ip(host).is_some_and(is_private_ip),
         None => true,
+    }
+}
+
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(std::net::IpAddr::V4(v4));
+            }
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 唯一本地地址
+                || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
+        }
     }
 }
 
@@ -820,7 +832,10 @@ fn is_redirect(status: StatusCode) -> bool {
 fn map_status(context: &str, response: &Response) -> SyncError {
     let status = response.status();
     match status.as_u16() {
-        401 | 403 => SyncError::Auth(format!("{context}：HTTP {}", status.as_u16())),
+        401 => SyncError::Auth(format!("{context}：HTTP {}", status.as_u16())),
+        // 403 多半是单个资源权限（只读、共享目录 ACL），不是密码错误，
+        // 不能让它中止整轮同步。
+        403 => SyncError::Forbidden(format!("{context}：HTTP {}", status.as_u16())),
         404 => SyncError::NotFound,
         405 | 501 => SyncError::Unsupported(format!("{context}：HTTP {}", status.as_u16())),
         412 => SyncError::VersionMismatch,
@@ -961,7 +976,9 @@ async fn read_limited(
         }
         bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes).map_err(|_| SyncError::Unsupported(format!("{label}不是 UTF-8")))
+    // 列表按有损解码处理：少数服务器输出非 UTF-8 的 XML，整轮失败比丢几个
+    // 属性更糟；文件名仍会经过白名单校验。
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `HTTP/1.1 404 Not Found` → `404`。

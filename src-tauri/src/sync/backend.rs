@@ -62,7 +62,10 @@ pub(crate) enum Expect {
 #[derive(Clone, Debug)]
 pub(crate) enum SyncError {
     Network(String),
+    /// 401：凭据无效/过期，整轮中止。
     Auth(String),
+    /// 403：权限不足。通常只针对单个文件（只读、ACL），不应中止整轮。
+    Forbidden(String),
     RateLimited {
         retry_after_secs: Option<u64>,
     },
@@ -117,6 +120,7 @@ impl fmt::Display for SyncError {
         match self {
             SyncError::Network(message) => write!(f, "网络错误：{message}"),
             SyncError::Auth(message) => write!(f, "认证失败：{message}"),
+            SyncError::Forbidden(message) => write!(f, "没有权限：{message}"),
             SyncError::RateLimited { .. } => write!(f, "请求过于频繁，稍后自动重试"),
             SyncError::Locked => write!(f, "文件被服务器锁定，稍后自动重试"),
             SyncError::Quota => write!(f, "远端空间不足"),

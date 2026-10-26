@@ -255,7 +255,14 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
     let notes_dir = PathBuf::from(&settings.notes_dir);
     // 只差末尾斜杠、大小写或 query 的地址是同一个远端，状态目录不能因此换一份。
     let remote_key = super::remote_identity(&sync.url, &sync.username);
-    let store = StateStore::with_remote(&config_dir, &notes_dir, &remote_key);
+    // 0.5.0 用原始 URL 做身份；旧目录存在时直接复用，避免升级后全量重合并。
+    let legacy_key = format!(
+        "{}\n{}",
+        sync.url.trim().trim_end_matches('/'),
+        sync.username.trim()
+    );
+    let store =
+        StateStore::with_remote_migrating(&config_dir, &notes_dir, &remote_key, &legacy_key);
     let device = sync.device_label();
     // StateStore::load 会读 state.json；连同引擎构造一起放进阻塞线程池。
     let mut engine = match tauri::async_runtime::spawn_blocking(move || {
