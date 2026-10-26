@@ -285,23 +285,35 @@ pub(crate) fn parse_block(block: &RawEntry) -> Option<(String, String, Option<St
     if compact && !first_head.is_empty() {
         content.push(first_head.clone());
     }
-    // 紧凑模式的围栏可能直接写在条目头里：`- 10:00 ```js`
+    let body = &block.lines[1..];
+    // 先标出哪些行在代码围栏内：围栏里的来源行只是正文。
+    let mut fenced = Vec::with_capacity(body.len());
     let mut open_fence = fence_marker(&first_head);
-
-    for line in &block.lines[1..] {
+    for line in body {
         if let Some(open) = open_fence {
-            // 围栏内的内容原样保留，`<!-- 来源：… -->` 只是正文
-            content.push(content_line(line, compact));
+            fenced.push(true);
             if closes_fence(line, open) {
                 open_fence = None;
             }
+        } else {
+            fenced.push(false);
+            open_fence = fence_marker(line);
+        }
+    }
+    // 只有块尾最后一个非空行才是来源。正文中间形似 `_来源：…_` 的行必须原样保留，
+    // 否则用户写到「来源」二字（或粘贴类似片段）时，整行会被吞掉并改写语义。
+    let source_index = body
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .filter(|index| !fenced[*index])
+        .filter(|index| source_line(&body[*index]).is_some());
+
+    for (index, line) in body.iter().enumerate() {
+        if Some(index) == source_index {
+            source = source_line(line);
             continue;
         }
-        if let Some(value) = source_line(line) {
-            source = Some(value);
-            continue;
-        }
-        open_fence = fence_marker(line);
+        // 围栏内的内容原样保留，`<!-- 来源：… -->` 只是正文
         content.push(content_line(line, compact));
     }
 
@@ -520,6 +532,12 @@ fn with_cache<T>(action: impl FnOnce(&mut HashMap<PathBuf, CachedFile>) -> T) ->
 /// 我们自己改写文件后立刻让缓存失效，不依赖文件系统时间戳的精度。
 pub fn invalidate_cache(path: &Path) {
     with_cache(|cache| cache.remove(path));
+}
+
+/// 清空整个解析缓存。改写路径拿到的可能是一份 canonicalize 过的路径，和
+/// 缓存键（`notes_dir.join(name)`）不一定逐字相等，直接全清最稳妥。
+pub(crate) fn invalidate_all() {
+    with_cache(|cache| cache.clear());
 }
 
 /// 读取并解析一个日期文件；命中缓存时只需一次 stat，不用读盘和重新解析。
@@ -856,6 +874,15 @@ mod tests {
         assert_eq!(entries[0].1, "正文");
         assert_eq!(entries[1].0, "14:00");
         assert_eq!(entries[1].1, "新条目");
+    }
+
+    #[test]
+    fn source_like_line_in_the_middle_stays_content() {
+        let text = "- 10:00 a\n  _来源：会议记录_\n  正文\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, None, "只有块尾的来源行才算来源");
+        assert_eq!(entries[0].1, "a\n_来源：会议记录_\n正文");
     }
 
     #[test]

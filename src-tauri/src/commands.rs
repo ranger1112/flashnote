@@ -272,16 +272,9 @@ pub fn set_pinned(app: AppHandle, state: State<'_, AppState>, pinned: bool) -> R
 
 #[tauri::command]
 pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String> {
-    let dir = {
-        let handle = app.clone();
-        run_blocking(move || {
-            let state = handle.state::<AppState>();
-            // 网络目录掉线时 create_dir_all 会阻塞很久，别让并发的笔记读写跟着卡住
-            let _guard = io_guard(&state);
-            files::ensure_writable_dir(&path)
-        })
-        .await?
-    };
+    // 网络目录掉线时 create_dir_all 会阻塞很久：探测不能持 io_guard，
+    // 否则所有笔记读写都会排在后面等这次超时。
+    let dir = run_blocking(move || files::ensure_writable_dir(&path)).await?;
     {
         let state = app.state::<AppState>();
         state

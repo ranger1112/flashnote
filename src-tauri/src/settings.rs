@@ -180,7 +180,7 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     let mut warning = None;
 
     let mut settings = match fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
+        Ok(raw) => match parse_settings(&raw) {
             // 手工编辑出的非法值只纠正字段，不把整份设置当成损坏
             Ok(mut parsed) => {
                 parsed.theme = normalize_theme(&parsed.theme);
@@ -215,6 +215,54 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     settings.notes_dir = absolute_notes_dir(&settings.notes_dir);
 
     LoadedSettings { settings, warning }
+}
+
+/// 宽松解析：单个字段类型写错（例如 `intervalMinutes` 写成字符串）时只丢弃该
+/// 字段，其余设置照常读取。整份回退默认会让笔记目录一并丢失，用户会以为笔记没了。
+fn parse_settings(raw: &str) -> Result<Settings, serde_json::Error> {
+    match serde_json::from_str::<Settings>(raw) {
+        Ok(settings) => Ok(settings),
+        Err(first_error) => {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+                return Err(first_error);
+            };
+            let defaults = serde_json::to_value(Settings::default()).ok();
+            if let (Some(object), Some(defaults)) = (
+                value.as_object_mut(),
+                defaults.as_ref().and_then(|value| value.as_object()),
+            ) {
+                object.retain(|key, item| match defaults.get(key) {
+                    // 未知字段保留下来，避免把新版本的设置写回旧格式时丢掉。
+                    None => true,
+                    Some(expected) => json_kind(expected) == json_kind(item),
+                });
+                for (key, item) in object.iter_mut() {
+                    let Some(expected) = defaults.get(key).and_then(|value| value.as_object())
+                    else {
+                        continue;
+                    };
+                    if let Some(nested) = item.as_object_mut() {
+                        nested.retain(|key, item| match expected.get(key) {
+                            None => true,
+                            Some(expected) => json_kind(expected) == json_kind(item),
+                        });
+                    }
+                }
+            }
+            serde_json::from_value(value).map_err(|_| first_error)
+        }
+    }
+}
+
+fn json_kind(value: &serde_json::Value) -> u8 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(_) => 2,
+        serde_json::Value::String(_) => 3,
+        serde_json::Value::Array(_) => 4,
+        serde_json::Value::Object(_) => 5,
+    }
 }
 
 /// 把相对路径固定成基于当前 CWD 的绝对路径。不碰文件系统，也不会引入 `\\?\` 前缀。
@@ -285,6 +333,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn wrong_field_type_only_drops_that_field() {
+        let dir = temp_dir("wrong-type");
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"notesDir":"D:\\Notes","theme":"dark","sync":{"enabled":"yes","url":"https://dav.example.com/","intervalMinutes":"15"}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings.notes_dir, "D:\\Notes");
+        assert_eq!(loaded.settings.theme, "dark");
+        assert_eq!(loaded.settings.sync.url, "https://dav.example.com/");
+        assert!(!loaded.settings.sync.enabled, "类型不符的字段回退默认值");
+        assert_eq!(loaded.settings.sync.interval_minutes, 5);
+        assert!(loaded.warning.is_none(), "不应整份当成损坏");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
