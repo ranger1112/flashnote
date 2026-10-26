@@ -43,7 +43,7 @@ const MAX_RETRIES: u32 = 2;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const DEPTH_HEADER: HeaderName = HeaderName::from_static("depth");
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct WebDavConfig {
     /// 用户填写的根地址，例如 `https://dav.jianguoyun.com/dav/`。
     pub url: String,
@@ -51,6 +51,18 @@ pub(crate) struct WebDavConfig {
     pub password: String,
     /// 允许非回环地址使用明文 `http://`。
     pub allow_insecure_http: bool,
+}
+
+impl std::fmt::Debug for WebDavConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 密码绝不进日志：手写 Debug，避免以后有人 `{:?}` 整个结构体。
+        f.debug_struct("WebDavConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
 }
 
 pub(crate) struct WebDavBackend {
@@ -419,6 +431,7 @@ impl WebDavBackend {
         timeout: Duration,
     ) -> Result<(Response, Url), SyncError> {
         let origin = origin_of(&url);
+        let secure_origin = url.scheme() == "https";
         let mut current = url;
         let mut method = method;
         let mut body = body;
@@ -482,7 +495,17 @@ impl WebDavBackend {
                         "拒绝把带正文的请求重定向到其他主机".into(),
                     ));
                 }
+                // 恶意或配置错误的服务端可以把 GET 引到内网/回环地址，响应体还会
+                // 被当成笔记内容写盘。跨源目标必须是公网 https。
+                if next.scheme() != "https" || is_private_host(&next) {
+                    return Err(SyncError::Other(
+                        "拒绝把请求重定向到非公网 https 目标".into(),
+                    ));
+                }
                 with_auth = false;
+            } else if secure_origin && next.scheme() != "https" {
+                // 同源也不允许 https → http 降级：正文与 Basic Auth 会明文出网。
+                return Err(SyncError::Other("拒绝把 https 重定向降级为 http".into()));
             }
             if status == StatusCode::SEE_OTHER {
                 method = next_method;
@@ -727,13 +750,29 @@ pub(crate) fn validate_url(raw: &str, allow_insecure_http: bool) -> Result<(), S
 
 fn is_loopback(url: &Url) -> bool {
     match url.host_str() {
-        Some(host) => {
-            host.eq_ignore_ascii_case("localhost")
-                || host == "::1"
-                || host == "[::1]"
-                || host.starts_with("127.")
-        }
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        // 必须解析成 IP：`127.evil.example` 这类域名不是回环地址。
+        Some(host) => parse_ip(host).is_some_and(|ip| ip.is_loopback()),
         None => false,
+    }
+}
+
+/// 解析 host（去掉 IPv6 的方括号）；域名返回 None。
+fn parse_ip(host: &str) -> Option<std::net::IpAddr> {
+    host.trim_matches(['[', ']']).parse().ok()
+}
+
+/// 跨源重定向的目标不允许指向回环、私网或链路本地地址（SSRF 防护）。
+fn is_private_host(url: &Url) -> bool {
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => parse_ip(host).is_some_and(|ip| match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        }),
+        None => true,
     }
 }
 
@@ -1036,6 +1075,8 @@ mod tests {
         assert!(parse_root("http://example.com/dav", true).is_ok());
         assert!(parse_root("http://127.0.0.1:5000", false).is_ok());
         assert!(parse_root("http://localhost:5000/", false).is_ok());
+        // 前缀像回环的域名不是回环地址，明文仍然需要显式允许。
+        assert!(parse_root("http://127.0.0.1.example.com/dav", false).is_err());
         assert!(parse_root("https://dav.example.com", false).is_ok());
     }
 
@@ -1493,11 +1534,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirects_are_followed_without_leaking_credentials() {
-        let target = MockServer::start().await;
+    async fn same_origin_redirects_keep_credentials() {
+        let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(
+                ResponseTemplate::new(301).insert_header("location", "/flashnote/notes/moved.md"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/moved.md"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let (bytes, _) = backend_with(&server, STRONG)
+            .get("2026-10-23.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"hello");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .all(|request| request.headers.get("authorization").is_some()));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_to_private_host_is_rejected() {
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
             .mount(&target)
             .await;
 
@@ -1505,21 +1576,42 @@ mod tests {
         let location = format!("{}/flashnote/notes/2026-10-23.md", target.uri());
         Mock::given(method("GET"))
             .and(path("/flashnote/notes/2026-10-23.md"))
-            .respond_with(ResponseTemplate::new(301).insert_header("location", location))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
             .mount(&origin)
             .await;
 
-        let (bytes, _) = backend_with(&origin, STRONG)
+        let error = backend_with(&origin, STRONG)
             .get("2026-10-23.md")
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(bytes, b"hello");
+            .unwrap_err();
+        assert!(matches!(error, SyncError::Other(_)), "{error}");
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
 
-        let origin_requests = origin.received_requests().await.unwrap();
-        assert!(origin_requests[0].headers.get("authorization").is_some());
-        let target_requests = target.received_requests().await.unwrap();
-        assert!(target_requests[0].headers.get("authorization").is_none());
+    #[test]
+    fn loopback_detection_requires_a_real_ip() {
+        let parse = |value: &str| Url::parse(value).unwrap();
+        assert!(is_loopback(&parse("http://127.0.0.1:5000/")));
+        assert!(is_loopback(&parse("http://[::1]:5000/")));
+        assert!(is_loopback(&parse("http://localhost:5000/")));
+        assert!(!is_loopback(&parse("http://127.0.0.1.example.com/")));
+        assert!(!is_loopback(&parse("http://127.attacker.tld/")));
+        assert!(is_private_host(&parse("https://10.0.0.5/")));
+        assert!(is_private_host(&parse("https://[::1]/")));
+        assert!(!is_private_host(&parse("https://dav.example.com/")));
+    }
+
+    #[test]
+    fn debug_output_redacts_the_password() {
+        let config = WebDavConfig {
+            url: "https://dav.example.com/dav/".into(),
+            username: "ranger".into(),
+            password: "top-secret".into(),
+            allow_insecure_http: false,
+        };
+        let text = format!("{config:?}");
+        assert!(!text.contains("top-secret"), "{text}");
+        assert!(text.contains("***"));
     }
 
     #[tokio::test]
