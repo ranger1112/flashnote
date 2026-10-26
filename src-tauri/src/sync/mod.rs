@@ -138,8 +138,9 @@ fn decide(
                 if caps.supports_deletion() {
                     Action::TrashLocal
                 } else {
-                    // 弱服务器只上传：把本地内容补回远端。
-                    Action::Upload
+                    // 弱服务器只上传：把本地内容补回远端。列表可能漏项，上传前
+                    // 先确认远端确实没有，避免覆盖另一台设备刚写的内容。
+                    Action::UploadRevive
                 }
             }
         };
@@ -334,6 +335,8 @@ pub(crate) struct SyncEngine<B: SyncBackend> {
     device_slug: String,
     state: SyncState,
     state_warning: Option<String>,
+    /// 状态文件读不出来时记在这里；本轮直接中止，不用空状态覆盖原文件。
+    state_error: Option<String>,
     io: Arc<Mutex<()>>,
 }
 
@@ -345,7 +348,14 @@ impl<B: SyncBackend> SyncEngine<B> {
         device_name: &str,
         io: Arc<Mutex<()>>,
     ) -> Self {
-        let (state, state_warning) = store.load();
+        let (state, state_warning, state_error) = match store.load() {
+            Ok((state, warning)) => (state, warning, None),
+            Err(error) => (
+                SyncState::default(),
+                None,
+                Some(format!("读取同步状态失败：{error}")),
+            ),
+        };
         Self {
             backend,
             store,
@@ -353,6 +363,7 @@ impl<B: SyncBackend> SyncEngine<B> {
             device_slug: device_slug(device_name),
             state,
             state_warning,
+            state_error,
             io,
         }
     }
@@ -361,6 +372,13 @@ impl<B: SyncBackend> SyncEngine<B> {
     /// 下一轮会重试。
     pub(crate) async fn run(&mut self) -> SyncSummary {
         let mut summary = SyncSummary::new();
+        if let Some(error) = self.state_error.take() {
+            // 状态暂时读不出来：整轮不动，更不能拿空状态去覆盖原文件。
+            summary.aborted = true;
+            summary.error("同步状态", error);
+            summary.finished_at = Some(now_iso());
+            return summary;
+        }
         if let Some(warning) = self.state_warning.take() {
             summary.warnings.push(warning);
         }
@@ -614,6 +632,14 @@ impl<B: SyncBackend> SyncEngine<B> {
                             .push(format!("{name}：远端文件超过 2 MiB，已跳过"));
                         return;
                     }
+                    // 与扫描、合并使用同一口径：不是 UTF-8 的内容绝不写进本地，
+                    // 否则下一轮会因为无法解析而永远跳过这个文件。
+                    if std::str::from_utf8(&bytes).is_err() {
+                        summary
+                            .warnings
+                            .push(format!("{name}：远端文件不是 UTF-8，已跳过"));
+                        return;
+                    }
                     // 版本令牌可能来自 GET 与 PROPFIND 两个来源。内容与我们上次
                     // 同步的完全一致时，只把列表版本补进记录，避免反复下载。
                     if record
@@ -678,14 +704,26 @@ impl<B: SyncBackend> SyncEngine<B> {
                 };
                 let store = self.store.clone();
                 let base_name = name.to_string();
-                let base = blocking(move || {
-                    store
-                        .read_base(&base_name)
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_default()
-                })
-                .await
-                .unwrap_or_default();
+                // 「没有 base」与「base 读不出来」必须分开：前者是首次合并，按并集
+                // 处理；后者若也当空 base，会把本地删除当成新增而复活条目。
+                let base = match blocking(move || store.read_base(&base_name)).await {
+                    Ok(Ok(None)) => String::new(),
+                    Ok(Ok(Some(bytes))) => match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(_) => {
+                            summary.error(name, "base 副本不是 UTF-8，已跳过本次合并");
+                            return;
+                        }
+                    },
+                    Ok(Err(error)) => {
+                        summary.error(name, format!("读取 base 副本失败，已跳过本次合并：{error}"));
+                        return;
+                    }
+                    Err(error) => {
+                        summary.error(name, error);
+                        return;
+                    }
+                };
 
                 let local_text = local.text.clone();
                 let remote_for_merge = remote_text.clone();
@@ -743,7 +781,11 @@ impl<B: SyncBackend> SyncEngine<B> {
                 let store = self.store.clone();
                 let owned_name = name.to_string();
                 let base = match blocking(move || store.read_base(&owned_name)).await {
-                    Ok(base) => base,
+                    Ok(Ok(base)) => base,
+                    Ok(Err(error)) => {
+                        summary.error(name, format!("读取 base 副本失败：{error}"));
+                        return;
+                    }
                     Err(error) => {
                         summary.error(name, error);
                         return;
@@ -927,9 +969,10 @@ impl<B: SyncBackend> SyncEngine<B> {
             }
         };
         if let Err(error) = base_result {
-            summary
-                .warnings
-                .push(format!("{name}：保存 base 副本失败（{error}）"));
+            // 记录必须与 base 同源：base 没写成功就不能推进状态，否则下一轮会拿
+            // 陈旧 base 做三方合并，把已删除的条目复活。
+            summary.error(name, format!("保存 base 副本失败，本轮不记录：{error}"));
+            return;
         }
         self.state.files.insert(name.to_string(), record);
 
@@ -1373,10 +1416,10 @@ mod tests {
             honors_if_none_match: false,
             reliable_listing: true,
         };
-        // 远端被删 → 把本地补回去，而不是删本地。
+        // 远端被删 → 把本地补回去，而不是删本地；上传前先 exists() 复核。
         assert_eq!(
             decide(&weak, true, LocalState::Unchanged, false, false),
-            Action::Upload
+            Action::UploadRevive
         );
         // 本地删除 → 无法传播；保留记录，避免下一轮重新下载。
         assert_eq!(
@@ -1744,6 +1787,99 @@ mod tests {
             harness.backend.content("2026-10-23.md").is_some(),
             "不能删远端"
         );
+    }
+
+    #[test]
+    fn non_utf8_remote_file_is_not_written_locally() {
+        let backend = FakeBackend::strong();
+        backend.put_remote("2026-10-23.md", vec![0xff, 0xfe, 0x00]);
+        let harness = Harness::with_backend("non-utf8-download", backend);
+
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 0, "{summary:?}");
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("不是 UTF-8")));
+        assert!(!harness.notes.join("2026-10-23.md").exists());
+    }
+
+    #[test]
+    fn unreadable_state_aborts_instead_of_overwriting() {
+        let harness = Harness::new("state-unreadable");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        let state_root = StateStore::new(&harness.config, &harness.notes)
+            .root()
+            .to_path_buf();
+        // 用目录占住 state.json：读取得到 NotFound 以外的错误。
+        fs::create_dir_all(state_root.join("state.json")).unwrap();
+
+        let summary = harness.run();
+        assert!(summary.aborted, "{summary:?}");
+        assert!(summary
+            .errors
+            .iter()
+            .any(|error| error.contains("同步状态")));
+        assert!(harness.backend.names().is_empty());
+    }
+
+    #[test]
+    fn unreadable_base_skips_merge_instead_of_reviving_entries() {
+        let harness = Harness::new("base-unreadable");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        harness.run();
+
+        let state_root = StateStore::new(&harness.config, &harness.notes)
+            .root()
+            .to_path_buf();
+        let base = state_root.join("base").join("2026-10-23.md");
+        fs::remove_file(&base).unwrap();
+        fs::create_dir_all(&base).unwrap();
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n\n- 11:00 b\n");
+        harness.backend.put_remote(
+            "2026-10-23.md",
+            b"# 2026-10-23\n\n- 10:00 a\n\n- 12:00 c\n".to_vec(),
+        );
+
+        let summary = harness.run();
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|error| error.contains("读取 base 副本失败")),
+            "{summary:?}"
+        );
+        assert_eq!(
+            harness.read("2026-10-23.md"),
+            "# 2026-10-23\n\n- 10:00 a\n\n- 11:00 b\n",
+            "base 读不出来时不能拿空 base 合并"
+        );
+    }
+
+    #[test]
+    fn base_write_failure_does_not_advance_state() {
+        let harness = Harness::new("base-write-fail");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        let state_root = StateStore::new(&harness.config, &harness.notes)
+            .root()
+            .to_path_buf();
+        // 让 base 的 rename 目标变成目录，写入必然失败。
+        fs::create_dir_all(state_root.join("base").join("2026-10-23.md")).unwrap();
+
+        let summary = harness.run();
+        assert_eq!(summary.uploaded, 1, "{summary:?}");
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|error| error.contains("保存 base 副本失败")),
+            "{summary:?}"
+        );
+
+        // 记录没有推进：下一轮不能把远端内容当成删除，也不能丢本地修改。
+        let summary = harness.run();
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert!(harness.notes.join("2026-10-23.md").exists());
     }
 
     #[test]
