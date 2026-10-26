@@ -147,6 +147,10 @@ async function boot(
   handlers: Handlers = {},
   prepare?: () => void,
 ): Promise<void> {
+  // 上一轮注册在 window/document 上的监听必须先摘掉，否则旧实例会响应新用例的事件。
+  (
+    globalThis as unknown as { __flashnoteTeardown?: () => void }
+  ).__flashnoteTeardown?.();
   vi.resetModules();
   document.documentElement.innerHTML = `<head></head><body>${BODY_HTML}</body>`;
   window.localStorage.clear();
@@ -400,6 +404,39 @@ describe("云同步", () => {
 
     expect(node<HTMLElement>("#sync-error").textContent).toContain("地址格式不正确");
     expect(node<HTMLInputElement>("#sync-url").value).toBe("http://dav.example.com/");
+  });
+
+  it("密码保存失败时不提示设置已保存", async () => {
+    await boot({
+      update_sync_config: () => syncStatus({ configured: true, enabled: true }),
+      save_sync_password: () => Promise.reject("凭据管理器不可用"),
+    });
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").value = "https://dav.example.com/";
+    node<HTMLInputElement>("#sync-username").value = "alice";
+    node<HTMLInputElement>("#sync-password").value = "secret";
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(node<HTMLElement>("#sync-error").textContent).toContain("密码未能保存");
+    expect(node<HTMLElement>("#toast-message").textContent).not.toContain(
+      "云同步设置已保存",
+    );
+  });
+
+  it("面板打开时 Ctrl+S 不会保存主输入框或收起窗口", async () => {
+    await boot();
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").dispatchEvent(
+      new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+
+    const commands = mocks.invoke.mock.calls.map(([command]) => command);
+    expect(commands).not.toContain("save_note");
+    expect(commands).not.toContain("hide_window");
   });
 
   it("地址变化且密码留空时提示重新输入密码", async () => {

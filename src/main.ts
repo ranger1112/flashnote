@@ -237,6 +237,17 @@ ui.settingsButton.addEventListener("click", openSettings);
 ui.notesButton.addEventListener("click", openHistory);
 ui.closeButton.addEventListener("click", () => void hideWindow());
 
+/**
+ * window/document 上的监听在开发热更新与测试里会跨「安装」累积：旧实例仍会
+ * 响应同一次按键。统一挂在一个 AbortController 上，测试启动新实例前可以清掉。
+ */
+const runtimeListeners = new AbortController();
+if ((import.meta as { env?: { MODE?: string } }).env?.MODE === "test") {
+  (
+    globalThis as unknown as { __flashnoteTeardown?: () => void }
+  ).__flashnoteTeardown = () => runtimeListeners.abort();
+}
+
 window.addEventListener(
   "keydown",
   (event) => {
@@ -267,6 +278,14 @@ window.addEventListener(
       return;
     }
 
+    // 面板打开时 Ctrl+S / Ctrl+Enter 属于面板自己：误按会把主输入框（通常为空）
+    // 当成保存并收起窗口，用户刚填的同步地址与密码全丢。
+    const panelOpen =
+      !ui.settingsPanel.classList.contains("hidden") ||
+      !ui.historyPanel.classList.contains("hidden") ||
+      !ui.welcomePanel.classList.contains("hidden");
+    if (panelOpen) return;
+
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
       void saveNote();
@@ -278,7 +297,7 @@ window.addEventListener(
       void saveNote();
     }
   },
-  true,
+  { capture: true, signal: runtimeListeners.signal },
 );
 
 /**
@@ -301,8 +320,14 @@ function handleLinkActivation(event: MouseEvent): void {
   void invoke("open_external_url", { url }).catch((error) => toast(String(error), true));
 }
 
-document.addEventListener("click", handleLinkActivation, true);
-document.addEventListener("auxclick", handleLinkActivation, true);
+document.addEventListener("click", handleLinkActivation, {
+  capture: true,
+  signal: runtimeListeners.signal,
+});
+document.addEventListener("auxclick", handleLinkActivation, {
+  capture: true,
+  signal: runtimeListeners.signal,
+});
 
 ui.resizeGrip.addEventListener("pointerdown", (event) => {
   event.preventDefault();

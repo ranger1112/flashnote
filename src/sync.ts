@@ -55,6 +55,9 @@ function formatTime(iso: string): string {
 
 let pendingSince: number | null = null;
 let lastStatus: SyncStatus | null = null;
+/// 状态刷新是异步的：慢响应回来时如果已经有更新的状态，直接丢弃。
+let statusSeq = 0;
+let savingConfig = false;
 
 /** 本地写入成功后调用：下一轮同步开始前显示「待同步」。 */
 export function markSyncPending(): void {
@@ -138,7 +141,13 @@ export function describeStatus(status: SyncStatus): string[] {
 
 export function paintSyncStatus(status: SyncStatus): void {
   lastStatus = status;
+  // 有任何更新来源（保存、广播、手动刷新）都作废在途的旧响应。
+  statusSeq += 1;
   paintSyncIndicator(status);
+  if (!status.lastError) {
+    // 同步已经成功：上一次测试/保存留下的红字不能一直挂着。
+    ui.syncError.textContent = "";
+  }
 
   ui.syncStatusText.textContent = describeStatus(status).join(" · ");
   ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded));
@@ -179,31 +188,72 @@ function normalizeSyncUrl(value: string): string {
   return value.trim().replace(/\/+$/, "");
 }
 
+/** 公网明文 http 需要用户再确认一次；本机与私网地址不打扰。 */
+function needsInsecureConfirmation(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:") {
+      return false;
+    }
+    const host = parsed.hostname;
+    const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+    const isPrivate =
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+    return !isLoopback && !isPrivate;
+  } catch {
+    return false;
+  }
+}
+
 async function saveSyncConfig(): Promise<void> {
+  if (savingConfig) {
+    return;
+  }
   ui.syncError.textContent = "";
   const form = readSyncForm();
   const identityChanged =
     normalizeSyncUrl(settings.sync.url) !== normalizeSyncUrl(form.url) ||
     settings.sync.username.trim() !== form.username;
+  if (
+    form.allowInsecureHttp &&
+    needsInsecureConfirmation(form.url) &&
+    typeof window.confirm === "function" &&
+    !window.confirm("这个地址不是本机或内网，笔记与密码会以明文传输。仍要保存吗？")
+  ) {
+    return;
+  }
+
+  savingConfig = true;
+  ui.syncSave.disabled = true;
   try {
     const status = await invoke<SyncStatus>("update_sync_config", {
       config: form,
     });
     // 配置先落盘，再单独保存密码：凭据管理器失败不该回滚服务器地址。
     const password = ui.syncPassword.value;
+    let passwordFailed = false;
     if (password) {
       try {
         const saved = await invoke<PasswordSaveResult>("save_sync_password", { password });
         ui.syncPassword.value = "";
         if (saved.warning) toast(saved.warning, true, 6000);
       } catch (error) {
-        ui.syncError.textContent = String(error);
+        passwordFailed = true;
         toast(String(error), true);
       }
     }
     await refreshSettings();
     paintSyncStatus(status);
-    toast("云同步设置已保存");
+    if (passwordFailed) {
+      // 绝不能用「已保存」盖掉刚刚的密码错误：用户会以为下次启动还能同步。
+      const message = "配置已保存，但密码未能保存；请重试或检查系统凭据管理器";
+      ui.syncError.textContent = message;
+      toast(message, true, 6000);
+    } else {
+      toast("云同步设置已保存");
+    }
     if (identityChanged && !password) {
       // 后端已清掉旧凭据，这里必须明确告诉用户，否则下一轮只会看到“同步失败”。
       const message = "地址或用户名已变更，请重新填写密码";
@@ -213,6 +263,9 @@ async function saveSyncConfig(): Promise<void> {
   } catch (error) {
     ui.syncError.textContent = String(error);
     toast(String(error), true);
+  } finally {
+    savingConfig = false;
+    ui.syncSave.disabled = false;
   }
 }
 
@@ -232,6 +285,10 @@ async function testConnection(): Promise<void> {
   } catch (error) {
     ui.syncError.textContent = String(error);
     toast(String(error), true);
+    // 失败时状态行可能还停在「已连接」，直接改成失败，避免三处信息互相矛盾。
+    ui.syncStatusText.textContent = "测试连接失败";
+    ui.syncStatusText.classList.remove("warn");
+    ui.syncStatusText.classList.add("bad");
   } finally {
     ui.syncTest.disabled = false;
   }
@@ -247,8 +304,13 @@ async function syncNow(): Promise<void> {
 }
 
 export async function refreshSyncStatus(): Promise<void> {
+  const seq = ++statusSeq;
   try {
-    paintSyncStatus(await invoke<SyncStatus>("get_sync_status"));
+    const status = await invoke<SyncStatus>("get_sync_status");
+    if (seq !== statusSeq) {
+      return; // 期间已经有更新的状态，丢弃这份旧快照
+    }
+    paintSyncStatus(status);
   } catch (error) {
     // 状态读不到不影响主流程，下一次广播会补上
     console.error("读取同步状态失败", error);
