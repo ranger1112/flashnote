@@ -238,7 +238,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
 }
 
 /** 列表里是否有尚未提交的条目编辑器；重建列表会连同输入内容一起丢掉。 */
-function hasOpenEditor(): boolean {
+export function hasOpenEditor(): boolean {
   return ui.entryList.querySelector(".entry-edit") !== null;
 }
 
@@ -465,6 +465,12 @@ async function toggleHistoryPreview(): Promise<void> {
 
 /** 重置历史面板状态并加载第一页；关闭其他面板由 main 负责。 */
 export function showHistoryPanel(): void {
+  // 编辑框里还有未保存的改动：不能再重建列表，否则输入被静默丢掉。
+  if (hasOpenEditor()) {
+    showPanel(ui.historyPanel);
+    ui.historySearch.focus();
+    return;
+  }
   showPanel(ui.historyPanel);
   ui.historySearch.value = "";
   notes = [];

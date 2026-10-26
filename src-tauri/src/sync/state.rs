@@ -116,26 +116,34 @@ impl StateStore {
             Ok(state) if state.version <= STATE_VERSION => (state, None),
             Ok(state) => {
                 // 更高版本的状态可能来自新版客户端：先备份再重来，别直接覆盖。
-                let backup = self.backup_corrupt();
-                let detail = backup
-                    .map(|path| format!("，已备份到 {}", path.display()))
-                    .unwrap_or_default();
+                let Some(backup) = self.backup_corrupt() else {
+                    return Err(io::Error::other(format!(
+                        "同步状态版本 {} 高于当前支持，且备份失败",
+                        state.version
+                    )));
+                };
                 (
                     SyncState::default(),
                     Some(format!(
-                        "同步状态版本 {} 高于当前支持的 {STATE_VERSION}，已重新开始{detail}",
-                        state.version
+                        "同步状态版本 {} 高于当前支持的 {STATE_VERSION}，已备份到 {} 并重新开始",
+                        state.version,
+                        backup.display()
                     )),
                 )
             }
             Err(error) => {
-                let backup = self.backup_corrupt();
-                let detail = backup
-                    .map(|path| format!("，已备份到 {}", path.display()))
-                    .unwrap_or_default();
+                // 备份失败时不能用空状态继续：轮末会覆盖掉还有救的原文件。
+                let Some(backup) = self.backup_corrupt() else {
+                    return Err(io::Error::other(format!(
+                        "同步状态已损坏且备份失败：{error}"
+                    )));
+                };
                 (
                     SyncState::default(),
-                    Some(format!("同步状态已损坏（{error}）{detail}")),
+                    Some(format!(
+                        "同步状态已损坏（{error}），已备份到 {}",
+                        backup.display()
+                    )),
                 )
             }
         })

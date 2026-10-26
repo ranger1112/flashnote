@@ -17,6 +17,7 @@ import { initSync, markSyncPending } from "./sync";
 import { initUpdater, startAutoUpdateChecks } from "./updater";
 import {
   closeHistory,
+  hasOpenEditor,
   initHistory,
   paintPreviewButton,
   refreshNotes,
@@ -133,6 +134,11 @@ async function saveNote(): Promise<void> {
 }
 
 function openSettings(): void {
+  // 历史编辑框还有未保存的改动：开设置会把历史面板关掉、输入丢失。
+  if (hasOpenEditor()) {
+    toast("请先保存或取消编辑", true);
+    return;
+  }
   closeHistory(false);
   closeWelcome(false);
   showSettingsPanel();

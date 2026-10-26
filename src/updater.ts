@@ -132,9 +132,11 @@ export function initUpdater(): void {
       // 重启前把设置与同步状态落盘，避免更新后重复合并或重复上传。
       // 落盘失败也要重启，但必须告诉用户这次「尽力了」。
       void invoke("flush_sync_state")
-        .catch((error) => {
+        .catch(async (error) => {
           console.error("保存同步状态失败", error);
           toast("同步状态未能落盘，仍将重启", true);
+          // 留一点时间让提示画出来，否则立刻重启等于没提示。
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
         })
         .finally(() => void relaunch());
     } else {

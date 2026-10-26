@@ -66,7 +66,7 @@ pub fn persist(app: &AppHandle) {
 }
 
 /// 退出路径同步落盘，确保进程结束前最后一次修改不会丢。
-pub fn persist_sync(app: &AppHandle) {
+pub fn persist_sync(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (snapshot, seq) = {
         let settings = state
@@ -76,17 +76,21 @@ pub fn persist_sync(app: &AppHandle) {
         let seq = state.settings_write_seq.fetch_add(1, Ordering::SeqCst) + 1;
         (settings.clone(), seq)
     };
-    write_snapshot(&state, &state.settings_path, seq, &snapshot);
+    if write_snapshot(&state, &state.settings_path, seq, &snapshot) {
+        Ok(())
+    } else {
+        Err("设置（含同步状态）写入失败".to_string())
+    }
 }
 
-fn write_snapshot(state: &AppState, path: &Path, seq: u64, snapshot: &Settings) {
+fn write_snapshot(state: &AppState, path: &Path, seq: u64, snapshot: &Settings) -> bool {
     write_snapshot_locked(
         path,
         seq,
         snapshot,
         &state.settings_last_saved_seq,
         &state.settings_write_lock,
-    );
+    )
 }
 
 /// 写盘成功后才推进 `last_saved`：这样只有「真正落盘的更新快照」会让旧快照跳过。
@@ -123,7 +127,7 @@ pub fn persist_on_exit(app: &AppHandle) {
     }
     // 先让调度线程停下，避免退出过程中再起一轮同步。
     app.state::<AppState>().sync.stop();
-    persist_sync(app);
+    let _ = persist_sync(app);
 }
 
 pub fn show_window_impl(app: &AppHandle) {
@@ -857,7 +861,7 @@ pub fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
 /// 更新程序重启前调用：把还没落盘的设置同步写掉。
 #[tauri::command]
 pub fn flush_sync_state(app: AppHandle) -> Result<(), String> {
-    persist_sync(&app);
+    persist_sync(&app)?;
     Ok(())
 }
 
