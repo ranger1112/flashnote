@@ -689,8 +689,9 @@ pub async fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
 
 /// 两个同步配置是否指向同一远端账号；只差 URL 末尾斜杠视为相同。
 fn same_sync_identity(left: &settings::SyncSettings, right: &settings::SyncSettings) -> bool {
-    left.url.trim().trim_end_matches('/') == right.url.trim().trim_end_matches('/')
-        && left.username.trim() == right.username.trim()
+    // 与凭据、状态目录共用同一份身份：大小写/尾斜杠/query 的差异不算换远端。
+    sync::remote_identity(&left.url, &left.username)
+        == sync::remote_identity(&right.url, &right.username)
 }
 
 #[tauri::command]
