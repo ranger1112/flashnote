@@ -280,11 +280,17 @@ window.addEventListener(
 
     // 面板打开时 Ctrl+S / Ctrl+Enter 属于面板自己：误按会把主输入框（通常为空）
     // 当成保存并收起窗口，用户刚填的同步地址与密码全丢。
-    const panelOpen =
-      !ui.settingsPanel.classList.contains("hidden") ||
-      !ui.historyPanel.classList.contains("hidden") ||
-      !ui.welcomePanel.classList.contains("hidden");
-    if (panelOpen) return;
+    if (anyPanelOpen()) {
+      // 面板内这两个组合键归面板自己：既要拦住保存/收起，也要 preventDefault，
+      // 否则 WebView 可能弹出「保存网页」。
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        (event.key === "Enter" || event.key.toLowerCase() === "s")
+      ) {
+        event.preventDefault();
+      }
+      return;
+    }
 
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !event.isComposing) {
       event.preventDefault();

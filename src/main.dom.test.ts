@@ -406,10 +406,14 @@ describe("云同步", () => {
     expect(node<HTMLInputElement>("#sync-url").value).toBe("http://dav.example.com/");
   });
 
-  it("密码保存失败时不提示设置已保存", async () => {
+  it("密码未持久化时不提示设置已保存", async () => {
     await boot({
       update_sync_config: () => syncStatus({ configured: true, enabled: true }),
-      save_sync_password: () => Promise.reject("凭据管理器不可用"),
+      // 后端在凭据管理器不可用时就是这条路径：Ok + persistent:false。
+      save_sync_password: () => ({
+        persistent: false,
+        warning: "当前系统没有可用的凭据管理器，密码只在本次会话内有效",
+      }),
     });
     await openSettings();
 

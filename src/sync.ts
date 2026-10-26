@@ -186,8 +186,17 @@ function readSyncForm() {
 }
 
 /** 只差末尾斜杠的地址是同一个远端。 */
+/** 与后端 `remote_identity` 同口径：域名大小写、query、尾斜杠都不算换远端。 */
 function normalizeSyncUrl(value: string): string {
-  return value.trim().replace(/\/+$/, "");
+  const trimmed = value.trim();
+  try {
+    const url = new URL(trimmed);
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
 }
 
 /** 公网明文 http 需要用户再确认一次；本机与私网地址不打扰。 */
@@ -241,6 +250,11 @@ async function saveSyncConfig(): Promise<void> {
         const saved = await invoke<PasswordSaveResult>("save_sync_password", { password });
         ui.syncPassword.value = "";
         if (saved.warning) toast(saved.warning, true, 6000);
+        // 凭据管理器不可用时后端仍返回成功（密码只在本次会话内存里），
+        // 这里必须按失败提示，否则用户以为重启后还能同步。
+        if (!saved.persistent) {
+          passwordFailed = true;
+        }
       } catch (error) {
         passwordFailed = true;
         toast(String(error), true);
