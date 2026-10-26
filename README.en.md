@@ -157,9 +157,9 @@ Nextcloud, NAS WebDAV, [dufs](https://github.com/sigoden/dufs), and `rclone serv
 
 - Triggers: 5 seconds after save / delete / edit; first round 60 seconds after launch; then every 5 / 15 / 60 minutes; the tray's "Sync Now" at any time.
 - Only one round runs at a time; triggers during a round queue a follow-up round.
-- Local deletions propagate to the remote; remote deletions move the local copy into `%APPDATA%\com.phoebe.flashnote\sync\<hash>\trash\<timestamp>\`.
+- Local deletions propagate to the remote, but the remote copy is first saved into the local `trash`; remote deletions move the local copy into `%APPDATA%\com.phoebe.flashnote\sync\<hash>\trash\<timestamp>\`.
 - Edits on both sides of the same day are merged entry by entry (time + content + source); when a merge is unsafe, the remote content is saved as `YYYY-MM-DD.conflict-<device>-<timestamp>.md` and the history panel shows "N conflict copies".
-- Safety valve: a round that would delete more than 5 files and more than 30% of tracked files aborts; an unreadable notes directory or a truncated remote listing also disables all deletions for that round.
+- Safety valve: a round aborts if it would delete more than 5 files and more than 30% of tracked files, or if all tracked files (3 or more) disappear locally at once; an unreadable notes directory or a truncated remote listing also disables all deletions for that round.
 - Weak servers (no strong ETag, ignored conditional writes, unreliable listings) are detected automatically and degrade to upload/download only — deletions are never propagated, and the reason is shown in settings.
 - Each round has a request budget; leftover files wait for the next round to avoid rate limits.
 

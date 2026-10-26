@@ -359,9 +359,13 @@ fn entry_header(
     current_is_markdown: bool,
     previous_blank: bool,
 ) -> Option<(String, String)> {
-    if let Some(time) = markdown_time(line) {
-        // Markdown 条目的正文从下一行开始，标题行本身不带内容。
-        return Some((time, String::new()));
+    // 只有第 0 列的 `### HH:MM` 才算条目头。紧凑模式的正文行会缩进两格，
+    // 正文里恰好写成 `### 10:00` 时必须保持为正文，否则整条笔记会被拆开。
+    if !line.starts_with(char::is_whitespace) {
+        if let Some(time) = markdown_time(line) {
+            // Markdown 条目的正文从下一行开始，标题行本身不带内容。
+            return Some((time, String::new()));
+        }
     }
     // Markdown 块正文里的 `- HH:MM` 是普通内容；只有空行之后的列表行才视为新条目（兼容混用格式）。
     if current_is_markdown && !previous_blank {
@@ -825,6 +829,23 @@ mod tests {
         let entries = parse_entries(text);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "- 14:00 评审");
+    }
+
+    #[test]
+    fn indented_markdown_time_inside_compact_body_stays_content() {
+        let text = "- 10:05 上午讨论\n  ### 10:00\n  要点\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "10:05");
+        assert_eq!(entries[0].1, "上午讨论\n### 10:00\n要点");
+    }
+
+    #[test]
+    fn full_width_indented_markdown_time_stays_content() {
+        let text = "- 10:05 上午讨论\n\u{3000}### 10:00\n\u{3000}要点\n";
+        let entries = parse_entries(text);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].1.contains("### 10:00"));
     }
 
     #[test]

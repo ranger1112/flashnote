@@ -366,6 +366,7 @@ mod tests {
         Capabilities {
             strong_etag: true,
             honors_if_match: true,
+            honors_if_none_match: true,
             reliable_listing: true,
         }
     }
