@@ -35,6 +35,9 @@ pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 删除安全阀：超过这个数量、且占比超过阈值才中止。
 const DELETE_MIN_FILES: usize = 5;
 const DELETE_RATIO_PERCENT: usize = 30;
+/// 已跟踪文件同时消失时，即使总数不到阈值也中止：这是「目录被清空 / 挂载失败」
+/// 最典型的形态，小笔记库否则完全没有保护。
+const DELETE_ALL_MIN_FILES: usize = 3;
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,7 +112,10 @@ fn decide(
 ) -> Action {
     if !has_record {
         return match (local != LocalState::Absent, remote_present) {
-            (true, false) => Action::Upload,
+            // 列表不可靠时无法断定远端真的没有这个文件：先 exists() 复核再写，
+            // 否则首轮同步或列表被截断时会覆盖另一台设备刚创建的笔记。
+            (true, false) if caps.reliable_listing => Action::Upload,
+            (true, false) => Action::UploadRevive,
             (true, true) => Action::Merge,
             (false, true) => Action::Download,
             (false, false) => Action::Skip,
@@ -441,9 +447,22 @@ impl<B: SyncBackend> SyncEngine<B> {
             .filter(|(_, action)| matches!(action, Action::DeleteRemote | Action::TrashLocal))
             .count();
         let tracked = self.state.files.len();
-        if deletions > DELETE_MIN_FILES
-            && deletions * 100 > tracked.saturating_mul(DELETE_RATIO_PERCENT)
-        {
+        let mass_deletion = deletions > DELETE_MIN_FILES
+            && deletions * 100 > tracked.saturating_mul(DELETE_RATIO_PERCENT);
+        // 「本地消失」只算本地真的没了的已跟踪文件：TrashLocal 是远端删除传播到
+        // 本地，本地内容还在，不属于「目录被清空」。Forget 也算，避免远端刚好已删
+        // 掉一两篇时差几个数漏判。
+        let local_gone = plans
+            .iter()
+            .filter(|(_, action)| matches!(action, Action::DeleteRemote | Action::Forget))
+            .count();
+        let remote_deletes = plans
+            .iter()
+            .filter(|(_, action)| matches!(action, Action::DeleteRemote))
+            .count();
+        let all_missing =
+            tracked >= DELETE_ALL_MIN_FILES && remote_deletes > 0 && local_gone == tracked;
+        if mass_deletion || all_missing {
             summary.aborted = true;
             summary.error(
                 "安全阀",
@@ -480,6 +499,37 @@ impl<B: SyncBackend> SyncEngine<B> {
         }
         summary.finished_at = Some(now_iso());
         summary
+    }
+
+    /// 懒创建本轮 trash 目录：同一轮的所有删除共用一个时间戳目录。
+    async fn ensure_trash_dir(&self, slot: &mut Option<PathBuf>) -> Result<PathBuf, String> {
+        if let Some(dir) = slot.as_ref() {
+            return Ok(dir.clone());
+        }
+        let store = self.store.clone();
+        match blocking(move || store.new_trash_dir()).await {
+            Ok(Ok(dir)) => {
+                *slot = Some(dir.clone());
+                Ok(dir)
+            }
+            Ok(Err(error)) => Err(format!("创建 trash 目录失败：{error}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn backup_to_trash(
+        &self,
+        dir: PathBuf,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let store = self.store.clone();
+        let owned_name = name.to_string();
+        match blocking(move || store.trash(&dir, &owned_name, &bytes)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!("备份到 trash 失败：{error}")),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -688,6 +738,46 @@ impl<B: SyncBackend> SyncEngine<B> {
                 let Some(record) = record else {
                     return;
                 };
+                // 本地文件已经由用户删除，远端这一份是最后可恢复的内容。删之前先
+                // 备份到 trash，否则笔记目录被清空或网络盘没挂上时两端都不留原文。
+                let store = self.store.clone();
+                let owned_name = name.to_string();
+                let base = match blocking(move || store.read_base(&owned_name)).await {
+                    Ok(base) => base,
+                    Err(error) => {
+                        summary.error(name, error);
+                        return;
+                    }
+                };
+                let backup = match base {
+                    // base 可能是一次 `write_base` 失败后留下的旧版本；摘要对不上就
+                    // 重新读远端，不能把旧内容当成「最后可恢复副本」。
+                    Some(bytes) if sha256_base64(&bytes) == record.remote_sha256 => bytes,
+                    _ => match self.backend.get(name).await {
+                        Ok(Some((bytes, _))) => bytes,
+                        Ok(None) => {
+                            // 远端已经不在，等同于删除成功。
+                            self.forget(name).await;
+                            summary.deleted += 1;
+                            return;
+                        }
+                        Err(error) => {
+                            summary.record(name, error);
+                            return;
+                        }
+                    },
+                };
+                let dir = match self.ensure_trash_dir(trash_dir).await {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        summary.error(name, error);
+                        return;
+                    }
+                };
+                if let Err(error) = self.backup_to_trash(dir, name, backup).await {
+                    summary.error(name, error);
+                    return;
+                }
                 match self
                     .backend
                     .delete(
@@ -733,34 +823,16 @@ impl<B: SyncBackend> SyncEngine<B> {
                         return;
                     }
                 }
-                if trash_dir.is_none() {
-                    let store = self.store.clone();
-                    match blocking(move || store.new_trash_dir()).await {
-                        Ok(Ok(dir)) => *trash_dir = Some(dir),
-                        Ok(Err(error)) => {
-                            summary.error(name, format!("创建 trash 目录失败：{error}"));
-                            return;
-                        }
-                        Err(error) => {
-                            summary.error(name, error);
-                            return;
-                        }
-                    }
-                }
-                let dir = trash_dir.clone().expect("trash 目录已创建");
-                let store = self.store.clone();
-                let trash_name = name.to_string();
-                let trash_bytes = local.bytes.clone();
-                match blocking(move || store.trash(&dir, &trash_name, &trash_bytes)).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        summary.error(name, format!("备份到 trash 失败：{error}"));
-                        return;
-                    }
+                let dir = match self.ensure_trash_dir(trash_dir).await {
+                    Ok(dir) => dir,
                     Err(error) => {
                         summary.error(name, error);
                         return;
                     }
+                };
+                if let Err(error) = self.backup_to_trash(dir, name, local.bytes.clone()).await {
+                    summary.error(name, error);
+                    return;
                 }
                 if let Err(error) = self.remove_local(name, Some(local.sha256.clone())).await {
                     summary.error(name, error);
@@ -1031,6 +1103,7 @@ mod tests {
             Self::new(Capabilities {
                 strong_etag: true,
                 honors_if_match: true,
+                honors_if_none_match: true,
                 reliable_listing: true,
             })
         }
@@ -1239,6 +1312,7 @@ mod tests {
         let caps = Capabilities {
             strong_etag: true,
             honors_if_match: true,
+            honors_if_none_match: true,
             reliable_listing: true,
         };
         assert_eq!(
@@ -1296,6 +1370,7 @@ mod tests {
         let weak = Capabilities {
             strong_etag: false,
             honors_if_match: false,
+            honors_if_none_match: false,
             reliable_listing: true,
         };
         // 远端被删 → 把本地补回去，而不是删本地。
@@ -1313,6 +1388,7 @@ mod tests {
         let blind = Capabilities {
             strong_etag: false,
             honors_if_match: false,
+            honors_if_none_match: false,
             reliable_listing: false,
         };
         assert_eq!(
@@ -1322,6 +1398,15 @@ mod tests {
         assert_eq!(
             decide(&blind, true, LocalState::Changed, false, false),
             Action::UploadRevive
+        );
+        // 没有记录时同样不能只凭不可靠的列表就认定远端为空。
+        assert_eq!(
+            decide(&blind, false, LocalState::Changed, false, false),
+            Action::UploadRevive
+        );
+        assert_eq!(
+            decide(&blind, false, LocalState::Changed, true, true),
+            Action::Merge
         );
     }
 
@@ -1432,6 +1517,133 @@ mod tests {
     }
 
     #[test]
+    fn all_tracked_files_missing_aborts_small_library() {
+        let harness = Harness::new("valve-small");
+        for day in 1..=4 {
+            harness.write(
+                &format!("2026-10-{day:02}.md"),
+                &format!("# 2026-10-{day:02}\n"),
+            );
+        }
+        assert_eq!(harness.run().uploaded, 4);
+
+        // 目录还在但内容全没了：小笔记库也必须拦住。
+        for day in 1..=4 {
+            fs::remove_file(harness.notes.join(format!("2026-10-{day:02}.md"))).unwrap();
+        }
+        let summary = harness.run();
+        assert!(summary.aborted, "{summary:?}");
+        assert!(summary.errors.iter().any(|error| error.contains("安全阀")));
+        assert_eq!(harness.backend.names().len(), 4);
+    }
+
+    #[test]
+    fn remote_cleared_trashes_local_instead_of_aborting() {
+        let harness = Harness::new("valve-trash-local");
+        for day in 1..=4 {
+            harness.write(
+                &format!("2026-10-{day:02}.md"),
+                &format!("# 2026-10-{day:02}\n"),
+            );
+        }
+        assert_eq!(harness.run().uploaded, 4);
+
+        // 另一台设备把远端删光：这是正常传播，应该把本地移进 trash，而不是中止。
+        for name in harness.backend.names() {
+            harness.backend.remove(&name);
+        }
+        let summary = harness.run();
+        assert!(!summary.aborted, "{summary:?}");
+        assert_eq!(summary.deleted, 4);
+        for day in 1..=4 {
+            assert!(!harness.notes.join(format!("2026-10-{day:02}.md")).exists());
+        }
+    }
+
+    #[test]
+    fn all_local_files_gone_with_one_already_missing_remotely_still_aborts() {
+        let harness = Harness::new("valve-mixed");
+        for day in 1..=4 {
+            harness.write(
+                &format!("2026-10-{day:02}.md"),
+                &format!("# 2026-10-{day:02}\n"),
+            );
+        }
+        harness.run();
+        // 远端刚好已被别的设备删掉一篇：它走 Forget，不能因此漏判「本地全没了」。
+        harness.backend.remove("2026-10-01.md");
+        for day in 1..=4 {
+            fs::remove_file(harness.notes.join(format!("2026-10-{day:02}.md"))).unwrap();
+        }
+
+        let summary = harness.run();
+        assert!(summary.aborted, "{summary:?}");
+        assert_eq!(harness.backend.names().len(), 3);
+    }
+
+    #[test]
+    fn local_deletion_backs_up_remote_copy_before_delete() {
+        let harness = Harness::new("delete-backup");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        harness.run();
+        fs::remove_file(harness.notes.join("2026-10-23.md")).unwrap();
+
+        let summary = harness.run();
+        assert_eq!(summary.deleted, 1, "{summary:?}");
+        assert!(harness.backend.names().is_empty());
+
+        let state_root = StateStore::new(&harness.config, &harness.notes)
+            .root()
+            .to_path_buf();
+        let mut backups = Vec::new();
+        for dir in fs::read_dir(state_root.join("trash")).unwrap().flatten() {
+            for file in fs::read_dir(dir.path()).unwrap().flatten() {
+                let path = file.path();
+                backups.push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read_to_string(&path).unwrap_or_default(),
+                ));
+            }
+        }
+        assert!(
+            backups
+                .iter()
+                .any(|(name, text)| name == "2026-10-23.md" && text.contains("10:00 a")),
+            "删除远端前应留下可恢复副本：{backups:?}"
+        );
+    }
+
+    #[test]
+    fn deletion_uses_remote_content_when_base_is_stale() {
+        let harness = Harness::new("delete-stale-base");
+        harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
+        harness.run();
+        let state_root = StateStore::new(&harness.config, &harness.notes)
+            .root()
+            .to_path_buf();
+        // 模拟 write_base 失败后留下的旧副本。
+        fs::write(state_root.join("base").join("2026-10-23.md"), "stale\n").unwrap();
+        fs::remove_file(harness.notes.join("2026-10-23.md")).unwrap();
+
+        let summary = harness.run();
+        assert_eq!(summary.deleted, 1, "{summary:?}");
+        let mut backups = Vec::new();
+        for dir in fs::read_dir(state_root.join("trash")).unwrap().flatten() {
+            for file in fs::read_dir(dir.path()).unwrap().flatten() {
+                backups.push(fs::read_to_string(file.path()).unwrap_or_default());
+            }
+        }
+        assert!(
+            backups.iter().any(|text| text.contains("10:00 a")),
+            "应备份远端内容而不是陈旧 base：{backups:?}"
+        );
+        assert!(
+            !backups.iter().any(|text| text.contains("stale")),
+            "陈旧 base 不能被当成可恢复副本：{backups:?}"
+        );
+    }
+
+    #[test]
     fn remote_deletion_moves_local_file_to_trash() {
         let harness = Harness::new("remote-delete");
         harness.write("2026-10-23.md", "# 2026-10-23\n\n- 10:00 a\n");
@@ -1459,6 +1671,7 @@ mod tests {
         let backend = FakeBackend::new(Capabilities {
             strong_etag: false,
             honors_if_match: false,
+            honors_if_none_match: false,
             reliable_listing: true,
         });
         let harness = Harness::with_backend("weak-restore", backend.clone());
@@ -1477,6 +1690,7 @@ mod tests {
         let backend = FakeBackend::new(Capabilities {
             strong_etag: false,
             honors_if_match: false,
+            honors_if_none_match: false,
             reliable_listing: true,
         });
         let harness = Harness::with_backend("weak-delete", backend.clone());
@@ -1717,6 +1931,7 @@ mod tests {
         let backend = FakeBackend::new(Capabilities {
             strong_etag: false,
             honors_if_match: false,
+            honors_if_none_match: false,
             reliable_listing: false,
         });
         let harness = Harness::with_backend("blind-upload", backend.clone());

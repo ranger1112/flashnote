@@ -162,12 +162,26 @@ impl WebDavBackend {
             .await?;
         let honors_if_match = response.status() == StatusCode::PRECONDITION_FAILED;
 
+        // `If-None-Match: *` 是另一种能力：有的服务器认 If-Match，却忽略它。
+        // 探测文件此刻已经存在，条件写必须被拒。
+        let (response, _) = self
+            .request(
+                Method::PUT,
+                probe_url.clone(),
+                vec![(IF_NONE_MATCH, HeaderValue::from_static("*"))],
+                Some(body.clone()),
+                TRANSFER_TIMEOUT,
+            )
+            .await?;
+        let honors_if_none_match = response.status() == StatusCode::PRECONDITION_FAILED;
+
         let listed = match self.propfind(self.base.clone(), "1").await {
             Ok((xml, _)) => parse_multistatus(&xml)
                 .map(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| name_from_href(&entry.href).as_deref() == Some(PROBE_NAME))
+                    entries.iter().any(|entry| {
+                        !entry.is_missing()
+                            && name_from_href(&entry.href).as_deref() == Some(PROBE_NAME)
+                    })
                 })
                 .unwrap_or(false),
             Err(_) => false,
@@ -186,6 +200,7 @@ impl WebDavBackend {
         self.caps = Capabilities {
             strong_etag,
             honors_if_match,
+            honors_if_none_match,
             // 列表不完整或读回内容不一致时，按「列表不可靠」处理，绝不传播删除。
             reliable_listing: listed && readback_ok,
         };
@@ -282,7 +297,10 @@ impl WebDavBackend {
     /// Depth: 0 读单个文件的版本；服务器不支持时返回 None。
     async fn stat_version(&self, url: &Url) -> Option<RemoteVersion> {
         let (xml, _) = self.propfind(url.clone(), "0").await.ok()?;
-        let entry = parse_multistatus(&xml).ok()?.into_iter().next()?;
+        let entry = parse_multistatus(&xml)
+            .ok()?
+            .into_iter()
+            .find(|entry| !entry.is_missing())?;
         Some(entry_version(&entry))
     }
 
@@ -441,6 +459,13 @@ impl WebDavBackend {
             if hops >= MAX_REDIRECTS {
                 return Err(SyncError::Network("重定向次数过多".into()));
             }
+            // 303 的语义是「去另一个地址 GET 结果」，写请求跟随它等于把一次
+            // 没有发生的写入当成成功。宁可让本轮失败，下一轮按新状态重新决策。
+            if status == StatusCode::SEE_OTHER && method != Method::GET && method != Method::HEAD {
+                return Err(SyncError::Other(
+                    "服务器把写请求重定向为 303，已中止以免误判成功".into(),
+                ));
+            }
             let Ok(next) = current.join(location) else {
                 return Ok((response, current));
             };
@@ -483,8 +508,8 @@ impl SyncBackend for WebDavBackend {
         let mut metas = Vec::new();
 
         for entry in entries {
-            // 集合自身、以及任何子目录都不是笔记。
-            if entry.href.ends_with('/') || entry.href == collection {
+            // 集合自身、以及任何子目录都不是笔记；全是 404 propstat 的条目不存在。
+            if entry.href.ends_with('/') || entry.href == collection || entry.is_missing() {
                 continue;
             }
             let Some(name) = name_from_href(&entry.href) else {
@@ -514,7 +539,16 @@ impl SyncBackend for WebDavBackend {
     async fn exists(&self, name: &str) -> Result<bool, SyncError> {
         let url = self.file_url(name)?;
         match self.propfind(url, "0").await {
-            Ok(_) => Ok(true),
+            // 有的服务器用 `207` + 内嵌 404 propstat 表示资源不存在；解析器会把
+            // 这类 response 过滤掉，所以看解析结果而不是只看 HTTP 状态。
+            Ok((xml, _)) => match parse_multistatus(&xml) {
+                // 只有明确看到「全是 404」才算不存在；解析成功但没有条目、或同一资源
+                // 有一条非 404 的 response 时，保守当作存在，避免误覆盖远端。
+                Ok(entries) => {
+                    Ok(entries.is_empty() || entries.iter().any(|entry| !entry.is_missing()))
+                }
+                Err(_) => Ok(true),
+            },
             Err(SyncError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
@@ -535,9 +569,17 @@ impl SyncBackend for WebDavBackend {
         let mut conditional = false;
         match &expect {
             Expect::Absent => {
-                headers.push((IF_NONE_MATCH, HeaderValue::from_static("*")));
-                // If-None-Match 没有单独探测；保持旧行为，弱服务器写后回读。
-                conditional = self.caps.honors_if_match;
+                conditional = self.caps.honors_if_none_match;
+                if conditional {
+                    headers.push((IF_NONE_MATCH, HeaderValue::from_static("*")));
+                } else {
+                    // 没确认过 `If-None-Match: *` 是否生效：写前再确认一次远端确实
+                    // 不存在，免得静默覆盖另一台设备刚创建的同名文件。头本身也不发，
+                    // 有些服务器不是忽略而是直接拒绝这个头。
+                    if self.exists(name).await? {
+                        return Err(SyncError::VersionMismatch);
+                    }
+                }
             }
             Expect::Version {
                 version: RemoteVersion::Etag(tag),
@@ -823,6 +865,17 @@ pub(crate) struct Props {
     etag: Option<String>,
     size: Option<u64>,
     modified: Option<String>,
+    /// 该 response 里是否出现过 2xx 的 propstat。
+    ok: bool,
+    /// 是否出现过 404 的 propstat。一个 response 常同时包含 200 与 404 两组
+    /// （服务器不支持的属性走 404），只有「全是 404」才代表资源不存在。
+    missing: bool,
+}
+
+impl Props {
+    fn is_missing(&self) -> bool {
+        self.missing && !self.ok
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -831,6 +884,12 @@ enum Field {
     Etag,
     Size,
     Modified,
+    Status,
+}
+
+/// `HTTP/1.1 404 Not Found` → `404`。
+fn http_status_code(text: &str) -> Option<u16> {
+    text.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// 解析 207 Multistatus。命名空间前缀（`D:`、`d:`、`lp1:`）一律忽略。
@@ -871,6 +930,10 @@ fn parse_multistatus(xml: &str) -> Result<Vec<Props>, SyncError> {
                     field = Some(Field::Modified);
                     text.clear();
                 }
+                "status" => {
+                    field = Some(Field::Status);
+                    text.clear();
+                }
                 _ => {}
             },
             Ok(Event::Text(event)) => {
@@ -904,6 +967,15 @@ fn parse_multistatus(xml: &str) -> Result<Vec<Props>, SyncError> {
                     ("getlastmodified", Some(Field::Modified)) => {
                         if let Some(entry) = current.as_mut() {
                             entry.modified = Some(text.trim().to_string());
+                        }
+                    }
+                    ("status", Some(Field::Status)) => {
+                        if let Some(entry) = current.as_mut() {
+                            match http_status_code(&text) {
+                                Some(code) if (200..300).contains(&code) => entry.ok = true,
+                                Some(404) => entry.missing = true,
+                                _ => {}
+                            }
                         }
                     }
                     ("response", _) => {
@@ -1030,6 +1102,7 @@ mod tests {
     const STRONG: Capabilities = Capabilities {
         strong_etag: true,
         honors_if_match: true,
+        honors_if_none_match: true,
         reliable_listing: true,
     };
 
@@ -1112,6 +1185,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, RemoteVersion::Etag("\"v2\"".into()));
+    }
+
+    #[tokio::test]
+    async fn write_redirected_with_303_is_not_treated_as_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header("location", "/flashnote/notes/2026-10-23.md"),
+            )
+            .mount(&server)
+            .await;
+        // 如果客户端跟随了 303，会命中这个 GET 并把它当成写成功。
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"old".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = backend_with(&server, STRONG)
+            .put("2026-10-23.md", b"new\n", Expect::Absent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::Other(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn get_follows_303_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(
+                ResponseTemplate::new(303).insert_header("location", "/flashnote/notes/target.md"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flashnote/notes/target.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let (bytes, _) = backend_with(&server, STRONG)
+            .get("2026-10-23.md")
+            .await
+            .unwrap()
+            .expect("应有内容");
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn partial_404_propstat_keeps_the_entry() {
+        // 弱服务器常把不支持的 getetag 放进 404 propstat，文件本身仍然存在。
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/flashnote/notes/2026-10-23.md</D:href><D:propstat><D:prop><D:getcontentlength>12</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat><D:propstat><D:prop><D:getetag/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response></D:multistatus>"#;
+        let entries = parse_multistatus(xml).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_missing());
+        assert_eq!(entries[0].size, Some(12));
+    }
+
+    #[tokio::test]
+    async fn exists_is_true_when_only_some_properties_are_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/flashnote/notes/2026-10-23.md</D:href><D:propstat><D:prop><D:getcontentlength>12</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat><D:propstat><D:prop><D:getetag/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response></D:multistatus>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        assert!(backend_with(&server, STRONG)
+            .exists("2026-10-23.md")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn exists_is_false_for_207_with_embedded_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/flashnote/notes/2026-10-23.md</D:href><D:propstat><D:prop/><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response></D:multistatus>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        assert!(!backend_with(&server, STRONG)
+            .exists("2026-10-23.md")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn absent_write_checks_existence_when_if_none_match_is_not_honored() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(
+                ResponseTemplate::new(207).set_body_string(multistatus(&[response_xml(
+                    "/flashnote/notes/2026-10-23.md",
+                    Some("\"v1\""),
+                    12,
+                )])),
+            )
+            .mount(&server)
+            .await;
+        // 远端已经存在时绝不能无条件写入。
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let caps = Capabilities {
+            strong_etag: true,
+            honors_if_match: true,
+            honors_if_none_match: false,
+            reliable_listing: true,
+        };
+        let error = backend_with(&server, caps)
+            .put("2026-10-23.md", b"new\n", Expect::Absent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::VersionMismatch), "{error:?}");
     }
 
     #[tokio::test]
@@ -1392,6 +1595,13 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/flashnote/notes/.flashnote-probe"))
+            .and(header("if-none-match", "*"))
+            .respond_with(ResponseTemplate::new(412))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/.flashnote-probe"))
             .respond_with(ResponseTemplate::new(201).insert_header("etag", "\"probe-1\""))
             .mount(&server)
             .await;
@@ -1423,6 +1633,7 @@ mod tests {
         let caps = backend.capabilities();
         assert!(caps.strong_etag);
         assert!(caps.honors_if_match);
+        assert!(caps.honors_if_none_match);
         assert!(caps.reliable_listing);
         assert!(caps.supports_deletion());
     }
@@ -1470,6 +1681,7 @@ mod tests {
         let caps = backend.capabilities();
         assert!(!caps.strong_etag);
         assert!(!caps.honors_if_match);
+        assert!(!caps.honors_if_none_match);
         assert!(!caps.supports_deletion());
     }
 

@@ -23,6 +23,9 @@ pub(crate) enum RemoteVersion {
 pub(crate) struct Capabilities {
     pub strong_etag: bool,
     pub honors_if_match: bool,
+    /// `If-None-Match: *` 是否真的生效。它与 `If-Match` 是两种能力，
+    /// 有的服务器只认其中一个，混用会让并发创建变成静默覆盖。
+    pub honors_if_none_match: bool,
     pub reliable_listing: bool,
 }
 
