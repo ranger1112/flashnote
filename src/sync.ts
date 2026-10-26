@@ -227,13 +227,15 @@ async function saveSyncConfig(): Promise<void> {
   const identityChanged =
     normalizeSyncUrl(settings.sync.url) !== normalizeSyncUrl(form.url) ||
     settings.sync.username.trim() !== form.username;
-  if (
-    form.allowInsecureHttp &&
-    needsInsecureConfirmation(form.url) &&
-    typeof window.confirm === "function" &&
-    !window.confirm("这个地址不是本机或内网，笔记与密码会以明文传输。仍要保存吗？")
-  ) {
-    return;
+  if (form.allowInsecureHttp && needsInsecureConfirmation(form.url)) {
+    if (typeof window.confirm !== "function") {
+      // 拿不到确认对话框时宁可拒绝保存，也不能静默把密码发到公网明文地址。
+      ui.syncError.textContent = "无法显示确认对话框，已取消保存";
+      return;
+    }
+    if (!window.confirm("这个地址不是本机或内网，笔记与密码会以明文传输。仍要保存吗？")) {
+      return;
+    }
   }
 
   savingConfig = true;

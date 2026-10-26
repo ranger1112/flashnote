@@ -507,9 +507,8 @@ impl WebDavBackend {
                     ));
                 }
                 // 恶意或配置错误的服务端可以把 GET 引到内网/回环地址，响应体还会
-                // 被当成笔记内容写盘。跨源目标必须是 https，且不能是字面量私网 IP
-                // （域名不做 DNS 预解析，见协议文档的限制说明）。
-                if next.scheme() != "https" || is_private_host(&next) {
+                // 被当成笔记内容写盘。跨源目标必须是 https，且解析后不能落在私网。
+                if next.scheme() != "https" || is_private_target(&next).await {
                     return Err(SyncError::Other(
                         "拒绝把请求重定向到非公网 https 目标".into(),
                     ));
@@ -786,10 +785,48 @@ fn is_private_host(url: &Url) -> bool {
     }
 }
 
+/// 跨源目标是否指向内网。字面量 IP 直接判断；域名解析一次（3 秒超时），
+/// 解析失败时不阻止——能阻止的部分已经挡住了，DNS 重绑定不在本层解决。
+async fn is_private_target(url: &Url) -> bool {
+    if is_private_host(url) {
+        return true;
+    }
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    if parse_ip(host).is_some() {
+        return false; // 字面量公网 IP，is_private_host 已经判过
+    }
+    let host = host.trim_matches(['[', ']']).to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let lookup = tauri::async_runtime::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
+    match tokio::time::timeout(Duration::from_secs(3), lookup).await {
+        Ok(Ok(ips)) => ips_are_private(ips),
+        _ => false,
+    }
+}
+
+/// 解析结果里只要有一个私网地址就拒绝（多 A 记录时不能挑一个公网的放行）。
+fn ips_are_private(ips: impl IntoIterator<Item = std::net::IpAddr>) -> bool {
+    ips.into_iter().any(is_private_ip)
+}
+
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // 100.64.0.0/10：运营商级 NAT，同样不是公网。
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         }
         std::net::IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -1716,6 +1753,24 @@ mod tests {
         assert!(is_private_host(&parse("https://10.0.0.5/")));
         assert!(is_private_host(&parse("https://[::1]/")));
         assert!(!is_private_host(&parse("https://dav.example.com/")));
+    }
+
+    #[test]
+    fn resolved_private_ips_are_rejected() {
+        use std::net::IpAddr;
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        let cgnat: IpAddr = "100.64.0.1".parse().unwrap();
+        assert!(ips_are_private([private, public]));
+        assert!(ips_are_private([cgnat]));
+        assert!(!ips_are_private([public]));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_private_targets_are_detected() {
+        assert!(is_private_target(&Url::parse("https://10.0.0.5/").unwrap()).await);
+        assert!(is_private_target(&Url::parse("https://localhost/").unwrap()).await);
+        assert!(!is_private_target(&Url::parse("https://93.184.216.34/").unwrap()).await);
     }
 
     #[test]

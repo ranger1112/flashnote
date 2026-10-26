@@ -191,9 +191,44 @@ function deleteButton(index = 0): HTMLButtonElement {
   return button;
 }
 
+function editButton(index = 0): HTMLButtonElement {
+  const button = entries()[index]?.querySelector<HTMLButtonElement>(".entry-action");
+  if (!button) throw new Error("没有编辑按钮");
+  return button;
+}
+
 beforeEach(() => {
   vi.useRealTimers();
   notes = [entry("09:00", "第一条"), entry("08:00", "第二条")];
+});
+
+describe("编辑保护", () => {
+  it("编辑框打开时关闭面板会提示先保存，不丢输入", async () => {
+    await boot();
+    await openHistory();
+
+    editButton().click();
+    await flush();
+    expect(document.querySelector(".entry-edit")).not.toBeNull();
+
+    node<HTMLButtonElement>("#history-close").click();
+    await flush();
+
+    expect(node<HTMLElement>("#history").classList.contains("hidden")).toBe(false);
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("请先保存或取消编辑");
+
+    // 再次点「笔记」（例如托盘唤起后）也不能重建列表、丢掉编辑器。
+    const editorValue = node<HTMLTextAreaElement>(".entry-edit").value;
+    node<HTMLButtonElement>("#notes-btn").click();
+    await flush();
+    const reopened = document.querySelector<HTMLTextAreaElement>(".entry-edit");
+    expect(reopened?.value).toBe(editorValue);
+  });
+
+  it("撤销条初始不可聚焦", async () => {
+    await boot();
+    expect(node<HTMLElement>("#undo-bar").hasAttribute("inert")).toBe(true);
+  });
 });
 
 describe("删除与撤销", () => {

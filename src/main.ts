@@ -17,6 +17,7 @@ import { initSync, markSyncPending } from "./sync";
 import { initUpdater, startAutoUpdateChecks } from "./updater";
 import {
   closeHistory,
+  hasOpenEditor,
   initHistory,
   paintPreviewButton,
   refreshNotes,
@@ -89,7 +90,8 @@ function setSource(source: string | null): void {
 async function hideWindow(): Promise<void> {
   // 收起窗口时不做退出动画，避免面板还停留在一半
   closeSettings(false);
-  closeHistory(false);
+  // 收起窗口是明确的「离开」动作：编辑框内容随窗口一起收起，不阻塞热键。
+  closeHistory(false, true);
   closeWelcome(false);
   setBackgroundInert(false);
   await flushDraft();
@@ -132,6 +134,11 @@ async function saveNote(): Promise<void> {
 }
 
 function openSettings(): void {
+  // 历史编辑框还有未保存的改动：开设置会把历史面板关掉、输入丢失。
+  if (hasOpenEditor()) {
+    toast("请先保存或取消编辑", true);
+    return;
+  }
   closeHistory(false);
   closeWelcome(false);
   showSettingsPanel();

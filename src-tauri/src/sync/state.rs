@@ -114,21 +114,36 @@ impl StateStore {
 
         Ok(match serde_json::from_slice::<SyncState>(&bytes) {
             Ok(state) if state.version <= STATE_VERSION => (state, None),
-            Ok(state) => (
-                SyncState::default(),
-                Some(format!(
-                    "同步状态版本 {} 高于当前支持的 {STATE_VERSION}，已重新开始",
-                    state.version
-                )),
-            ),
-            Err(error) => {
-                let backup = self.backup_corrupt();
-                let detail = backup
-                    .map(|path| format!("，已备份到 {}", path.display()))
-                    .unwrap_or_default();
+            Ok(state) => {
+                // 更高版本的状态可能来自新版客户端：先备份再重来，别直接覆盖。
+                let Some(backup) = self.backup_corrupt() else {
+                    return Err(io::Error::other(format!(
+                        "同步状态版本 {} 高于当前支持，且备份失败",
+                        state.version
+                    )));
+                };
                 (
                     SyncState::default(),
-                    Some(format!("同步状态已损坏（{error}）{detail}")),
+                    Some(format!(
+                        "同步状态版本 {} 高于当前支持的 {STATE_VERSION}，已备份到 {} 并重新开始",
+                        state.version,
+                        backup.display()
+                    )),
+                )
+            }
+            Err(error) => {
+                // 备份失败时不能用空状态继续：轮末会覆盖掉还有救的原文件。
+                let Some(backup) = self.backup_corrupt() else {
+                    return Err(io::Error::other(format!(
+                        "同步状态已损坏且备份失败：{error}"
+                    )));
+                };
+                (
+                    SyncState::default(),
+                    Some(format!(
+                        "同步状态已损坏（{error}），已备份到 {}",
+                        backup.display()
+                    )),
                 )
             }
         })
@@ -307,6 +322,30 @@ mod tests {
             second.root(),
             "换服务器不能复用旧状态，否则会把本地笔记误判为远端已删除"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_state_version_is_backed_up_before_reset() {
+        let dir = temp_dir("newer-version");
+        let store = StateStore::new(&dir, Path::new("D:\\Notes"));
+        fs::create_dir_all(store.root()).unwrap();
+        fs::write(
+            store.state_path(),
+            br#"{"version":99,"files":{},"lastSyncAt":null}"#,
+        )
+        .unwrap();
+
+        let (state, warning) = store.load().unwrap();
+        assert!(state.files.is_empty());
+        assert!(warning.unwrap().contains("备份"));
+        let backups: Vec<_> = fs::read_dir(store.root())
+            .unwrap()
+            .filter_map(|item| item.ok())
+            .filter(|item| item.file_name().to_string_lossy().contains("corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "高版本状态必须先备份");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
