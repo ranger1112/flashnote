@@ -80,23 +80,21 @@ impl StateStore {
         self.root.join("state.json")
     }
 
-    /// 读取状态；损坏时备份原文件并从空状态开始（首轮只会上传/下载，不会删除）。
-    pub(crate) fn load(&self) -> (SyncState, Option<String>) {
+    /// 读取状态；内容损坏时备份原文件并从空状态开始（首轮只会上传/下载，不会删除）。
+    ///
+    /// 读不出来（共享冲突、权限、杀软锁）返回 `Err`：这种错误不能当成空状态继续，
+    /// 否则本轮会把所有文件当「无记录」重新合并，并在轮末覆盖掉原状态。
+    pub(crate) fn load(&self) -> io::Result<(SyncState, Option<String>)> {
         let path = self.state_path();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return (SyncState::default(), None)
+                return Ok((SyncState::default(), None))
             }
-            Err(error) => {
-                return (
-                    SyncState::default(),
-                    Some(format!("读取同步状态失败：{error}")),
-                )
-            }
+            Err(error) => return Err(error),
         };
 
-        match serde_json::from_slice::<SyncState>(&bytes) {
+        Ok(match serde_json::from_slice::<SyncState>(&bytes) {
             Ok(state) if state.version <= STATE_VERSION => (state, None),
             Ok(state) => (
                 SyncState::default(),
@@ -115,7 +113,7 @@ impl StateStore {
                     Some(format!("同步状态已损坏（{error}）{detail}")),
                 )
             }
-        }
+        })
     }
 
     fn backup_corrupt(&self) -> Option<PathBuf> {
@@ -135,8 +133,14 @@ impl StateStore {
         self.root.join("base").join(name)
     }
 
-    pub(crate) fn read_base(&self, name: &str) -> Option<Vec<u8>> {
-        fs::read(self.base_path(name)).ok()
+    pub(crate) fn read_base(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        match fs::read(self.base_path(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            // 读失败与「没有 base」是两件事：前者必须让本轮放弃合并，
+            // 否则会把正常删除当成新增。
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn write_base(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -245,7 +249,7 @@ mod tests {
         );
         store.save(&state).unwrap();
 
-        let (loaded, warning) = store.load();
+        let (loaded, warning) = store.load().unwrap();
         assert!(warning.is_none());
         assert_eq!(loaded.files.len(), 1);
         assert_eq!(
@@ -262,7 +266,7 @@ mod tests {
         fs::create_dir_all(store.root()).unwrap();
         fs::write(store.state_path(), b"{ not json").unwrap();
 
-        let (state, warning) = store.load();
+        let (state, warning) = store.load().unwrap();
         assert!(state.files.is_empty());
         assert!(warning.unwrap().contains("损坏"));
         let backups: Vec<_> = fs::read_dir(store.root())
@@ -297,10 +301,10 @@ mod tests {
 
         first.write_base("2026-10-23.md", b"hello").unwrap();
         assert_eq!(
-            first.read_base("2026-10-23.md").as_deref(),
+            first.read_base("2026-10-23.md").unwrap().as_deref(),
             Some(&b"hello"[..])
         );
-        assert!(second.read_base("2026-10-23.md").is_none());
+        assert!(second.read_base("2026-10-23.md").unwrap().is_none());
 
         let trash = first.new_trash_dir().unwrap();
         let path = first.trash(&trash, "2026-10-23.md", b"bye").unwrap();
