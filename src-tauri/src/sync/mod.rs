@@ -776,11 +776,19 @@ impl<B: SyncBackend> SyncEngine<B> {
                     blocking(move || merge::merge(&base, &local_text, &remote_for_merge)).await;
                 match merged {
                     Ok(Some(result)) => {
-                        if result.text != local.text {
+                        // 合并以远端原文为底稿；本地是 CRLF 时按本地风格写回并上传，
+                        // 避免一次合并把整份文件改成 LF。
+                        let merged_text =
+                            if local.text.contains("\r\n") && !result.text.contains("\r\n") {
+                                result.text.replace('\n', "\r\n")
+                            } else {
+                                result.text.clone()
+                            };
+                        if merged_text != local.text {
                             if let Err(error) = self
                                 .write_local(
                                     name,
-                                    result.text.as_bytes().to_vec(),
+                                    merged_text.as_bytes().to_vec(),
                                     LocalExpect::Sha(local.sha256.clone()),
                                 )
                                 .await
@@ -793,7 +801,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                             .backend
                             .put(
                                 name,
-                                result.text.as_bytes(),
+                                merged_text.as_bytes(),
                                 Expect::Version {
                                     version: remote_version,
                                     sha256: Some(sha256_base64(remote_text.as_bytes())),
@@ -802,7 +810,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                             .await
                         {
                             Ok(version) => {
-                                self.commit(name, result.text.as_bytes(), version, summary)
+                                self.commit(name, merged_text.as_bytes(), version, summary)
                                     .await;
                                 summary.merged += 1;
                                 summary.conflicts += result.conflicts;
@@ -1889,6 +1897,33 @@ mod tests {
         assert!(
             harness.backend.content("2026-10-23.md").is_some(),
             "不能删远端"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_local_crlf_style() {
+        let harness = Harness::new("merge-crlf");
+        harness.write("2026-10-23.md", "# 2026-10-23\r\n\r\n- 10:00 a\r\n");
+        harness.run();
+        harness.write(
+            "2026-10-23.md",
+            "# 2026-10-23\r\n\r\n- 10:00 a\r\n\r\n- 11:00 b\r\n",
+        );
+        harness.backend.put_remote(
+            "2026-10-23.md",
+            b"# 2026-10-23\n\n- 10:00 a\n\n- 12:00 c\n".to_vec(),
+        );
+
+        let summary = harness.run();
+        assert!(!summary.aborted, "{summary:?}");
+        let text = fs::read_to_string(harness.notes.join("2026-10-23.md")).unwrap();
+        assert!(
+            !text.replace("\r\n", "").contains('\n'),
+            "合并后不应混入裸 LF：{text:?}"
+        );
+        assert!(
+            text.contains("11:00 b") && text.contains("12:00 c"),
+            "{text:?}"
         );
     }
 

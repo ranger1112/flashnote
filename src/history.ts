@@ -35,8 +35,14 @@ function dateLabel(date: string): string {
   return date === today ? `今天 · ${date}` : date;
 }
 
-export function closeHistory(animate = true): void {
+export function closeHistory(animate = true, force = false): void {
   if (ui.historyPanel.classList.contains("hidden")) return;
+  // 编辑框里有未保存的改动：直接关闭会静默丢掉，必须先保存或取消。
+  // 收起窗口（force）例外，否则用户没法用快捷键收起小窗。
+  if (!force && hasOpenEditor()) {
+    toast("请先保存或取消编辑", true);
+    return;
+  }
   // 面板关了就不该再跑一次搜索
   if (searchTimer !== undefined) {
     window.clearTimeout(searchTimer);
@@ -48,7 +54,11 @@ export function closeHistory(animate = true): void {
 
 function markdownHtml(markdown: string): string {
   const html = marked.parse(markdown, { async: false });
-  return DOMPurify.sanitize(String(html));
+  // 内联 style 不能留：同步来的笔记可以借此盖住界面做 UI 伪装。
+  return DOMPurify.sanitize(String(html), {
+    FORBID_ATTR: ["style"],
+    FORBID_TAGS: ["style"],
+  });
 }
 
 export function paintPreviewButton(): void {

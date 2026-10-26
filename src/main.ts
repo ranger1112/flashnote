@@ -89,7 +89,8 @@ function setSource(source: string | null): void {
 async function hideWindow(): Promise<void> {
   // 收起窗口时不做退出动画，避免面板还停留在一半
   closeSettings(false);
-  closeHistory(false);
+  // 收起窗口是明确的「离开」动作：编辑框内容随窗口一起收起，不阻塞热键。
+  closeHistory(false, true);
   closeWelcome(false);
   setBackgroundInert(false);
   await flushDraft();

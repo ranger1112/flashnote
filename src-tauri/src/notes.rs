@@ -690,12 +690,20 @@ pub fn append_note(dir: &Path, date: &str, entry: &str) -> std::io::Result<PathB
     };
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
 
+    // 跟着原文件的行尾走：CRLF 文件追加后不能变成混合行尾。
+    let crlf = existing.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+    let body = if crlf {
+        entry.replace('\n', "\r\n")
+    } else {
+        entry.to_string()
+    };
     if existing.is_empty() {
-        write!(file, "# {date}\n\n")?;
-    } else if !existing.ends_with("\n\n") {
-        writeln!(file)?;
+        write!(file, "# {date}{eol}{eol}")?;
+    } else if !existing.ends_with(&format!("{eol}{eol}")) {
+        write!(file, "{eol}")?;
     }
-    writeln!(file, "{entry}")?;
+    write!(file, "{body}{eol}")?;
     // 追加后 mtime 会变，但同一秒内的多次写入仍可能撞上旧缓存，这里直接清掉
     drop(file);
     invalidate_cache(&path);
@@ -1083,6 +1091,26 @@ mod tests {
         let all = load_recent(&dir, 10, 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].content, "第二条");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appending_to_crlf_file_keeps_crlf() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-crlf-append-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-20.md");
+        fs::write(&path, "# 2026-10-20\r\n\r\n- 10:00 旧\r\n").unwrap();
+
+        append_note(&dir, "2026-10-20", "- 11:00 新\n  第二行").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.replace("\r\n", "").contains('\n'),
+            "不应混入裸 LF：{text:?}"
+        );
+        assert!(text.contains("- 11:00 新\r\n  第二行\r\n"), "{text:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -130,7 +130,13 @@ export function initUpdater(): void {
   ui.updateBannerAction.addEventListener("click", () => {
     if (updateReady) {
       // 重启前把设置与同步状态落盘，避免更新后重复合并或重复上传。
-      void invoke("flush_sync_state").finally(() => void relaunch());
+      // 落盘失败也要重启，但必须告诉用户这次「尽力了」。
+      void invoke("flush_sync_state")
+        .catch((error) => {
+          console.error("保存同步状态失败", error);
+          toast("同步状态未能落盘，仍将重启", true);
+        })
+        .finally(() => void relaunch());
     } else {
       void installUpdate();
     }

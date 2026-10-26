@@ -191,9 +191,32 @@ function deleteButton(index = 0): HTMLButtonElement {
   return button;
 }
 
+function editButton(index = 0): HTMLButtonElement {
+  const button = entries()[index]?.querySelector<HTMLButtonElement>(".entry-action");
+  if (!button) throw new Error("没有编辑按钮");
+  return button;
+}
+
 beforeEach(() => {
   vi.useRealTimers();
   notes = [entry("09:00", "第一条"), entry("08:00", "第二条")];
+});
+
+describe("编辑保护", () => {
+  it("编辑框打开时关闭面板会提示先保存，不丢输入", async () => {
+    await boot();
+    await openHistory();
+
+    editButton().click();
+    await flush();
+    expect(document.querySelector(".entry-edit")).not.toBeNull();
+
+    node<HTMLButtonElement>("#history-close").click();
+    await flush();
+
+    expect(node<HTMLElement>("#history").classList.contains("hidden")).toBe(false);
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("请先保存或取消编辑");
+  });
 });
 
 describe("删除与撤销", () => {
