@@ -298,24 +298,26 @@ blobs/<userId>/<name>/<version>
 
 保存在 `app_config_dir()/sync/<哈希(笔记目录 + 远端身份)>/`。远端身份对闪记云是 `userId`，对 WebDAV 是「URL + 用户名」；换账号或换服务器等于换一份状态，首轮只上传/合并，不会把本地文件误判成「远端已删除」。
 
+WebDAV 模式实际写入的形状（`remoteVersion` 为 ETag 或弱服务器的修订令牌）：
+
 ```json
 {
   "version": 1,
-  "userId": "…",
-  "lastSeq": 128,
+  "lastSyncAt": "2026-10-23T06:00:00Z",
   "files": {
     "2026-10-23.md": {
       "localMtimeNs": 1761200000000000000,
       "localSize": 380,
       "localSha256": "<base64url>",
-      "remoteVersion": 7,
+      "remoteVersion": { "kind": "etag", "value": "\"v7\"" },
       "remoteSha256": "<base64url>",
-      "syncedAt": "2026-10-23T06:00:00Z",
-      "deletedAt": null
+      "syncedAt": "2026-10-23T06:00:00Z"
     }
   }
 }
 ```
+
+闪记云还会在此基础上使用 `userId`、`lastSeq` 与每条记录的 `deletedAt`；WebDAV 没有墓碑，不写这些字段，远端删除直接靠文件消失表达。
 
 同时保存 `base/<name>`（上次同步成功时的明文）与 `trash/<时间戳>/`（远端删除时的本地副本）。
 
