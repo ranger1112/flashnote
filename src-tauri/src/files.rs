@@ -219,6 +219,8 @@ where
     let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
     let updated =
         update(&text).ok_or_else(|| "没有找到这条笔记，可能已被其他程序修改".to_string())?;
+    // 删除/编辑一条笔记不应该把整个 CRLF 文件改成 LF。
+    let updated = preserve_line_endings(&text, updated);
 
     let stem = target
         .file_stem()
@@ -239,11 +241,31 @@ where
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("写入失败：{err}"));
     }
-    // 解析缓存按 mtime+size 判断，但同一秒内的改写可能撞上旧值，这里直接失效
-    notes::invalidate_cache(&target);
+    // 解析缓存按 mtime+size 判断，但同一秒内的改写可能撞上旧值；这里的 target
+    // 是 canonicalize 过的路径，和缓存键不一定相等，直接全清。
+    notes::invalidate_all();
 
     prune_backups(&dir, stem);
     Ok(())
+}
+
+/// 按原文件的换行风格写回：CRLF 文件保持 CRLF，末尾有没有换行也照旧。
+fn preserve_line_endings(original: &str, rendered: String) -> String {
+    let crlf = original.contains("\r\n");
+    let ended_with_newline = original.ends_with('\n');
+    let mut text = if crlf {
+        rendered.replace('\n', "\r\n")
+    } else {
+        rendered
+    };
+    if !ended_with_newline {
+        if text.ends_with("\r\n") {
+            text.truncate(text.len() - 2);
+        } else if text.ends_with('\n') {
+            text.pop();
+        }
+    }
+    text
 }
 
 /// 每个日期文件最多保留 5 份备份，避免长期使用后目录膨胀。
@@ -405,6 +427,18 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_keeps_crlf_and_missing_trailing_newline() {
+        assert_eq!(
+            preserve_line_endings("# d\r\n\r\n- 10:00 a\r\n", "# d\n\n- 11:00 b\n".into()),
+            "# d\r\n\r\n- 11:00 b\r\n"
+        );
+        assert_eq!(
+            preserve_line_endings("# d\n\n- 10:00 a", "# d\n\n- 11:00 b\n".into()),
+            "# d\n\n- 11:00 b"
+        );
     }
 
     #[test]

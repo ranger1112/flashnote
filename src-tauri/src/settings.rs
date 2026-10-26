@@ -180,7 +180,7 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     let mut warning = None;
 
     let mut settings = match fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
+        Ok(raw) => match parse_settings(&raw) {
             // 手工编辑出的非法值只纠正字段，不把整份设置当成损坏
             Ok(mut parsed) => {
                 parsed.theme = normalize_theme(&parsed.theme);
@@ -215,6 +215,101 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     settings.notes_dir = absolute_notes_dir(&settings.notes_dir);
 
     LoadedSettings { settings, warning }
+}
+
+/// 宽松解析：单个字段类型写错（例如 `intervalMinutes` 写成字符串）时只丢弃该
+/// 字段，其余设置照常读取。整份回退默认会让笔记目录一并丢失，用户会以为笔记没了。
+fn parse_settings(raw: &str) -> Result<Settings, serde_json::Error> {
+    match serde_json::from_str::<Settings>(raw) {
+        Ok(settings) => Ok(settings),
+        Err(first_error) => {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+                return Err(first_error);
+            };
+            let defaults = serde_json::to_value(Settings::default()).ok();
+            if let (Some(object), Some(defaults)) = (
+                value.as_object_mut(),
+                defaults.as_ref().and_then(|value| value.as_object()),
+            ) {
+                object.retain(|key, item| match defaults.get(key) {
+                    // 未知字段保留下来，避免把新版本的设置写回旧格式时丢掉。
+                    None => true,
+                    // `Option` 字段默认序列化成 null，合法的对象/数组不能被当成类型不符。
+                    Some(serde_json::Value::Null) => true,
+                    Some(expected) => json_kind(expected) == json_kind(item),
+                });
+                for (key, item) in object.iter_mut() {
+                    let Some(expected) = defaults.get(key).and_then(|value| value.as_object())
+                    else {
+                        continue;
+                    };
+                    if let Some(nested) = item.as_object_mut() {
+                        nested.retain(|key, item| match expected.get(key) {
+                            None => true,
+                            Some(serde_json::Value::Null) => true,
+                            Some(expected) => json_kind(expected) == json_kind(item),
+                        });
+                    }
+                }
+                prune_invalid_sync(object);
+                // 窗口几何只要有一个字段类型不对就整个丢弃，别让它拖累其它设置。
+                if object.get("window").cloned().is_some_and(|window| {
+                    serde_json::from_value::<Option<WindowGeometry>>(window).is_err()
+                }) {
+                    object.remove("window");
+                }
+            }
+            // 最后兜底：逐个丢弃非 notesDir 字段再试，优先保住笔记目录。
+            if serde_json::from_value::<Settings>(value.clone()).is_err() {
+                let keys: Vec<String> = value
+                    .as_object()
+                    .map(|object| object.keys().cloned().collect())
+                    .unwrap_or_default();
+                for key in keys {
+                    if key == "notesDir" {
+                        continue;
+                    }
+                    let mut candidate = value.clone();
+                    if let Some(object) = candidate.as_object_mut() {
+                        object.remove(&key);
+                    }
+                    if serde_json::from_value::<Settings>(candidate.clone()).is_ok() {
+                        value = candidate;
+                        break;
+                    }
+                }
+            }
+            serde_json::from_value(value).map_err(|_| first_error)
+        }
+    }
+}
+
+/// 类型对但取值非法的字段：`sync.intervalMinutes` 必须是正整数（小数/负数会
+/// 让整份反序列化失败，进而丢掉笔记目录）。
+fn prune_invalid_sync(object: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(sync) = object
+        .get_mut("sync")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    if sync
+        .get("intervalMinutes")
+        .is_some_and(|value| value.as_u64().map_or(true, |minutes| minutes == 0))
+    {
+        sync.remove("intervalMinutes");
+    }
+}
+
+fn json_kind(value: &serde_json::Value) -> u8 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(_) => 2,
+        serde_json::Value::String(_) => 3,
+        serde_json::Value::Array(_) => 4,
+        serde_json::Value::Object(_) => 5,
+    }
 }
 
 /// 把相对路径固定成基于当前 CWD 的绝对路径。不碰文件系统，也不会引入 `\\?\` 前缀。
@@ -285,6 +380,47 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn wrong_field_type_only_drops_that_field() {
+        let dir = temp_dir("wrong-type");
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"notesDir":"D:\\Notes","theme":"dark","sync":{"enabled":"yes","url":"https://dav.example.com/","intervalMinutes":"15"}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings.notes_dir, "D:\\Notes");
+        assert_eq!(loaded.settings.theme, "dark");
+        assert_eq!(loaded.settings.sync.url, "https://dav.example.com/");
+        assert!(!loaded.settings.sync.enabled, "类型不符的字段回退默认值");
+        assert_eq!(loaded.settings.sync.interval_minutes, 5);
+        assert!(loaded.warning.is_none(), "不应整份当成损坏");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_interval_and_window_do_not_drop_notes_dir() {
+        let dir = temp_dir("invalid-values");
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"notesDir":"D:\\Notes","sync":{"url":"https://dav.example.com/","intervalMinutes":-1},"window":{"x":"left","y":2,"w":480,"h":360}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings.notes_dir, "D:\\Notes");
+        assert_eq!(loaded.settings.sync.url, "https://dav.example.com/");
+        assert_eq!(loaded.settings.sync.interval_minutes, 5);
+        assert!(loaded.settings.window.is_none(), "非法窗口几何应被丢弃");
+        assert!(loaded.warning.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
