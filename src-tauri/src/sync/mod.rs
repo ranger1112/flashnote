@@ -397,7 +397,9 @@ impl<B: SyncBackend> SyncEngine<B> {
     /// 下一轮会重试。
     pub(crate) async fn run(&mut self) -> SyncSummary {
         let mut summary = SyncSummary::new();
-        if let Some(error) = self.state_error.take() {
+        // 用 clone 而不是 take：同一个引擎再跑一轮也必须继续中止，不能带着
+        // 空状态去覆盖 state.json。
+        if let Some(error) = self.state_error.clone() {
             // 状态暂时读不出来：整轮不动，更不能拿空状态去覆盖原文件。
             summary.aborted = true;
             summary.error("同步状态", error);
@@ -503,16 +505,29 @@ impl<B: SyncBackend> SyncEngine<B> {
             .iter()
             .filter(|(_, action)| matches!(action, Action::DeleteRemote))
             .count();
-        let all_missing =
-            tracked >= DELETE_ALL_MIN_FILES && remote_deletes > 0 && local_gone == tracked;
+        // 被跳过（非 UTF-8 / 超大 / 读不了）的文件本地还在，不能算「消失」。
+        let ambiguous = scan
+            .skipped
+            .iter()
+            .filter(|name| self.state.files.contains_key(*name))
+            .count();
+        let all_missing = tracked >= DELETE_ALL_MIN_FILES
+            && remote_deletes > 0
+            && local_gone + ambiguous == tracked;
         if mass_deletion || all_missing {
-            summary.aborted = true;
+            // 只拦删除，其余上传/下载/合并照常：否则一次合法的大批删除会让
+            // 整个笔记库永久停止同步，也没有用户出口。
             summary.error(
                 "安全阀",
-                format!("本轮拟删除 {deletions} 个文件（共 {tracked} 个已同步），已中止"),
+                format!("本轮拟删除 {deletions} 个文件（共 {tracked} 个已同步），已跳过删除"),
             );
-            summary.finished_at = Some(now_iso());
-            return summary;
+            plans = plans
+                .into_iter()
+                .map(|(name, action)| match action {
+                    Action::DeleteRemote | Action::TrashLocal => (name, Action::Skip),
+                    other => (name, other),
+                })
+                .collect();
         }
 
         let mut trash_dir: Option<PathBuf> = None;
@@ -632,7 +647,8 @@ impl<B: SyncBackend> SyncEngine<B> {
                             return;
                         }
                         Err(error) => {
-                            summary.error(name, format!("无法确认远端状态，未上传：{error}"));
+                            // 走 record：401 要继续中止整轮，其余错误只记当前文件。
+                            summary.record(name, error);
                             return;
                         }
                     }
@@ -890,7 +906,7 @@ impl<B: SyncBackend> SyncEngine<B> {
                         return;
                     }
                     Err(error) => {
-                        summary.error(name, format!("无法确认远端状态，未删除本地副本：{error}"));
+                        summary.record(name, error);
                         return;
                     }
                 }
@@ -1605,7 +1621,7 @@ mod tests {
             fs::remove_file(harness.notes.join(format!("2026-10-{day:02}.md"))).unwrap();
         }
         let summary = harness.run();
-        assert!(summary.aborted, "{summary:?}");
+        assert!(!summary.aborted, "{summary:?}");
         assert!(summary.errors.iter().any(|error| error.contains("安全阀")));
         assert_eq!(harness.backend.names().len(), 10);
 
@@ -1639,9 +1655,31 @@ mod tests {
             fs::remove_file(harness.notes.join(format!("2026-10-{day:02}.md"))).unwrap();
         }
         let summary = harness.run();
-        assert!(summary.aborted, "{summary:?}");
+        assert!(!summary.aborted, "{summary:?}");
         assert!(summary.errors.iter().any(|error| error.contains("安全阀")));
         assert_eq!(harness.backend.names().len(), 4);
+    }
+
+    #[test]
+    fn safety_valve_skips_deletions_but_still_uploads() {
+        let harness = Harness::new("valve-uploads");
+        for day in 1..=6 {
+            harness.write(
+                &format!("2026-10-{day:02}.md"),
+                &format!("# 2026-10-{day:02}\n"),
+            );
+        }
+        harness.run();
+        for day in 1..=6 {
+            fs::remove_file(harness.notes.join(format!("2026-10-{day:02}.md"))).unwrap();
+        }
+        harness.write("2026-10-25.md", "# 2026-10-25\n\n- 09:00 new\n");
+
+        let summary = harness.run();
+        assert!(summary.errors.iter().any(|error| error.contains("安全阀")));
+        assert_eq!(summary.uploaded, 1, "{summary:?}");
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(harness.backend.names().len(), 7);
     }
 
     #[test]
@@ -1684,7 +1722,8 @@ mod tests {
         }
 
         let summary = harness.run();
-        assert!(summary.aborted, "{summary:?}");
+        assert!(!summary.aborted, "{summary:?}");
+        assert!(summary.errors.iter().any(|error| error.contains("安全阀")));
         assert_eq!(harness.backend.names().len(), 3);
     }
 
