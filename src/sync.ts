@@ -140,12 +140,14 @@ export function describeStatus(status: SyncStatus): string[] {
 }
 
 export function paintSyncStatus(status: SyncStatus): void {
+  const previous = lastStatus;
   lastStatus = status;
   // 有任何更新来源（保存、广播、手动刷新）都作废在途的旧响应。
   statusSeq += 1;
   paintSyncIndicator(status);
-  if (!status.lastError) {
-    // 同步已经成功：上一次测试/保存留下的红字不能一直挂着。
+  // 只有「又成功同步了一轮」才清掉红色错误行：单纯刷新状态不能抹掉
+  // 「地址已变更，请重新填写密码」这类还需要用户处理的提示。
+  if (!status.lastError && status.lastSyncAt !== previous?.lastSyncAt) {
     ui.syncError.textContent = "";
   }
 
