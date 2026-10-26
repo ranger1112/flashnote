@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-26
+
 ### 修复
 
 - 删除远端文件前先把内容备份进本地 `trash/`，笔记目录被清空或网络盘未挂载时不再两边都不留副本（#65）。
@@ -188,7 +190,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.3.1
