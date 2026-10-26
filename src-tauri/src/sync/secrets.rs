@@ -7,12 +7,12 @@ use super::state::sha256_base64;
 
 const SERVICE: &str = "flashnote-sync";
 
-/// 凭据账号名：URL 与用户名一起哈希，换服务器或换账号都不会串到旧密码。
+/// 凭据账号名：规范化 URL 与用户名一起哈希，换服务器或换账号都不会串到旧密码。
 ///
-/// URL 末尾斜杠不改变远端身份，哈希时统一去掉，避免「补一个 /」就找不到密码。
+/// 大小写、末尾斜杠与 query 都不改变远端身份，统一走 [`super::remote_identity`]，
+/// 避免「补一个 /」或把域名改成小写就找不到密码。
 pub(crate) fn account(url: &str, username: &str) -> String {
-    let url = url.trim().trim_end_matches('/');
-    sha256_base64(format!("{}\n{}", url, username.trim()).as_bytes())
+    sha256_base64(super::remote_identity(url, username).as_bytes())
 }
 
 /// 保存密码；覆盖已有凭据。
@@ -92,6 +92,16 @@ mod tests {
             account("https://dav.example.com/dav", "alice"),
             account("https://dav.example.com/dav/", "alice"),
             "末尾斜杠不应改变凭据身份"
+        );
+        assert_eq!(
+            account("https://DAV.example.com/dav", "alice"),
+            account("https://dav.example.com/dav", "alice"),
+            "域名大小写不改变凭据身份"
+        );
+        assert_eq!(
+            account("https://dav.example.com/dav?token=1", "alice"),
+            account("https://dav.example.com/dav", "alice"),
+            "query 不改变凭据身份"
         );
         assert_ne!(a, account("https://dav.example.com/", "bob"));
         assert_ne!(a, account("https://other.example.com/", "alice"));

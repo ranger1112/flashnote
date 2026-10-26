@@ -39,6 +39,8 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 const UNLIMITED: usize = usize::MAX;
 /// 单次请求内最多补两次；再失败就留给下一轮同步。
 const MAX_RETRIES: u32 = 2;
+/// 目录列表上限：GET 有 2 MiB 上限，PROPFIND 也需要有，避免恶意/异常响应撑爆内存。
+const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
 /// `Retry-After` 可能长达一小时，单轮最多等这么久，剩下的下次再说。
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const DEPTH_HEADER: HeaderName = HeaderName::from_static("depth");
@@ -110,6 +112,16 @@ impl WebDavBackend {
     /// 下一轮允许发出的请求数；用尽后本轮剩余文件留到下一轮。
     pub(crate) fn reset_budget(&self, requests: usize) {
         self.budget.store(requests, Ordering::Relaxed);
+    }
+
+    /// 写入/删除前预留够用的预算，避免「写成功了、回读却因预算耗尽失败」，
+    /// 导致记录不提交、下一轮误判为并发修改。
+    fn reserve_budget(&self, units: usize) -> Result<(), SyncError> {
+        let remaining = self.budget.load(Ordering::Relaxed);
+        if remaining != UNLIMITED && remaining < units {
+            return Err(SyncError::Budget);
+        }
+        Ok(())
     }
 
     fn take_budget(&self) -> Result<(), SyncError> {
@@ -242,7 +254,10 @@ impl WebDavBackend {
             match status.as_u16() {
                 // 已存在或父目录刚建好，都不是错误。
                 301 | 405 | 409 => {}
-                401 | 403 => return Err(map_status("创建同步目录", &response)),
+                // 有的服务器对已存在的集合返回 403，而不是 405。放行后续请求，
+                // 真的没权限时 PROPFIND/PUT 会给出准确错误。
+                403 => {}
+                401 => return Err(map_status("创建同步目录", &response)),
                 _ => return Err(SyncError::Other(format!("创建同步目录失败：HTTP {status}"))),
             }
         }
@@ -272,10 +287,7 @@ impl WebDavBackend {
         if !response.status().is_success() {
             return Err(map_status("读取远端目录", &response));
         }
-        let text = response
-            .text()
-            .await
-            .map_err(|error| SyncError::Network(format!("读取远端目录失败：{error}")))?;
+        let text = read_limited(response, MAX_LIST_BYTES, "远端目录").await?;
         Ok((text, final_url))
     }
 
@@ -621,6 +633,8 @@ impl SyncBackend for WebDavBackend {
             }
         }
 
+        // 预留「写 + 回读（+ 补写）」的预算：写到一半没预算会让记录不提交。
+        self.reserve_budget(if conditional { 1 } else { 3 })?;
         let mut response = self
             .request(
                 Method::PUT,
@@ -697,6 +711,8 @@ impl SyncBackend for WebDavBackend {
                 self.check_version(&url, version, sha256.as_deref()).await?;
             }
         }
+        // 条件删除 1 个请求；非条件删除前面还要 GET 复核，预留 2 个。
+        self.reserve_budget(if conditional { 1 } else { 2 })?;
         let (response, _) = self
             .request(Method::DELETE, url, headers, None, REQUEST_TIMEOUT)
             .await?;
@@ -924,6 +940,28 @@ enum Field {
     Size,
     Modified,
     Status,
+}
+
+/// 按块读取响应体，超过上限立即中止，错误信息标明是哪个请求。
+async fn read_limited(
+    mut response: Response,
+    limit: usize,
+    label: &str,
+) -> Result<String, SyncError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| SyncError::Network(format!("读取{label}失败：{error}")))?
+    {
+        if bytes.len() + chunk.len() > limit {
+            return Err(SyncError::Unsupported(format!(
+                "{label}超过 {limit} 字节，已中止"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| SyncError::Unsupported(format!("{label}不是 UTF-8")))
 }
 
 /// `HTTP/1.1 404 Not Found` → `404`。
@@ -1561,6 +1599,68 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.headers.get("authorization").is_some()));
+    }
+
+    #[tokio::test]
+    async fn oversized_listing_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .respond_with(
+                ResponseTemplate::new(207).set_body_string("a".repeat(MAX_LIST_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let error = backend_with(&server, STRONG).list().await.unwrap_err();
+        assert!(matches!(error, SyncError::Unsupported(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mkcol_forbidden_is_tolerated() {
+        let server = MockServer::start().await;
+        for dir in ["/flashnote/", "/flashnote/notes/"] {
+            Mock::given(method("MKCOL"))
+                .and(path(dir))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+        }
+
+        backend_with(&server, STRONG)
+            .ensure_collections()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_reserves_budget_for_the_readback() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/flashnote/notes/2026-10-23.md"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let caps = Capabilities {
+            strong_etag: true,
+            honors_if_match: true,
+            honors_if_none_match: false,
+            reliable_listing: true,
+        };
+        let backend = backend_with(&server, caps);
+        // exists() 预检吃掉 1 个，剩下 1 个不够「写 + 回读」。
+        backend.reset_budget(2);
+        let error = backend
+            .put("2026-10-23.md", b"x\n", Expect::Absent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::Budget), "{error}");
     }
 
     #[tokio::test]

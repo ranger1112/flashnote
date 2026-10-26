@@ -253,12 +253,8 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let notes_dir = PathBuf::from(&settings.notes_dir);
-    // 只差末尾斜杠的地址是同一个远端，状态目录不能因此换一份。
-    let remote_key = format!(
-        "{}\n{}",
-        sync.url.trim_end_matches('/'),
-        sync.username.trim()
-    );
+    // 只差末尾斜杠、大小写或 query 的地址是同一个远端，状态目录不能因此换一份。
+    let remote_key = super::remote_identity(&sync.url, &sync.username);
     let store = StateStore::with_remote(&config_dir, &notes_dir, &remote_key);
     let device = sync.device_label();
     // StateStore::load 会读 state.json；连同引擎构造一起放进阻塞线程池。

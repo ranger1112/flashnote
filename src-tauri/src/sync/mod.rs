@@ -32,6 +32,25 @@ use crate::notes;
 
 /// 与协议一致：单个笔记文件明文上限 2 MiB。
 pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 远端身份：规范化后的 URL（scheme/host 小写、去 query/fragment、去尾斜杠）
+/// 加上用户名。凭据、状态目录与「地址是否变了」的判断都必须用同一份身份，
+/// 否则大小写或多余参数的差异会让密码「丢失」、状态目录重新开始。
+pub(crate) fn remote_identity(url: &str, username: &str) -> String {
+    let canonical = match reqwest::Url::parse(url.trim()) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let mut text = parsed.to_string();
+            while text.ends_with('/') {
+                text.pop();
+            }
+            text
+        }
+        Err(_) => url.trim().trim_end_matches('/').to_string(),
+    };
+    format!("{}\n{}", canonical, username.trim())
+}
 /// 删除安全阀：超过这个数量、且占比超过阈值才中止。
 const DELETE_MIN_FILES: usize = 5;
 const DELETE_RATIO_PERCENT: usize = 30;
@@ -72,6 +91,12 @@ impl SyncSummary {
         match error {
             SyncError::Budget | SyncError::TooLarge => {
                 self.warnings.push(format!("{name}：{error}"));
+            }
+            // 密码失效或持续限流时继续逐文件重试只会锤服务器：本轮到此为止，
+            // 让调度器按正常节奏再来。
+            SyncError::Auth(_) | SyncError::RateLimited { .. } => {
+                self.aborted = true;
+                self.error(name, error);
             }
             other => self.error(name, other),
         }
@@ -505,6 +530,10 @@ impl<B: SyncBackend> SyncEngine<B> {
                 &mut summary,
             )
             .await;
+            // 认证失效/限流已标记中止：不再继续打后续文件。
+            if summary.aborted {
+                break;
+            }
         }
 
         self.state.last_sync_at = Some(now_iso());
@@ -1110,7 +1139,7 @@ mod tests {
     use super::*;
     use crate::sync::backend::SyncBackend;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -1126,6 +1155,9 @@ mod tests {
         hidden: Mutex<BTreeSet<String>>,
         /// 模拟 GET/PUT 与 PROPFIND 使用不同来源的版本令牌。
         diverge_list: AtomicBool,
+        /// 模拟密码失效：PUT 一律返回 Auth。
+        fail_put_auth: AtomicBool,
+        put_calls: AtomicUsize,
     }
 
     impl FakeBackend {
@@ -1138,6 +1170,8 @@ mod tests {
                     fail_list: AtomicBool::new(false),
                     hidden: Mutex::new(BTreeSet::new()),
                     diverge_list: AtomicBool::new(false),
+                    fail_put_auth: AtomicBool::new(false),
+                    put_calls: AtomicUsize::new(0),
                 }),
             }
         }
@@ -1162,6 +1196,14 @@ mod tests {
 
         fn names(&self) -> Vec<String> {
             self.inner.files.lock().unwrap().keys().cloned().collect()
+        }
+
+        fn set_put_auth_failure(&self) {
+            self.inner.fail_put_auth.store(true, Ordering::SeqCst);
+        }
+
+        fn put_calls(&self) -> usize {
+            self.inner.put_calls.load(Ordering::SeqCst)
         }
 
         fn remove(&self, name: &str) {
@@ -1245,6 +1287,10 @@ mod tests {
             data: &[u8],
             expect: Expect,
         ) -> Result<RemoteVersion, SyncError> {
+            self.inner.put_calls.fetch_add(1, Ordering::SeqCst);
+            if self.inner.fail_put_auth.load(Ordering::SeqCst) {
+                return Err(SyncError::Auth("401".into()));
+            }
             let mut files = self.inner.files.lock().unwrap();
             if self.inner.caps.honors_if_match {
                 match &expect {
@@ -1348,6 +1394,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn remote_identity_ignores_case_trailing_slash_and_query() {
+        let base = remote_identity("https://dav.example.com/dav/", "alice");
+        assert_eq!(
+            base,
+            remote_identity("https://DAV.example.com/dav", " alice ")
+        );
+        assert_eq!(
+            base,
+            remote_identity("https://dav.example.com/dav/?token=1", "alice")
+        );
+        assert_ne!(
+            base,
+            remote_identity("https://dav.example.com/other", "alice")
+        );
+        assert_ne!(base, remote_identity("https://dav.example.com/dav/", "bob"));
     }
 
     #[test]
@@ -1880,6 +1944,34 @@ mod tests {
         let summary = harness.run();
         assert_eq!(summary.deleted, 0, "{summary:?}");
         assert!(harness.notes.join("2026-10-23.md").exists());
+    }
+
+    #[test]
+    fn auth_failure_aborts_the_round_after_the_first_file() {
+        let harness = Harness::new("auth-abort");
+        for day in 1..=3 {
+            harness.write(
+                &format!("2026-10-{day:02}.md"),
+                &format!("# 2026-10-{day:02}\n"),
+            );
+        }
+        harness.backend.set_put_auth_failure();
+
+        let summary = harness.run();
+        assert!(summary.aborted, "{summary:?}");
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|error| error.contains("认证失败")),
+            "{summary:?}"
+        );
+        assert_eq!(
+            harness.backend.put_calls(),
+            1,
+            "认证失败后不应继续打后续文件"
+        );
+        assert!(harness.backend.names().is_empty());
     }
 
     #[test]
