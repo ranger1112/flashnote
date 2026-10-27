@@ -399,6 +399,10 @@ Windows「设置 → 应用」里卸载「FlashNote」（闪记），或运行�
 
 版本变更见 [CHANGELOG.md](CHANGELOG.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 Issue。
 
+## 致谢
+
+感谢 [LINUX DO](https://linux.do) 社区提供的交流与反馈环境。本项目的开源推广在 LINUX DO 社区进行，也感谢社区里提出问题、试用并给出建议的各位佬友。
+
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 开源。

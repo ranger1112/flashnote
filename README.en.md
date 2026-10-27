@@ -399,6 +399,10 @@ Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for
 
 See [CHANGELOG.md](CHANGELOG.md) for version changes; report security issues privately as described in [SECURITY.md](SECURITY.md) instead of opening a public issue.
 
+## Acknowledgements
+
+Thanks to the [LINUX DO](https://linux.do) community for providing a place to discuss and give feedback. FlashNote's open-source promotion happens in the LINUX DO community, and thanks to everyone there who tried it, filed issues, and suggested improvements.
+
 ## License
 
 This project is open source under the [MIT License](LICENSE).
