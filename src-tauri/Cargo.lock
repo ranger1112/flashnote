@@ -1176,7 +1176,7 @@ name = "flashnote"
 version = "0.5.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "keyring",
  "log",
