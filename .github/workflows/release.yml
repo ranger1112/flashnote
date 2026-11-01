@@ -121,7 +121,7 @@ jobs:
       # 「FlashNote_<版本>_x64-setup.exe」；仍用 assetNamePattern 固定命名，
       # 避免以后改产品名时影响下载链接。
       - name: 构建并创建 Release
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # minisign 私钥，用于生成 .sig 与 latest.json；缺失时构建出的包无法被自动更新校验
