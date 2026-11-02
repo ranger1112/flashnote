@@ -22,6 +22,37 @@ pub(crate) fn parse_hotkey(accel: &str) -> Result<Shortcut, String> {
     Ok(shortcut)
 }
 
+/// 只允许应用自身页面做顶层导航。主窗口是无边框置顶的，一旦被远程页面接管，
+/// Esc 与本地 JS 都会失效，用户只能从托盘退出；外部链接一律交给系统浏览器。
+pub(crate) fn navigation_allowed(url: &tauri::Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    match url.scheme() {
+        // macOS / Linux 的生产页面
+        "tauri" => host.eq_ignore_ascii_case("localhost"),
+        // Windows 生产页面是 http(s)://tauri.localhost；开发时是 Vite 的 1420 端口
+        "http" | "https" => {
+            host.eq_ignore_ascii_case("tauri.localhost")
+                // 只有 debug 构建才可能跑 Vite 开发服务器，release 永不放行
+                || (cfg!(debug_assertions)
+                    && host.eq_ignore_ascii_case("localhost")
+                    && url.port() == Some(1420))
+        }
+        _ => false,
+    }
+}
+
+fn navigation_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("navigation-guard")
+        .on_navigation(|_webview, url| {
+            let allowed = navigation_allowed(url);
+            if !allowed {
+                log::warn!("已阻止主窗口导航到 {url}");
+            }
+            allowed
+        })
+        .build()
+}
+
 /// release 构建没有控制台，启动失败时用 MessageBox 把原因显示出来。
 #[cfg(windows)]
 fn fatal_dialog(message: &str) {
@@ -90,6 +121,7 @@ fn register_hotkey(app: &tauri::AppHandle, accel: &str) -> Result<(), String> {
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(navigation_guard())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             commands::show_window_impl(app);
         }))
@@ -269,4 +301,30 @@ fn main() {
             commands::persist_on_exit(app);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::navigation_allowed;
+
+    fn allowed(url: &str) -> bool {
+        navigation_allowed(&url.parse().expect("测试 URL 必须合法"))
+    }
+
+    #[test]
+    fn allows_only_the_app_origin() {
+        // Windows 生产页面
+        assert!(allowed("https://tauri.localhost/"));
+        assert!(allowed("http://tauri.localhost/index.html"));
+        // macOS / Linux 生产页面
+        assert!(allowed("tauri://localhost/"));
+        // 开发页面（Vite 固定 1420 端口）
+        assert_eq!(allowed("http://localhost:1420/"), cfg!(debug_assertions));
+        assert!(!allowed("http://localhost:1421/"));
+        // 远程与本地文件一律拒绝
+        assert!(!allowed("https://example.com/"));
+        assert!(!allowed("https://tauri.localhost.evil.example/"));
+        assert!(!allowed("file:///C:/Windows/win.ini"));
+        assert!(!allowed("javascript:alert(1)"));
+    }
 }
