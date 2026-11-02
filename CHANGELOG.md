@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-02
+
 ### 修复
 
 - 预览里的 `<area>` 链接不再能绕过拦截把主窗口导航到远程页面：新增全局 `on_navigation` 守卫，预览只保留 HTML profile，并剥离 `area`/`map`/SVG/表单控件与 `class`/`id`，防止 UI 伪装。
@@ -194,7 +196,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.2
 [0.5.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.4.0
