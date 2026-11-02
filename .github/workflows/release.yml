@@ -118,10 +118,11 @@ jobs:
         run: cargo test --locked
 
       # 安装包内部文件名由 productName 决定，现在是 ASCII 的
-      # 「FlashNote_<版本>_x64-setup.exe」；仍用 assetNamePattern 固定命名，
-      # 避免以后改产品名时影响下载链接。
+      # 「FlashNote_<版本>_x64-setup.exe」；仍用 releaseAssetNamePattern 固定命名，
+      # 避免以后改产品名时影响下载链接。该输入在 tauri-action 1.0.0 由
+      # assetNamePattern 改名而来，旧名会被当作未知输入静默忽略。
       - name: 构建并创建 Release
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # minisign 私钥，用于生成 .sig 与 latest.json；缺失时构建出的包无法被自动更新校验
@@ -132,8 +133,7 @@ jobs:
           releaseName: "闪记 ${{ steps.meta.outputs.tag }}"
           releaseDraft: true
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          # 已发布的 tauri-action 里这个输入叫 assetNamePattern（dev 分支文档写的是 releaseAssetNamePattern）
-          assetNamePattern: "FlashNote_[version]_[arch][setup][ext]"
+          releaseAssetNamePattern: "FlashNote_[version]_[arch][setup][ext]"
           releaseBody: |
             ## 下载
 
