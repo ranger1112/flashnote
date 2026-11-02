@@ -1,12 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import DOMPurify from "dompurify";
-import { marked } from "marked";
 import {
   matchesTerm,
   nextOffset,
   withoutEntry,
   type NoteEntry,
 } from "./lib";
+import { markdownHtml } from "./markdown";
 import { ui } from "./dom";
 import { settings } from "./settings-store";
 import { hideUndoBar, showUndoBar, toast } from "./toast";
@@ -50,15 +49,6 @@ export function closeHistory(animate = true, force = false): void {
   }
   // 未落盘的删除由撤销定时器负责，收起面板不提前提交，撤销窗口保持完整
   hidePanel(ui.historyPanel, animate);
-}
-
-function markdownHtml(markdown: string): string {
-  const html = marked.parse(markdown, { async: false });
-  // 内联 style 不能留：同步来的笔记可以借此盖住界面做 UI 伪装。
-  return DOMPurify.sanitize(String(html), {
-    FORBID_ATTR: ["style"],
-    FORBID_TAGS: ["style"],
-  });
 }
 
 export function paintPreviewButton(): void {

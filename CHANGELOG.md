@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 预览里的 `<area>` 链接不再能绕过拦截把主窗口导航到远程页面：新增全局 `on_navigation` 守卫，预览只保留 HTML profile，并剥离 `area`/`map`/SVG/表单控件与 `class`/`id`，防止 UI 伪装。
+
 ## [0.5.1] - 2026-10-26
 
 ### 修复

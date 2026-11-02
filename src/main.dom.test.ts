@@ -641,3 +641,44 @@ describe("草稿", () => {
     expect(window.localStorage.getItem(DRAFT_KEY)).toBeNull();
   });
 });
+
+describe("预览安全", () => {
+  it("外链点击被拦截并交给系统浏览器", async () => {
+    await boot();
+    await openHistory();
+
+    const content = node<HTMLElement>("#entry-list .entry-content");
+    const anchor = document.createElement("a");
+    anchor.setAttribute("href", "https://example.com/path");
+    anchor.textContent = "外链";
+    content.append(anchor);
+
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    anchor.dispatchEvent(event);
+    await flush();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(mocks.invoke).toHaveBeenCalledWith("open_external_url", {
+      url: "https://example.com/path",
+    });
+  });
+
+  it("图片映射区域的外链也会被拦截", async () => {
+    await boot();
+    await openHistory();
+
+    const content = node<HTMLElement>("#entry-list .entry-content");
+    const area = document.createElement("area");
+    area.setAttribute("href", "https://evil.example/area");
+    content.append(area);
+
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    area.dispatchEvent(event);
+    await flush();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(mocks.invoke).toHaveBeenCalledWith("open_external_url", {
+      url: "https://evil.example/area",
+    });
+  });
+});

@@ -320,10 +320,15 @@ window.addEventListener(
 function handleLinkActivation(event: MouseEvent): void {
   const target = event.target;
   if (!(target instanceof Element)) return;
-  const anchor = target.closest("a[href]");
-  if (!(anchor instanceof HTMLAnchorElement)) return;
+  // 不能只认 HTMLAnchorElement：<area> 与 SVG <a> 都不是它，
+  // 漏掉任何一个都会让 WebView 自己导航到远程页面。
+  const anchor = target.closest("a[href], area[href]");
+  if (!(anchor instanceof Element)) return;
 
-  const href = anchor.getAttribute("href") ?? "";
+  const href =
+    anchor.getAttribute("href") ??
+    anchor.getAttributeNS("http://www.w3.org/1999/xlink", "href") ??
+    "";
   // 页内锚点保持默认行为，其余一律不让 WebView 自己跳
   if (href.trim().startsWith("#")) return;
   event.preventDefault();
