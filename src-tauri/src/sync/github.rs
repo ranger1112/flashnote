@@ -27,6 +27,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 与 WebDAV 后端保持一致的单文件上限。
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const UNLIMITED: usize = usize::MAX;
+/// 只读请求遇到网络抖动时的轮内重试次数；与 WebDAV 后端保持一致的口径。
+const MAX_RETRIES: u32 = 2;
 
 /// 文件名里只需要转义会破坏 URL 的字符；`.`、`-`、`_` 保持原样。
 const PATH_ENCODE: &AsciiSet = &CONTROLS
@@ -174,12 +176,7 @@ impl GitHubBackend {
     /// 「远端一个文件都没有」，进而把本地笔记全部当成已删除。
     async fn probe(&self) -> Result<(), SyncError> {
         let url = format!("{}/repos/{}/{}", self.api, self.owner, self.repo);
-        self.spend()?;
-        let response = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
         // 仓库不存在时 GitHub 用 404 而不是 403，避免泄露私有仓库是否存在。
         if response.status() == StatusCode::NOT_FOUND {
             return Err(SyncError::Auth(
@@ -198,12 +195,7 @@ impl GitHubBackend {
             self.repo,
             utf8_percent_encode(branch, PATH_ENCODE)
         );
-        self.spend()?;
-        let response = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
         if response.status() == StatusCode::NOT_FOUND {
             // 空仓库还没有任何分支，第一次写入会创建它，不能因此报错。
             // 用 /commits 判断而不是仓库大小：size 按 KB 取整，极小的非空仓库
@@ -219,18 +211,38 @@ impl GitHubBackend {
         Ok(())
     }
 
+    /// 只读请求的轮内重试：网络抖动/连接失败时重试两次，超时与 4xx 不重试。
+    ///
+    /// 只包 GET：PUT/DELETE 在「其实已经成功、只是响应丢了」的情况下重试
+    /// 会拿到 409，被引擎当成并发修改，白白生成一次冲突。
+    async fn send_retry<F>(&self, build: F) -> Result<reqwest::Response, SyncError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut attempt = 0;
+        loop {
+            self.spend()?;
+            match build().send().await {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if (error.is_connect() || error.is_timeout()) && attempt < MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    let delay = Duration::from_secs(attempt as u64);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(network(error)),
+            }
+        }
+    }
+
     /// GitHub 对空仓库的 `/commits` 返回 409，用它判断比看仓库大小可靠。
     async fn repo_is_empty(&self) -> Result<bool, SyncError> {
         let url = format!(
             "{}/repos/{}/{}/commits?per_page=1",
             self.api, self.owner, self.repo
         );
-        self.spend()?;
-        let response = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
         if response.status() == StatusCode::CONFLICT {
             return Ok(true);
         }
@@ -438,12 +450,7 @@ impl SyncBackend for GitHubBackend {
             self.repo,
             utf8_percent_encode(ref_name, PATH_ENCODE)
         );
-        self.spend()?;
-        let response = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
 
         if matches!(
             response.status(),
@@ -490,13 +497,8 @@ impl SyncBackend for GitHubBackend {
     }
 
     async fn get(&self, name: &str) -> Result<Option<(Vec<u8>, RemoteVersion)>, SyncError> {
-        self.spend()?;
         let url = self.with_ref(&self.file_url(name));
-        let response = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -520,13 +522,8 @@ impl SyncBackend for GitHubBackend {
     }
 
     async fn exists(&self, name: &str) -> Result<bool, SyncError> {
-        self.spend()?;
         let url = self.with_ref(&self.file_url(name));
-        let response = self
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
         match response.status() {
             StatusCode::NOT_FOUND => Ok(false),
             status if status.is_success() => Ok(true),
@@ -612,11 +609,8 @@ impl GitHubBackend {
             reqwest::header::HeaderValue::from_static("application/vnd.github.raw"),
         );
         let response = self
-            .request(Method::GET, &url)
-            .headers(accept)
-            .send()
-            .await
-            .map_err(network)?;
+            .send_retry(|| self.request(Method::GET, &url).headers(accept.clone()))
+            .await?;
         let response = self.check(response).await?;
         let bytes = response.bytes().await.map_err(network)?;
         Ok(bytes.to_vec())
