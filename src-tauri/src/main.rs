@@ -322,10 +322,7 @@ mod tests {
 
     fn allowed(url: &str) -> bool {
         let dev: tauri::Url = "http://localhost:1421/".parse().expect("devUrl 必须合法");
-        navigation_allowed(
-            &url.parse().expect("测试 URL 必须合法"),
-            Some(&dev),
-        )
+        navigation_allowed(&url.parse().expect("测试 URL 必须合法"), Some(&dev))
     }
 
     #[test]
