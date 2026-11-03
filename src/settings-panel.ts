@@ -28,7 +28,8 @@ interface GitStatus {
 async function paintGitStatus(): Promise<void> {
   try {
     const status = await invoke<GitStatus>("get_git_status");
-    ui.gitBackupCheck.disabled = !status.available;
+    // 没装 Git 时禁用开关，但已经开启的必须还能关掉
+    ui.gitBackupCheck.disabled = !status.available && !settings.gitBackup;
     ui.gitInit.hidden = !status.available || status.repo;
     ui.gitStatus.classList.toggle("warn", !status.available);
     if (!status.available) {

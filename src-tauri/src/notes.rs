@@ -779,12 +779,19 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
                     content.clone(),
                     source.clone(),
                 ));
-            } else if (tag_query.is_none() || text_hits.len() < limit)
-                && matches_query(&date, &time, &content, source.as_deref(), needle, &folded)
-            {
+            } else if tag_query.is_some() {
+                // 没有同名标签时退回字面量匹配：只找「不是更长标签前缀」的那些。
+                if contains_literal_tag(&content, needle) {
+                    text_hits.push(entry_for(&path, &date, time, content, source));
+                }
+            } else if matches_query(&date, &time, &content, source.as_deref(), needle, &folded) {
                 text_hits.push(entry_for(&path, &date, time, content, source));
+                // 普通关键词：凑够条数立刻返回，不把整库都扫一遍再截断
+                if text_hits.len() >= limit {
+                    return Ok(text_hits);
+                }
             }
-            if tag_hits.len() >= limit && text_hits.len() >= limit {
+            if tag_query.is_some() && tag_hits.len() >= limit && text_hits.len() >= limit {
                 break;
             }
         }
@@ -796,6 +803,20 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
     };
     result.truncate(limit);
     Ok(result)
+}
+
+/// 字面量 `#标签` 匹配：命中的位置后面不能再跟标签字符，
+/// 否则搜 `#工作` 会把 `#工作台` 也算进来。
+fn contains_literal_tag(text: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(needle) {
+        let end = from + offset + needle.len();
+        if !text[end..].chars().next().is_some_and(is_tag_char) {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// 搜索词是不是「就是要这个标签」：单个 `#标签`，且不带空白。
@@ -1413,6 +1434,27 @@ mod tests {
 
         let hits = search_entries(&dir, "#项目A", 10).unwrap();
         assert_eq!(hits.len(), 1, "没有同名标签时应退回子串匹配");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tag_prefix_still_does_not_match_without_an_exact_hit() {
+        let dir = std::env::temp_dir().join(format!("flashnote-tag-prefix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 只有 `#工作台`，没有 `#工作`：退回字面量匹配时也不能命中前缀
+        fs::write(
+            dir.join("2026-10-21.md"),
+            "# 2026-10-21
+
+- 10:00 修桌子 #工作台
+",
+        )
+        .unwrap();
+
+        assert!(search_entries(&dir, "#工作", 10).unwrap().is_empty());
+        assert_eq!(search_entries(&dir, "#工作台", 10).unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

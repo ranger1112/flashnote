@@ -831,7 +831,10 @@ pub fn save_sync_password(
         .sync
         .clone();
     if !sync.is_configured() {
-        return Err("请先填写 WebDAV 地址和用户名".to_string());
+        return Err(match sync.kind {
+            SyncKind::Github => "请先填写 GitHub 仓库地址".to_string(),
+            SyncKind::Webdav => "请先填写 WebDAV 地址和用户名".to_string(),
+        });
     }
 
     // 先记在内存里：凭据管理器被禁用时，本次会话仍然能同步。

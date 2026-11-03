@@ -79,6 +79,13 @@ pub(crate) fn commit(dir: &Path) -> Result<bool, String> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+    // 仓库正处于合并冲突时不能提交：`git add` 会把带冲突标记的文件标成已解决，
+    // 一次保存就等于替用户「解决」了冲突并把标记写进历史。
+    let unmerged = run(Some(dir), &["ls-files", "-u"])?;
+    if unmerged.status.success() && !unmerged.stdout.is_empty() {
+        return Err("笔记仓库有未解决的合并冲突，已跳过自动提交".to_string());
+    }
+
     let added = run(Some(dir), &["add", "-A", "--", "*.md"])?;
     if !added.status.success() {
         // 目录里一个 .md 都没有时 git 会报 pathspec 不匹配；这不是错误
@@ -90,12 +97,15 @@ pub(crate) fn commit(dir: &Path) -> Result<bool, String> {
     }
 
     // 暂存区与 HEAD 一致：这次保存没有产生新内容（例如重复确认了同一条删除）
-    let staged = run(Some(dir), &["diff", "--cached", "--quiet"])?;
+    let staged = run(Some(dir), &["diff", "--cached", "--quiet", "--", "*.md"])?;
     if staged.status.success() {
         return Ok(false);
     }
 
-    let changed = run(Some(dir), &["diff", "--cached", "--name-only"])?;
+    let changed = run(
+        Some(dir),
+        &["diff", "--cached", "--name-only", "--", "*.md"],
+    )?;
     let count = String::from_utf8_lossy(&changed.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -116,7 +126,9 @@ pub(crate) fn commit(dir: &Path) -> Result<bool, String> {
             "user.email=flashnote@localhost",
         ]);
     }
-    args.extend(["commit", "-q", "-m", &message]);
+    // 带上 pathspec：只提交我们刚 stage 的 Markdown，用户自己 `git add` 的
+    // 其它文件（或别人留下的暂存内容）不能被卷进「笔记…」这条提交里。
+    args.extend(["commit", "-q", "-m", &message, "--", "*.md"]);
 
     let out = run(Some(dir), &args)?;
     if !out.status.success() {
@@ -150,9 +162,13 @@ fn enabled_notes_dir(app: &AppHandle) -> Option<PathBuf> {
 }
 
 fn has_identity(dir: &Path) -> bool {
+    // 有些安装器会把 user.name 设成空字符串：exit 0 且输出只有一个换行，
+    // 只判 is_empty 会误以为身份可用，之后每次提交都报 empty ident name。
     let read = |key: &str| {
         run(Some(dir), &["config", key])
-            .map(|out| out.status.success() && !out.stdout.is_empty())
+            .map(|out| {
+                out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+            })
             .unwrap_or(false)
     };
     read("user.name") && read("user.email")
@@ -232,6 +248,31 @@ mod tests {
 
         fs::write(dir.join("2026-10-31.md"), "- 11:00 又记一笔\n").unwrap();
         assert!(commit(&dir).unwrap(), "内容变化后应再次提交");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_does_not_sweep_user_staged_files() {
+        if !available() {
+            return;
+        }
+        let dir = temp_dir("stage");
+        init(&dir).unwrap();
+        fs::write(dir.join("2026-10-31.md"), "note").unwrap();
+        fs::write(dir.join("secret.txt"), "do not commit me").unwrap();
+
+        // 用户自己把非 Markdown 文件放进暂存区
+        run(Some(&dir), &["add", "--", "secret.txt"]).unwrap();
+
+        assert!(commit(&dir).unwrap());
+        let tree = run(Some(&dir), &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let files = String::from_utf8_lossy(&tree.stdout);
+        assert!(files.contains("2026-10-31.md"));
+        assert!(
+            !files.contains("secret.txt"),
+            "不该把用户暂存的文件卷进笔记提交"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

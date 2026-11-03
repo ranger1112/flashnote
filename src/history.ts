@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   exactTagTerm,
-  matchesSubstring,
+  matchesLiteralTag,
   matchesTerm,
   nextOffset,
   withoutEntry,
@@ -454,7 +454,7 @@ function matchesLocally(note: NoteEntry, term: string): boolean {
   );
   return known
     ? note.tags.some((value) => value.toLowerCase() === tag.toLowerCase())
-    : matchesSubstring(note, term);
+    : matchesLiteralTag(note, term);
 }
 
 /** 点标签即筛选；再点一次（搜索框已经是这个标签）取消筛选。 */

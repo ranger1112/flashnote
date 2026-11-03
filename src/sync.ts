@@ -229,6 +229,13 @@ function normalizeSyncUrl(value: string): string {
   }
 }
 
+/** GitHub 仓库地址的规范形：只保留 owner/repo，大小写不敏感。 */
+function normalizeRepoUrl(value: string): string {
+  const match = /github\.com[/:]+([^/\s]+)\/([^/\s#?]+)/i.exec(value.trim());
+  if (!match) return value.trim();
+  return `${match[1].toLowerCase()}/${match[2].replace(/\.git$/i, "").toLowerCase()}`;
+}
+
 /** 公网明文 http 需要用户再确认一次；本机与私网地址不打扰。 */
 function needsInsecureConfirmation(url: string): boolean {
   try {
@@ -254,10 +261,14 @@ async function saveSyncConfig(): Promise<void> {
   }
   ui.syncError.textContent = "";
   const form = readSyncForm();
+  // 与后端 credential_identity 同口径：GitHub 只看仓库（分支不参与），
+  // WebDAV 才把账号算进去。
   const identityChanged =
     settings.sync.kind !== form.kind ||
-    normalizeSyncUrl(settings.sync.url) !== normalizeSyncUrl(form.url) ||
-    settings.sync.username.trim() !== form.username;
+    (form.kind === "github"
+      ? normalizeRepoUrl(settings.sync.url) !== normalizeRepoUrl(form.url)
+      : normalizeSyncUrl(settings.sync.url) !== normalizeSyncUrl(form.url) ||
+        settings.sync.username.trim() !== form.username);
   if (form.kind === "webdav" && form.allowInsecureHttp && needsInsecureConfirmation(form.url)) {
     if (typeof window.confirm !== "function") {
       // 拿不到确认对话框时宁可拒绝保存，也不能静默把密码发到公网明文地址。
@@ -373,6 +384,8 @@ export function initSync(): void {
     // 的用户名被当成 GitHub 的分支提交上去。
     ui.syncUsername.value = "";
     ui.syncUsername.placeholder = "";
+    // 密码栏也要清：WebDAV 的应用密码不能被当成 GitHub 的令牌存下去
+    ui.syncPassword.value = "";
     paintSyncKind();
   });
   ui.syncSave.addEventListener("click", () => void saveSyncConfig());

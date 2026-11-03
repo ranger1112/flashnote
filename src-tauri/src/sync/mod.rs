@@ -65,8 +65,12 @@ pub(crate) fn credential_identity(
             format!("{}\n{}", canonical_url(url), username.trim())
         }
         crate::settings::SyncKind::Github => match github::parse_repo(url) {
-            Some((owner, repo, _)) => format!("github\n{owner}/{repo}"),
-            None => format!("github\n{}", canonical_url(url)),
+            // GitHub 的 owner/repo 大小写不敏感，身份也必须如此：
+            // 否则把 URL 改个大小写就会清掉仍然有效的令牌。
+            Some((owner, repo, _)) => {
+                format!("github\n{}/{}", owner.to_lowercase(), repo.to_lowercase())
+            }
+            None => format!("github\n{}", canonical_url(url).to_lowercase()),
         },
     }
 }
@@ -94,7 +98,11 @@ pub(crate) fn remote_identity(
                     (!value.is_empty()).then(|| value.to_string())
                 })
                 .unwrap_or_default();
-            format!("github\n{owner}/{repo}\n{branch}")
+            format!(
+                "github\n{}/{}\n{branch}",
+                owner.to_lowercase(),
+                repo.to_lowercase()
+            )
         }
     }
 }

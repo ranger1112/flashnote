@@ -95,6 +95,10 @@ pub(crate) fn parse_repo(url: &str) -> Option<(String, String, Option<String>)> 
     if !owner.chars().all(is_name_char) || !repo.chars().all(is_name_char) {
         return None;
     }
+    // `.` / `..` 会被 URL 规范化吃掉，拼出来的 API 路径指向别处
+    if owner.trim_matches('.').is_empty() || repo.trim_matches('.').is_empty() {
+        return None;
+    }
     let branch = match parts.next() {
         // `/tree/<分支>` 是分支页面；`/blob/<分支>/<文件>` 是文件页面，
         // 后面的路径不是分支名，宁可忽略也不能拼出一个不存在的分支。
@@ -182,15 +186,7 @@ impl GitHubBackend {
                 "令牌无权访问该仓库，或仓库地址不正确".to_string(),
             ));
         }
-        let response = self.check(response).await?;
-        let info: RepoInfo = response
-            .json()
-            .await
-            .map_err(|error| SyncError::Other(format!("解析仓库信息失败：{error}")))?;
-        // 空仓库还没有任何分支，第一次写入会创建它，不能因此报错。
-        if info.size == 0 {
-            return Ok(());
-        }
+        self.check(response).await?;
 
         let Some(branch) = &self.branch else {
             return Ok(());
@@ -209,12 +205,37 @@ impl GitHubBackend {
             .await
             .map_err(network)?;
         if response.status() == StatusCode::NOT_FOUND {
+            // 空仓库还没有任何分支，第一次写入会创建它，不能因此报错。
+            // 用 /commits 判断而不是仓库大小：size 按 KB 取整，极小的非空仓库
+            // 也可能报 0，那样就把校验放空了。
+            if self.repo_is_empty().await? {
+                return Ok(());
+            }
             return Err(SyncError::Auth(format!(
                 "远端没有分支 {branch}，请检查“分支”这一栏"
             )));
         }
         self.check(response).await?;
         Ok(())
+    }
+
+    /// GitHub 对空仓库的 `/commits` 返回 409，用它判断比看仓库大小可靠。
+    async fn repo_is_empty(&self) -> Result<bool, SyncError> {
+        let url = format!(
+            "{}/repos/{}/{}/commits?per_page=1",
+            self.api, self.owner, self.repo
+        );
+        self.spend()?;
+        let response = self
+            .request(Method::GET, &url)
+            .send()
+            .await
+            .map_err(network)?;
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(true);
+        }
+        self.check(response).await?;
+        Ok(false)
     }
 
     fn spend(&self) -> Result<(), SyncError> {
@@ -244,16 +265,6 @@ impl GitHubBackend {
             )
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-    }
-
-    fn dir_url(&self) -> String {
-        format!(
-            "{}/repos/{}/{}/contents/{}",
-            self.api,
-            self.owner,
-            self.repo,
-            REMOTE_SUBDIR.trim_end_matches('/')
-        )
     }
 
     fn file_url(&self, name: &str) -> String {
@@ -292,18 +303,26 @@ impl GitHubBackend {
                 retry_after_secs: retry_after(&response),
             }),
             StatusCode::FORBIDDEN => {
-                // 403 既可能是限流也可能是权限不足，靠响应头区分。
-                let limited = response
+                // 403 既可能是限流也可能是权限不足。主限流看 remaining=0；
+                // 次级限流（并发/单位时间请求过多）remaining 仍是正数，只会带
+                // retry-after 或在正文里说明，漏判会让整轮对着被限流的服务器硬打。
+                let remaining_zero = response
                     .headers()
                     .get("x-ratelimit-remaining")
                     .and_then(|value| value.to_str().ok())
                     == Some("0");
-                if limited {
+                let has_retry_after = response
+                    .headers()
+                    .contains_key(reqwest::header::RETRY_AFTER);
+                let wait = retry_after(&response);
+                let body = response.text().await.unwrap_or_default();
+                let mentions_limit = body.to_ascii_lowercase().contains("rate limit");
+                if remaining_zero || has_retry_after || mentions_limit {
                     Err(SyncError::RateLimited {
-                        retry_after_secs: retry_after(&response),
+                        // 次级限流的窗口通常是 1 分钟
+                        retry_after_secs: wait.or(Some(60)),
                     })
                 } else {
-                    let body = response.text().await.unwrap_or_default();
                     Err(SyncError::Forbidden(short(&body)))
                 }
             }
@@ -361,18 +380,20 @@ fn version_token(version: &RemoteVersion) -> Result<String, SyncError> {
 }
 
 #[derive(Deserialize)]
-struct RepoInfo {
-    /// 仓库大小（KB）。0 表示还没有任何提交。
-    size: u64,
+struct TreeResponse {
+    tree: Vec<TreeEntry>,
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Deserialize)]
-struct ContentItem {
-    name: String,
+struct TreeEntry {
+    path: String,
     sha: String,
-    size: u64,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -402,45 +423,68 @@ impl SyncBackend for GitHubBackend {
         self.budget.store(requests, Ordering::Relaxed);
     }
 
+    /// 用 Git Trees API 列目录。
+    ///
+    /// 不用 Contents API 的原因有两个：它对单次列表有 1000 项上限（日笔记攒到
+    /// 两年多就会撑爆，且没有分页），而且「目录不存在」和「分支不存在」都返回
+    /// 404 —— 后者会被当成「远端为空」，进而把本地笔记全部判成已删除。
+    /// Trees 一次返回整棵树（上限 10 万项），ref 解析失败时只会是 404/409。
     async fn list(&self) -> Result<Vec<RemoteMeta>, SyncError> {
+        let ref_name = self.branch.as_deref().unwrap_or("HEAD");
+        let url = format!(
+            "{}/repos/{}/{}/git/trees/{}?recursive=1",
+            self.api,
+            self.owner,
+            self.repo,
+            utf8_percent_encode(ref_name, PATH_ENCODE)
+        );
         self.spend()?;
-        let url = self.with_ref(&self.dir_url());
         let response = self
             .request(Method::GET, &url)
             .send()
             .await
             .map_err(network)?;
-        if response.status() == StatusCode::NOT_FOUND {
-            let body = response.text().await.unwrap_or_default();
-            // 分支不存在时 GitHub 也返回 404。把它当成「远端为空」会让引擎
-            // 计划删除全部本地笔记，必须区分开。
-            if body.contains("No commit found for the ref") || body.contains("Branch not found") {
-                return Err(SyncError::Other(
-                    "远端分支不存在或已被删除，请检查同步设置".to_string(),
-                ));
+
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::CONFLICT
+        ) {
+            // 空仓库还没有任何提交，等同于「远端一个文件都没有」。
+            if self.repo_is_empty().await? {
+                return Ok(Vec::new());
             }
-            // 目录还没建出来：不是错误，等同于「远端一个文件都没有」。
-            return Ok(Vec::new());
+            return Err(SyncError::Other(
+                "远端分支不存在或已被删除，请检查同步设置".to_string(),
+            ));
         }
+
         let response = self.check(response).await?;
-        let items: Vec<ContentItem> = response
+        let tree: TreeResponse = response
             .json()
             .await
             .map_err(|error| SyncError::Other(format!("解析目录列表失败：{error}")))?;
-        // Contents API 单次最多返回 1000 项。达到上限说明列表可能被截断，
-        // 而「没列出来」会被当成「远端已删除」，必须整轮中止。
-        if items.len() >= 1000 {
+        // 截断的列表会被引擎当成「其余文件都删了」，必须整轮中止。
+        if tree.truncated {
             return Err(SyncError::Other(
-                "远端目录条目达到 GitHub 的 1000 项上限，无法安全比较，本轮已中止".to_string(),
+                "远端文件过多，GitHub 返回了截断的目录列表，本轮已中止".to_string(),
             ));
         }
-        Ok(items
+
+        Ok(tree
+            .tree
             .into_iter()
-            .filter(|item| item.kind == "file" && super::is_sync_name(&item.name))
-            .map(|item| RemoteMeta {
-                name: item.name,
-                version: RemoteVersion::Etag(item.sha),
-                size: item.size,
+            .filter(|entry| entry.kind == "blob")
+            .filter_map(|entry| {
+                // 只要同步目录下第一层的文件；子目录与其它路径都不碰。
+                let name = entry.path.strip_prefix(REMOTE_SUBDIR)?;
+                if name.contains('/') || !super::is_sync_name(name) {
+                    return None;
+                }
+                Some(RemoteMeta {
+                    name: name.to_string(),
+                    version: RemoteVersion::Etag(entry.sha),
+                    size: entry.size.unwrap_or(0),
+                })
             })
             .collect())
     }
@@ -664,28 +708,86 @@ mod tests {
     async fn list_keeps_only_note_files() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/o/r/contents/flashnote/notes"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"name": "2026-10-31.md", "sha": "sha1", "size": 12, "type": "file"},
-                {"name": "readme.txt", "sha": "sha2", "size": 3, "type": "file"},
-                {"name": "old", "sha": "sha3", "size": 0, "type": "dir"},
-            ])))
+            .and(path("/repos/o/r/git/trees/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "truncated": false,
+                "tree": [
+                    {"path": "flashnote/notes/2026-10-31.md", "sha": "sha1", "type": "blob", "size": 12},
+                    {"path": "flashnote/notes/readme.txt", "sha": "sha2", "type": "blob", "size": 3},
+                    {"path": "flashnote/notes/sub/deep.md", "sha": "sha3", "type": "blob", "size": 4},
+                    {"path": "flashnote", "sha": "sha4", "type": "tree"},
+                ]
+            })))
             .mount(&server)
             .await;
 
         let files = backend(&server).list().await.unwrap();
-        assert_eq!(files.len(), 1);
+        assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(files[0].name, "2026-10-31.md");
         assert_eq!(files[0].version, RemoteVersion::Etag("sha1".into()));
+        assert_eq!(files[0].size, 12);
     }
 
     #[tokio::test]
-    async fn missing_directory_lists_as_empty() {
+    async fn empty_tree_lists_as_empty() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/trees/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"truncated": false, "tree": []})),
+            )
+            .mount(&server)
+            .await;
+        assert!(backend(&server).list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_listing_aborts_instead_of_reporting_deletions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/trees/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"truncated": true, "tree": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let error = backend(&server).list().await.unwrap_err();
+        assert!(format!("{error:?}").contains("截断"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn missing_branch_is_an_error_not_an_empty_remote() {
+        let server = MockServer::start().await;
+        // 分支不存在 → 404；仓库非空（/commits 正常）→ 不能当成「远端为空」
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/trees/main"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/commits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        assert!(backend(&server).list().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_repository_lists_as_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/trees/main"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/commits"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+
         assert!(backend(&server).list().await.unwrap().is_empty());
     }
 
@@ -814,7 +916,9 @@ mod tests {
     async fn budget_stops_further_requests() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(404))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"truncated": false, "tree": []})),
+            )
             .mount(&server)
             .await;
 

@@ -104,6 +104,27 @@ export function matchesTerm(
   return matchesSubstring(note, term);
 }
 
+const TAG_CHAR = /[\p{L}\p{N}_\-/]/u;
+
+/**
+ * 字面量 `#标签` 匹配：命中的位置后面不能再跟标签字符。
+ * 否则搜 `#工作` 又会把 `#工作台` 带进来，等于精确匹配没有生效。
+ */
+export function matchesLiteralTag(
+  note: Pick<NoteEntry, "content">,
+  term: string,
+): boolean {
+  const text = note.content;
+  let from = 0;
+  for (;;) {
+    const index = text.indexOf(term, from);
+    if (index < 0) return false;
+    const next = text.charAt(index + term.length);
+    if (!next || !TAG_CHAR.test(next)) return true;
+    from = index + term.length;
+  }
+}
+
 /** 纯子串匹配：标签查询找不到对应标签时退回这里，保证 `：#项目A` 这类字面量仍能搜到。 */
 export function matchesSubstring(
   note: Pick<NoteEntry, "date" | "time" | "content" | "source">,
