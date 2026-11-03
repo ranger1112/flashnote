@@ -177,7 +177,11 @@ Nextcloud、NAS 自带 WebDAV、[dufs](https://github.com/sigoden/dufs)、`rclon
 同步方式选「GitHub 仓库」，笔记会以 `flashnote/notes/YYYY-MM-DD.md` 的路径提交到仓库里：
 
 1. 在 GitHub 建一个**私有**仓库（公开仓库等于把笔记公开）；
-2. 生成 Personal Access Token：Settings → Developer settings → Personal access tokens，勾选该仓库的 **Contents: Read and write**（经典令牌勾 `repo`）；
+2. 生成 **Fine-grained token**（推荐）：Settings → Developer settings → Personal access tokens → Fine-grained tokens：
+   - Repository access 选 **Only select repositories**，只勾这一个笔记仓库；
+   - Permissions → Repository permissions → **Contents: Read and write**（Metadata 会自动带上只读）；
+   - 设一个过期时间（最长一年），到期后在这里换新的。
+   经典令牌（classic）也能用，但 `repo` 范围是「所有私有仓库」，不如 fine-grained 划算；
 3. 同步方式选「GitHub 仓库」，仓库地址填 `https://github.com/<owner>/<repo>`，令牌填上一步生成的 PAT；
 4. 分支栏可以留空（用仓库默认分支），也可以写 `main` 或 `flashnote`；把地址写成 `https://github.com/<owner>/<repo>/tree/<分支>` 也认；
 5. 点「测试连接」，确认后保存并启用。
@@ -210,7 +214,7 @@ Nextcloud、NAS 自带 WebDAV、[dufs](https://github.com/sigoden/dufs)、`rclon
 
 ### 排障
 
-- 「认证失败」：坚果云必须使用应用密码；也检查地址是否以 `/dav/` 结尾。
+- 「认证失败」：坚果云必须使用应用密码；也检查地址是否以 `/dav/` 结尾。GitHub 模式多半是令牌过期、被撤销，或没有给这个仓库的 `Contents: Read and write` 权限。
 - 「请求过于频繁」：服务商限流，闪记会按 `Retry-After` 退避；可把同步间隔调长，或减少同时使用的客户端。
 - 冲突副本不会自动清理；确认内容后手动删除或合并即可。
 - 同步状态与失败原因显示在设置页与历史面板底部。

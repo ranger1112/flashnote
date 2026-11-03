@@ -182,7 +182,7 @@ function paintSyncKind(): void {
   ui.syncUsername.placeholder = github ? "留空使用仓库默认分支" : "";
   ui.syncPasswordLabel.textContent = github ? "Personal Access Token" : "密码 / 应用密码";
   ui.syncPassword.placeholder = github
-    ? "需要 repo 读写权限的令牌；留空则保留已保存的令牌"
+    ? "Fine-grained token（Contents: Read and write）；留空则保留已保存的令牌"
     : "留空则保留已保存的密码（改地址或用户名后需重新输入）";
   // http 只对 WebDAV 有意义
   ui.syncAllowHttp.closest("label")?.toggleAttribute("hidden", github);
