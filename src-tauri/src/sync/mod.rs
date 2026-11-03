@@ -10,6 +10,7 @@
 //! - 服务器不支持条件写入时只上传/下载，绝不传播删除。
 
 pub(crate) mod backend;
+pub(crate) mod github;
 pub(crate) mod merge;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
@@ -36,7 +37,11 @@ pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 远端身份：规范化后的 URL（scheme/host 小写、去 query/fragment、去尾斜杠）
 /// 加上用户名。凭据、状态目录与「地址是否变了」的判断都必须用同一份身份，
 /// 否则大小写或多余参数的差异会让密码「丢失」、状态目录重新开始。
-pub(crate) fn remote_identity(url: &str, username: &str) -> String {
+pub(crate) fn remote_identity(
+    kind: crate::settings::SyncKind,
+    url: &str,
+    username: &str,
+) -> String {
     let canonical = match reqwest::Url::parse(url.trim()) {
         Ok(mut parsed) => {
             parsed.set_query(None);
@@ -49,7 +54,8 @@ pub(crate) fn remote_identity(url: &str, username: &str) -> String {
         }
         Err(_) => url.trim().trim_end_matches('/').to_string(),
     };
-    format!("{}\n{}", canonical, username.trim())
+    // 后端类型也算身份的一部分：同一个地址换成 GitHub 解析方式时，状态目录必须换新。
+    format!("{kind:?}\n{canonical}\n{}", username.trim())
 }
 /// 删除安全阀：超过这个数量、且占比超过阈值才中止。
 const DELETE_MIN_FILES: usize = 5;
@@ -272,7 +278,7 @@ pub(crate) fn is_valid_note_name(name: &str) -> bool {
 }
 
 /// 只同步日期笔记与协议允许的冲突副本；`.bak-*`、`.tmp-*`、其它 Markdown 不碰。
-fn is_sync_name(name: &str) -> bool {
+pub(crate) fn is_sync_name(name: &str) -> bool {
     is_valid_note_name(name)
 }
 
@@ -1261,6 +1267,8 @@ mod tests {
 
     #[async_trait]
     impl SyncBackend for FakeBackend {
+        fn reset_budget(&self, _requests: usize) {}
+
         fn capabilities(&self) -> Capabilities {
             self.inner.caps.clone()
         }
@@ -1422,20 +1430,30 @@ mod tests {
 
     #[test]
     fn remote_identity_ignores_case_trailing_slash_and_query() {
-        let base = remote_identity("https://dav.example.com/dav/", "alice");
+        use crate::settings::SyncKind;
+        let webdav = SyncKind::Webdav;
+        let base = remote_identity(webdav, "https://dav.example.com/dav/", "alice");
         assert_eq!(
             base,
-            remote_identity("https://DAV.example.com/dav", " alice ")
+            remote_identity(webdav, "https://DAV.example.com/dav", " alice ")
         );
         assert_eq!(
             base,
-            remote_identity("https://dav.example.com/dav/?token=1", "alice")
+            remote_identity(webdav, "https://dav.example.com/dav/?token=1", "alice")
         );
         assert_ne!(
             base,
-            remote_identity("https://dav.example.com/other", "alice")
+            remote_identity(webdav, "https://dav.example.com/other", "alice")
         );
-        assert_ne!(base, remote_identity("https://dav.example.com/dav/", "bob"));
+        assert_ne!(
+            base,
+            remote_identity(webdav, "https://dav.example.com/dav/", "bob")
+        );
+        // 同一地址换后端类型必须换一份状态，否则会把 GitHub 的种子当成 WebDAV 的历史
+        assert_ne!(
+            base,
+            remote_identity(SyncKind::Github, "https://dav.example.com/dav/", "alice")
+        );
     }
 
     #[test]

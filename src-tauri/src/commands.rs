@@ -6,8 +6,8 @@
 use crate::{
     files::{self, io_guard},
     git_backup, notes,
-    settings::{self, Settings, SyncSettings},
-    sync::{self, backend::SyncBackend, runtime::SyncStatus, webdav},
+    settings::{self, Settings, SyncKind, SyncSettings},
+    sync::{self, backend::SyncBackend, github, runtime::SyncStatus, webdav},
     AppState,
 };
 use serde::{Deserialize, Serialize};
@@ -676,8 +676,9 @@ pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opa
 
 /// 前端提交的同步配置。密码不在这里，走 `save_sync_password`。
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct SyncConfigInput {
+    pub kind: SyncKind,
     pub enabled: bool,
     pub url: String,
     pub username: String,
@@ -686,19 +687,49 @@ pub struct SyncConfigInput {
     pub device_name: String,
 }
 
+impl Default for SyncConfigInput {
+    fn default() -> Self {
+        Self {
+            kind: SyncKind::default(),
+            enabled: false,
+            url: String::new(),
+            username: String::new(),
+            interval_minutes: 15,
+            allow_insecure_http: false,
+            device_name: String::new(),
+        }
+    }
+}
+
 impl SyncConfigInput {
-    /// 校验并规范化；启用时必须填全地址与用户名。
+    /// 校验并规范化。两种后端的「地址」含义不同，校验也分开做。
     fn normalize(self) -> Result<SyncSettings, String> {
         let url = self.url.trim().to_string();
         let username = self.username.trim().to_string();
-        if !url.is_empty() {
-            webdav::validate_url(&url, self.allow_insecure_http)
-                .map_err(|error| error.to_string())?;
-        }
-        if self.enabled && (url.is_empty() || username.is_empty()) {
-            return Err("启用同步前请填写 WebDAV 地址和用户名".to_string());
+        match self.kind {
+            SyncKind::Github => {
+                if !url.is_empty() && github::parse_repo(&url).is_none() {
+                    return Err(
+                        "仓库地址应形如 https://github.com/owner/repo（可选 /tree/<分支>）"
+                            .to_string(),
+                    );
+                }
+                if self.enabled && github::parse_repo(&url).is_none() {
+                    return Err("启用前请填写 GitHub 仓库地址".to_string());
+                }
+            }
+            SyncKind::Webdav => {
+                if !url.is_empty() {
+                    webdav::validate_url(&url, self.allow_insecure_http)
+                        .map_err(|error| error.to_string())?;
+                }
+                if self.enabled && (url.is_empty() || username.is_empty()) {
+                    return Err("启用同步前请填写 WebDAV 地址和用户名".to_string());
+                }
+            }
         }
         Ok(SyncSettings {
+            kind: self.kind,
             enabled: self.enabled,
             url,
             username,
@@ -742,8 +773,8 @@ pub async fn get_sync_file_states(
 /// 两个同步配置是否指向同一远端账号；只差 URL 末尾斜杠视为相同。
 fn same_sync_identity(left: &settings::SyncSettings, right: &settings::SyncSettings) -> bool {
     // 与凭据、状态目录共用同一份身份：大小写/尾斜杠/query 的差异不算换远端。
-    sync::remote_identity(&left.url, &left.username)
-        == sync::remote_identity(&right.url, &right.username)
+    sync::remote_identity(left.kind, &left.url, &left.username)
+        == sync::remote_identity(right.kind, &right.url, &right.username)
 }
 
 #[tauri::command]
@@ -767,7 +798,9 @@ pub async fn update_sync_config(
     if !same_sync_identity(&previous, &next) {
         state.sync.forget_password();
         if previous.is_configured() {
-            if let Err(error) = sync::secrets::clear(&previous.url, &previous.username) {
+            if let Err(error) =
+                sync::secrets::clear(previous.kind, &previous.url, &previous.username)
+            {
                 log::warn!("清理旧同步密码失败：{error}");
             }
         }
@@ -803,7 +836,7 @@ pub fn save_sync_password(
     state.sync.remember_password(&password);
     // 密码补上后立刻可以同步，不用等下一个定时点。
     state.sync.schedule();
-    match sync::secrets::save(&sync.url, &sync.username, &password) {
+    match sync::secrets::save(sync.kind, &sync.url, &sync.username, &password) {
         Ok(()) => Ok(PasswordSaveResult {
             persistent: true,
             warning: None,
@@ -828,7 +861,7 @@ pub async fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> 
         .clone();
     state.sync.forget_password();
     if sync.is_configured() {
-        sync::secrets::clear(&sync.url, &sync.username)?;
+        sync::secrets::clear(sync.kind, &sync.url, &sync.username)?;
     }
     sync::runtime::emit_status(&app).await;
     Ok(())
@@ -843,7 +876,10 @@ pub async fn test_sync_connection(
 ) -> Result<SyncTestResult, String> {
     let sync = config.normalize()?;
     if !sync.is_configured() {
-        return Err("请先填写 WebDAV 地址和用户名".to_string());
+        return Err(match sync.kind {
+            SyncKind::Github => "请先填写 GitHub 仓库地址".to_string(),
+            SyncKind::Webdav => "请先填写 WebDAV 地址和用户名".to_string(),
+        });
     }
 
     let saved = app
@@ -861,22 +897,44 @@ pub async fn test_sync_connection(
         // 只允许使用新地址自己在凭据管理器里保存过的密码。
         None if same_identity => match runtime.cached_password() {
             Some(password) => password,
-            None => sync::secrets::load(&sync.url, &sync.username)?
+            None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
                 .ok_or_else(|| "还没有保存密码".to_string())?,
         },
-        None => sync::secrets::load(&sync.url, &sync.username)?
+        None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
             .ok_or_else(|| "地址或用户名已修改，请重新输入密码".to_string())?,
     };
 
-    let backend = webdav::WebDavBackend::connect(webdav::WebDavConfig {
-        url: sync.url.clone(),
-        username: sync.username.clone(),
-        password,
-        allow_insecure_http: sync.allow_insecure_http,
-    })
-    .await
-    .map_err(|error| error.to_string())?;
+    match sync.kind {
+        SyncKind::Github => {
+            let Some((owner, repo, url_branch)) = github::parse_repo(&sync.url) else {
+                return Err("GitHub 仓库地址格式不正确".to_string());
+            };
+            let backend = github::GitHubBackend::connect(github::GitHubConfig {
+                owner,
+                repo,
+                branch: url_branch.or_else(|| sync.github_branch()),
+                token: password,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            probe_backend(backend).await
+        }
+        SyncKind::Webdav => {
+            let backend = webdav::WebDavBackend::connect(webdav::WebDavConfig {
+                url: sync.url.clone(),
+                username: sync.username.clone(),
+                password,
+                allow_insecure_http: sync.allow_insecure_http,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            probe_backend(backend).await
+        }
+    }
+}
 
+/// 连上之后列一次目录，作为「测试连接」的结论。
+async fn probe_backend<B: SyncBackend>(backend: B) -> Result<SyncTestResult, String> {
     let degraded = sync::runtime::capability_note(&backend.capabilities());
     let files = backend
         .list()
@@ -939,6 +997,7 @@ mod tests {
 
     fn sync_input(url: &str, enabled: bool) -> SyncConfigInput {
         SyncConfigInput {
+            kind: SyncKind::Webdav,
             enabled,
             url: url.to_string(),
             username: " ranger ".to_string(),

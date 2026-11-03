@@ -171,10 +171,28 @@ export function paintSyncStatus(status: SyncStatus): void {
   for (const listener of statusListeners) listener(status);
 }
 
+/** 两种后端的字段含义不同，标签和占位符跟着切换。 */
+function paintSyncKind(): void {
+  const github = ui.syncKind.value === "github";
+  ui.syncUrlLabel.textContent = github ? "仓库地址" : "WebDAV 地址";
+  ui.syncUrl.placeholder = github
+    ? "https://github.com/owner/repo"
+    : "https://dav.example.com/dav/";
+  ui.syncUsernameLabel.textContent = github ? "分支（可选）" : "用户名";
+  ui.syncUsername.placeholder = github ? "留空使用仓库默认分支" : "";
+  ui.syncPasswordLabel.textContent = github ? "Personal Access Token" : "密码 / 应用密码";
+  ui.syncPassword.placeholder = github
+    ? "需要 repo 读写权限的令牌；留空则保留已保存的令牌"
+    : "留空则保留已保存的密码（改地址或用户名后需重新输入）";
+  // http 只对 WebDAV 有意义
+  ui.syncAllowHttp.closest("label")?.toggleAttribute("hidden", github);
+}
+
 /** 用已保存的设置回填表单；密码框始终留空，避免把密码画到界面上。 */
 export function paintSyncForm(): void {
   const sync = settings.sync;
   ui.syncEnabled.checked = sync.enabled;
+  ui.syncKind.value = sync.kind;
   ui.syncUrl.value = sync.url;
   ui.syncUsername.value = sync.username;
   ui.syncPassword.value = "";
@@ -182,10 +200,12 @@ export function paintSyncForm(): void {
   ui.syncAllowHttp.checked = sync.allowInsecureHttp;
   ui.syncDevice.value = sync.deviceName;
   ui.syncError.textContent = "";
+  paintSyncKind();
 }
 
 function readSyncForm() {
   return {
+    kind: ui.syncKind.value === "github" ? "github" : "webdav",
     enabled: ui.syncEnabled.checked,
     url: ui.syncUrl.value.trim(),
     username: ui.syncUsername.value.trim(),
@@ -235,9 +255,10 @@ async function saveSyncConfig(): Promise<void> {
   ui.syncError.textContent = "";
   const form = readSyncForm();
   const identityChanged =
+    settings.sync.kind !== form.kind ||
     normalizeSyncUrl(settings.sync.url) !== normalizeSyncUrl(form.url) ||
     settings.sync.username.trim() !== form.username;
-  if (form.allowInsecureHttp && needsInsecureConfirmation(form.url)) {
+  if (form.kind === "webdav" && form.allowInsecureHttp && needsInsecureConfirmation(form.url)) {
     if (typeof window.confirm !== "function") {
       // 拿不到确认对话框时宁可拒绝保存，也不能静默把密码发到公网明文地址。
       ui.syncError.textContent = "无法显示确认对话框，已取消保存";
@@ -347,6 +368,7 @@ export async function refreshSyncStatus(): Promise<void> {
 
 /** 模块加载时绑定同步相关控件与事件（由 main.ts 调用一次）。 */
 export function initSync(): void {
+  ui.syncKind.addEventListener("change", paintSyncKind);
   ui.syncSave.addEventListener("click", () => void saveSyncConfig());
   ui.syncTest.addEventListener("click", () => void testConnection());
   ui.syncNow.addEventListener("click", () => void syncNow());

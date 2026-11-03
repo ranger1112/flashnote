@@ -10,19 +10,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
-use super::backend::{Capabilities, SyncBackend};
+use super::backend::{Capabilities, SyncBackend, SyncError};
+use super::github::{self, GitHubBackend, GitHubConfig};
 use super::secrets;
 use super::state::{now_iso, sha256_base64, StateStore, SyncState};
 use super::webdav::{WebDavBackend, WebDavConfig};
 use super::{SyncEngine, SyncSummary};
-use crate::settings::{Settings, SyncSettings};
+use crate::settings::{Settings, SyncKind, SyncSettings};
 use crate::AppState;
 
 /// 保存后等这么久再同步，连续记录只跑一轮。
@@ -234,13 +235,47 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
         Err(error) => return RoundOutcome::Failed(error),
     };
 
-    let config = WebDavConfig {
-        url: sync.url.clone(),
-        username: sync.username.clone(),
-        password,
-        allow_insecure_http: sync.allow_insecure_http,
-    };
-    let backend = match WebDavBackend::connect(config).await {
+    let notes_dir = PathBuf::from(&settings.notes_dir);
+
+    match sync.kind {
+        SyncKind::Github => {
+            let Some((owner, repo, url_branch)) = github::parse_repo(&sync.url) else {
+                return RoundOutcome::Failed(
+                    "GitHub 仓库地址格式不正确，应形如 https://github.com/owner/repo".to_string(),
+                );
+            };
+            let config = GitHubConfig {
+                owner,
+                repo,
+                // 地址里写了 /tree/<分支> 就以它为准，其次才是表单里的分支
+                branch: url_branch.or_else(|| sync.github_branch()),
+                token: password,
+            };
+            let backend = GitHubBackend::connect(config).await;
+            drive(app, &sync, notes_dir, io, backend).await
+        }
+        SyncKind::Webdav => {
+            let config = WebDavConfig {
+                url: sync.url.clone(),
+                username: sync.username.clone(),
+                password,
+                allow_insecure_http: sync.allow_insecure_http,
+            };
+            let backend = WebDavBackend::connect(config).await;
+            drive(app, &sync, notes_dir, io, backend).await
+        }
+    }
+}
+
+/// 两种后端共用的一轮：探测能力、建状态目录、跑引擎、补一次 Git 提交。
+async fn drive<B: SyncBackend + 'static>(
+    app: &AppHandle,
+    sync: &SyncSettings,
+    notes_dir: PathBuf,
+    io: Arc<Mutex<()>>,
+    backend: Result<B, SyncError>,
+) -> RoundOutcome {
+    let backend = match backend {
         Ok(backend) => backend,
         Err(error) => return RoundOutcome::Failed(error.to_string()),
     };
@@ -252,9 +287,8 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let notes_dir = PathBuf::from(&settings.notes_dir);
     // 只差末尾斜杠、大小写或 query 的地址是同一个远端，状态目录不能因此换一份。
-    let remote_key = super::remote_identity(&sync.url, &sync.username);
+    let remote_key = super::remote_identity(sync.kind, &sync.url, &sync.username);
     // 0.5.0 用原始 URL 做身份；旧目录存在时直接复用，避免升级后全量重合并。
     let legacy_key = format!(
         "{}\n{}",
@@ -287,7 +321,7 @@ fn resolve_password(runtime: &SyncRuntime, sync: &SyncSettings) -> Result<String
     if let Some(password) = runtime.cached_password() {
         return Ok(password);
     }
-    match secrets::load(&sync.url, &sync.username) {
+    match secrets::load(sync.kind, &sync.url, &sync.username) {
         Ok(Some(password)) => {
             runtime.remember_password(&password);
             Ok(password)
@@ -398,7 +432,11 @@ pub(crate) fn file_states(app: &AppHandle, dates: &[String]) -> Vec<FileSyncStat
         return Vec::new();
     };
     let notes_dir = PathBuf::from(&settings.notes_dir);
-    let remote_key = super::remote_identity(&settings.sync.url, &settings.sync.username);
+    let remote_key = super::remote_identity(
+        settings.sync.kind,
+        &settings.sync.url,
+        &settings.sync.username,
+    );
     let legacy_key = format!(
         "{}\n{}",
         settings.sync.url.trim().trim_end_matches('/'),

@@ -63,6 +63,7 @@ const baseSettings = {
   backgroundOpacity: 1,
   window: null,
   sync: {
+    kind: "webdav",
     enabled: false,
     url: "",
     username: "",
@@ -470,6 +471,48 @@ describe("云同步", () => {
     });
     expect(node<HTMLInputElement>("#sync-password").value).toBe("");
     expect(node<HTMLElement>("#toast-message").textContent).toContain("已保存");
+  });
+
+  it("切换到 GitHub 时字段标签与提示跟着变", async () => {
+    await boot();
+    await openSettings();
+
+    const kind = node<HTMLSelectElement>("#sync-kind");
+    expect(node<HTMLElement>("#sync-url-label").textContent).toBe("WebDAV 地址");
+
+    kind.value = "github";
+    kind.dispatchEvent(new Event("change"));
+    await flush();
+
+    expect(node<HTMLElement>("#sync-url-label").textContent).toBe("仓库地址");
+    expect(node<HTMLElement>("#sync-username-label").textContent).toContain("分支");
+    expect(node<HTMLElement>("#sync-password-label").textContent).toBe("Personal Access Token");
+    expect(node<HTMLInputElement>("#sync-url").placeholder).toContain("github.com");
+    // 明文 http 只对 WebDAV 有意义
+    expect(node<HTMLElement>("#sync-allow-http").closest("label")?.hidden).toBe(true);
+  });
+
+  it("保存 GitHub 配置时把类型一起提交", async () => {
+    let saved: Record<string, unknown> | undefined;
+    await boot({
+      update_sync_config: (args) => {
+        saved = args?.config as Record<string, unknown>;
+        return syncStatus({ configured: true, enabled: true });
+      },
+    });
+    await openSettings();
+
+    const kind = node<HTMLSelectElement>("#sync-kind");
+    kind.value = "github";
+    kind.dispatchEvent(new Event("change"));
+    node<HTMLInputElement>("#sync-url").value = "https://github.com/alice/notes";
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(saved).toMatchObject({
+      kind: "github",
+      url: "https://github.com/alice/notes",
+    });
   });
 
   it("保存失败时保留输入并显示后端错误", async () => {

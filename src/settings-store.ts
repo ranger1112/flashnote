@@ -8,7 +8,10 @@ import {
 import { applyTheme, paintOpacity } from "./appearance";
 import { ui } from "./dom";
 
+export type SyncKind = "webdav" | "github";
+
 export interface SyncSettings {
+  kind: SyncKind;
   enabled: boolean;
   url: string;
   username: string;
@@ -49,6 +52,7 @@ export let settings: Settings = {
   backgroundOpacity: 1,
   window: null,
   sync: {
+    kind: "webdav",
     enabled: false,
     url: "",
     username: "",
