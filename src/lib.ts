@@ -7,6 +7,8 @@ export interface NoteEntry {
   time: string;
   content: string;
   source: string | null;
+  /** 正文里内联的 `#标签`，后端解析后按首次出现顺序去重。 */
+  tags: string[];
   path: string;
 }
 
@@ -85,14 +87,30 @@ export function clampOpacity(value: number): number {
   return Math.min(MAX_OPACITY, Math.max(MIN_OPACITY, value));
 }
 
-/** 历史面板的本地过滤：日期、时间、正文、来源都参与匹配（调用方传入小写化的词）。 */
+/**
+ * 搜索词是否命中一条笔记（调用方传入已小写化的词）。
+ *
+ * `#标签` 走精确匹配：否则搜 `#工作` 会把 `#工作台` 也带出来。
+ * 其余情况按日期、时间、正文、来源做子串匹配。
+ */
 export function matchesTerm(
-  note: Pick<NoteEntry, "date" | "time" | "content" | "source">,
+  note: Pick<NoteEntry, "date" | "time" | "content" | "source" | "tags">,
   term: string,
 ): boolean {
+  const tag = exactTagTerm(term);
+  if (tag !== null) {
+    return note.tags.some((value) => value.toLowerCase() === tag.toLowerCase());
+  }
   return [note.date, note.time, note.content, note.source ?? ""].some((value) =>
     value.toLowerCase().includes(term),
   );
+}
+
+/** 搜索词是不是「就是要这个标签」：单个 `#标签`，且不带空格。 */
+export function exactTagTerm(term: string): string | null {
+  const value = term.trim();
+  if (!value.startsWith("#") || value.length < 2) return null;
+  return value.includes(" ") || value.includes("\t") ? null : value.slice(1);
 }
 
 /** 两条笔记是否同一条：与后端 delete_note_entry 的定位参数保持一致。 */

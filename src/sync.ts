@@ -59,6 +59,14 @@ let lastStatus: SyncStatus | null = null;
 let statusSeq = 0;
 let savingConfig = false;
 
+type StatusListener = (status: SyncStatus) => void;
+const statusListeners: StatusListener[] = [];
+
+/** 订阅同步状态变化（历史面板据此刷新日期级的文件状态）。 */
+export function subscribeSyncStatus(listener: StatusListener): void {
+  statusListeners.push(listener);
+}
+
 /** 本地写入成功后调用：下一轮同步开始前显示「待同步」。 */
 export function markSyncPending(): void {
   if (!settings.sync.enabled) return;
@@ -159,6 +167,8 @@ export function paintSyncStatus(status: SyncStatus): void {
     status.configured && status.enabled ? describeStatus(status)[0] : "云同步未启用";
   ui.syncConflicts.hidden = status.conflicts === 0;
   ui.syncConflicts.textContent = `${status.conflicts} 个冲突副本`;
+
+  for (const listener of statusListeners) listener(status);
 }
 
 /** 用已保存的设置回填表单；密码框始终留空，避免把密码画到界面上。 */

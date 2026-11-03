@@ -23,6 +23,7 @@ export interface Settings {
   pinned: boolean;
   captureSource: boolean;
   markdownMode: boolean;
+  gitBackup: boolean;
   historyPreview: boolean;
   autoUpdate: boolean;
   onboarded: boolean;
@@ -39,6 +40,7 @@ export let settings: Settings = {
   pinned: false,
   captureSource: true,
   markdownMode: false,
+  gitBackup: false,
   historyPreview: false,
   autoUpdate: true,
   onboarded: true,
@@ -62,6 +64,7 @@ export function paintSettings(): void {
   ui.notesDirInput.value = settings.notesDir;
   ui.captureSourceCheck.checked = settings.captureSource;
   ui.markdownModeCheck.checked = settings.markdownMode;
+  ui.gitBackupCheck.checked = settings.gitBackup;
   ui.autoUpdateCheck.checked = settings.autoUpdate;
   ui.autoHideCheck.checked = settings.autoHideOnBlur;
   ui.themeSelect.value = settings.theme;

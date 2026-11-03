@@ -3,6 +3,7 @@
 mod commands;
 mod files;
 mod geometry;
+mod git_backup;
 mod notes;
 mod settings;
 mod source;
@@ -251,6 +252,9 @@ fn main() {
             commands::save_note,
             commands::set_pinned,
             commands::update_notes_dir,
+            commands::get_git_status,
+            commands::init_notes_git,
+            commands::update_git_backup,
             commands::update_hotkey,
             commands::update_capture_source,
             commands::update_markdown_mode,
@@ -274,6 +278,7 @@ fn main() {
             commands::update_auto_hide,
             commands::update_background_opacity,
             commands::get_sync_status,
+            commands::get_sync_file_states,
             commands::update_sync_config,
             commands::save_sync_password,
             commands::clear_sync_password,

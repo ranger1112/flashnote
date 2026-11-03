@@ -8,7 +8,7 @@
 //! 当前轮结束后再补一轮，绝不叠加。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 
 use super::backend::{Capabilities, SyncBackend};
 use super::secrets;
-use super::state::{now_iso, StateStore};
+use super::state::{now_iso, sha256_base64, StateStore, SyncState};
 use super::webdav::{WebDavBackend, WebDavConfig};
 use super::{SyncEngine, SyncSummary};
 use crate::settings::{Settings, SyncSettings};
@@ -274,7 +274,13 @@ async fn round(app: &AppHandle, runtime: &SyncRuntime) -> RoundOutcome {
         Err(error) => return RoundOutcome::Failed(format!("同步引擎初始化失败：{error}")),
     };
 
-    RoundOutcome::Done(engine.run().await, degraded)
+    let summary = engine.run().await;
+    // 下载、合并和冲突副本都会在本地产生新内容；补一次提交，Git 历史才不会断档。
+    // 本地保存/删除已经由各自的命令提交过，这里重复调用只会命中「没有变化」。
+    if summary.downloaded + summary.merged + summary.conflicts > 0 {
+        crate::git_backup::schedule(app);
+    }
+    RoundOutcome::Done(summary, degraded)
 }
 
 fn resolve_password(runtime: &SyncRuntime, sync: &SyncSettings) -> Result<String, String> {
@@ -355,6 +361,109 @@ fn count_conflicts(dir: &std::path::Path) -> usize {
         .count()
 }
 
+/// 历史面板里某一天文件的同步状态。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileSyncState {
+    pub date: String,
+    /// `synced` 已同步 / `pending` 待同步 / `conflict` 有冲突副本。
+    pub state: &'static str,
+}
+
+/// 日期会被拼进文件名，只接受 `YYYY-MM-DD`，其余一律丢弃。
+fn is_date_name(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+/// 计算指定日期文件的同步状态。
+///
+/// 状态取自 `state.json` 的 `local_sha256` 与磁盘内容比对：一致才算已同步。
+/// 没同步过、同步后又被改过都算待同步——条目级不单独同步，不给出更细的结论。
+pub(crate) fn file_states(app: &AppHandle, dates: &[String]) -> Vec<FileSyncState> {
+    let settings = settings_snapshot(app);
+    if !settings.sync.enabled || !settings.sync.is_configured() {
+        return Vec::new();
+    }
+    let Some(config_dir) = crate::settings::settings_path(app)
+        .parent()
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let notes_dir = PathBuf::from(&settings.notes_dir);
+    let remote_key = super::remote_identity(&settings.sync.url, &settings.sync.username);
+    let legacy_key = format!(
+        "{}\n{}",
+        settings.sync.url.trim().trim_end_matches('/'),
+        settings.sync.username.trim()
+    );
+    let store =
+        StateStore::with_remote_migrating(&config_dir, &notes_dir, &remote_key, &legacy_key);
+    // 状态读不出来时宁可不显示，也不要把「读不到」画成「未同步」。
+    let Ok((state, _)) = store.load() else {
+        return Vec::new();
+    };
+    file_states_for(&notes_dir, &state, dates)
+}
+
+/// 纯函数版本，便于测试：按状态记录与磁盘内容比对，不访问网络。
+pub(crate) fn file_states_for(
+    notes_dir: &Path,
+    state: &SyncState,
+    dates: &[String],
+) -> Vec<FileSyncState> {
+    let conflicts = conflict_dates(notes_dir);
+    let mut out = Vec::with_capacity(dates.len());
+    for date in dates {
+        if !is_date_name(date) {
+            continue;
+        }
+        if conflicts.iter().any(|value| value == date) {
+            out.push(FileSyncState {
+                date: date.clone(),
+                state: "conflict",
+            });
+            continue;
+        }
+        let name = format!("{date}.md");
+        let Ok(bytes) = fs::read(notes_dir.join(&name)) else {
+            continue;
+        };
+        let sha = sha256_base64(&bytes);
+        let value = match state.files.get(&name) {
+            Some(record) if record.local_sha256 == sha => "synced",
+            _ => "pending",
+        };
+        out.push(FileSyncState {
+            date: date.clone(),
+            state: value,
+        });
+    }
+    out
+}
+
+/// 有冲突副本的日期（`YYYY-MM-DD.conflict-*.md` 的文件名前缀）。
+fn conflict_dates(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let (date, rest) = name.split_once(".conflict-")?;
+            (rest.ends_with(".md") && is_date_name(date)).then(|| date.to_string())
+        })
+        .collect()
+}
+
 fn settings_snapshot(app: &AppHandle) -> Settings {
     let state = app.state::<AppState>();
     let settings = lock(&state.settings).clone();
@@ -364,6 +473,8 @@ fn settings_snapshot(app: &AppHandle) -> Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::backend::RemoteVersion;
+    use crate::sync::state::FileRecord;
 
     fn strong() -> Capabilities {
         Capabilities {
@@ -407,6 +518,56 @@ mod tests {
         fs::write(dir.join("2026-10-23.conflict-pc-20261023101010.md"), "").unwrap();
         fs::write(dir.join("2026-10-22.conflict-pc-20261022090000.md"), "").unwrap();
         assert_eq!(count_conflicts(&dir), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_states_compare_content_with_the_last_synced_hash() {
+        let dir = std::env::temp_dir().join(format!("flashnote-sync-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("2026-10-23.md"), "hello").unwrap();
+        fs::write(dir.join("2026-10-22.md"), "old").unwrap();
+        fs::write(dir.join("2026-10-22.conflict-pc-20261022100000.md"), "x").unwrap();
+
+        let mut state = SyncState::default();
+        state.files.insert(
+            "2026-10-23.md".into(),
+            FileRecord {
+                local_mtime_ns: 0,
+                local_size: 5,
+                local_sha256: sha256_base64(b"hello"),
+                remote_version: RemoteVersion::Etag("\"v1\"".into()),
+                remote_sha256: sha256_base64(b"hello"),
+                synced_at: now_iso(),
+            },
+        );
+
+        let dates = vec![
+            "2026-10-23".to_string(),
+            "2026-10-22".to_string(),
+            // 真实日期格式之外的值一律丢弃，不能被拼进文件名
+            "../../etc".to_string(),
+        ];
+        assert_eq!(
+            file_states_for(&dir, &state, &dates),
+            vec![
+                FileSyncState {
+                    date: "2026-10-23".into(),
+                    state: "synced",
+                },
+                FileSyncState {
+                    date: "2026-10-22".into(),
+                    state: "conflict",
+                },
+            ]
+        );
+
+        // 同步之后又改过内容：回到「待同步」
+        fs::write(dir.join("2026-10-23.md"), "changed").unwrap();
+        let states = file_states_for(&dir, &state, &["2026-10-23".to_string()]);
+        assert_eq!(states[0].state, "pending");
+
         let _ = fs::remove_dir_all(&dir);
     }
 

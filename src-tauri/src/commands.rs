@@ -5,7 +5,7 @@
 
 use crate::{
     files::{self, io_guard},
-    notes,
+    git_backup, notes,
     settings::{self, Settings, SyncSettings},
     sync::{self, backend::SyncBackend, runtime::SyncStatus, webdav},
     AppState,
@@ -254,6 +254,7 @@ pub async fn save_note(app: AppHandle, content: String) -> Result<SavedNote, Str
         };
         // 落盘成功后再排一轮同步：防抖 5 秒，连续记录只跑一次。
         state.sync.schedule();
+        git_backup::schedule(&app);
 
         Ok(SavedNote {
             path: path.to_string_lossy().to_string(),
@@ -292,6 +293,49 @@ pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String
     persist(&app);
     log::info!("笔记目录已更新为 {}", dir.display());
     Ok(())
+}
+
+/// 笔记目录当前能否用 Git：有没有装 git、是不是仓库。
+#[tauri::command]
+pub async fn get_git_status(app: AppHandle) -> Result<git_backup::GitStatus, String> {
+    run_blocking(move || Ok(git_backup::status(&notes_dir(&app)))).await
+}
+
+/// 给笔记目录建一个本地仓库；已经是仓库时幂等返回。
+#[tauri::command]
+pub async fn init_notes_git(app: AppHandle) -> Result<git_backup::GitStatus, String> {
+    run_blocking(move || {
+        let dir = notes_dir(&app);
+        git_backup::init(&dir)?;
+        Ok(git_backup::status(&dir))
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn update_git_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .git_backup = enabled;
+    persist(&app);
+    Ok(())
+}
+
+fn notes_dir(app: &AppHandle) -> PathBuf {
+    let state = app.state::<AppState>();
+    let dir = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notes_dir
+        .clone();
+    PathBuf::from(dir)
 }
 
 #[tauri::command]
@@ -440,6 +484,7 @@ pub async fn delete_note_entry(
         });
         if result.is_ok() {
             state.sync.schedule();
+            git_backup::schedule(&app);
         }
         result
     })
@@ -465,6 +510,7 @@ pub async fn update_note_entry(
         });
         if result.is_ok() {
             state.sync.schedule();
+            git_backup::schedule(&app);
         }
         result
     })
@@ -682,6 +728,15 @@ pub struct SyncTestResult {
 #[tauri::command]
 pub async fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
     run_blocking(move || Ok(sync::runtime::status(&app))).await
+}
+
+/// 历史面板里按日期显示文件级同步状态；只算当前列表里的日期，避免全目录哈希。
+#[tauri::command]
+pub async fn get_sync_file_states(
+    app: AppHandle,
+    dates: Vec<String>,
+) -> Result<Vec<sync::runtime::FileSyncState>, String> {
+    run_blocking(move || Ok(sync::runtime::file_states(&app, &dates))).await
 }
 
 /// 两个同步配置是否指向同一远端账号；只差 URL 末尾斜杠视为相同。

@@ -119,6 +119,8 @@ pub struct Settings {
     pub theme: String,
     /// 窗口失去焦点时自动收起；常驻模式下面不生效。
     pub auto_hide_on_blur: bool,
+    /// 保存后把笔记目录的改动提交到本地 Git 仓库；默认关闭。
+    pub git_backup: bool,
     /// 小窗与面板的背景不透明度，0.6–1.0。
     pub background_opacity: f64,
     pub window: Option<WindowGeometry>,
@@ -139,6 +141,7 @@ impl Default for Settings {
             onboarded: false,
             theme: "system".to_string(),
             auto_hide_on_blur: false,
+            git_backup: false,
             background_opacity: 1.0,
             window: None,
             sync: SyncSettings::default(),
@@ -538,6 +541,7 @@ mod tests {
             onboarded: true,
             theme: "dark".to_string(),
             auto_hide_on_blur: true,
+            git_backup: true,
             background_opacity: 0.8,
             window: Some(WindowGeometry {
                 x: -120,

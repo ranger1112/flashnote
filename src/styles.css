@@ -583,6 +583,31 @@ kbd {
   background: var(--border);
 }
 
+/* 日期分隔行右侧的文件级同步状态；未启用同步时为空，不占位 */
+.date-sync {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.date-sync:empty {
+  display: none;
+}
+
+.date-sync.synced {
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+.date-sync.pending {
+  color: var(--accent-text);
+}
+
+.date-sync.conflict {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .entry {
   padding: 7px 9px;
   border-radius: 8px;
@@ -618,6 +643,36 @@ kbd {
 .entry-time {
   font: 11px/1.4 Consolas, monospace;
   color: var(--accent-text);
+}
+
+/* 正文里内联的 #标签：只做展示与筛选，点一下把搜索框换成这个标签 */
+.entry-tags {
+  display: flex;
+  flex: 0 1 auto;
+  gap: 4px;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+}
+
+.entry-tag {
+  flex: 0 0 auto;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent-text);
+  font-size: 10px;
+  line-height: 1.6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.entry-tag:hover {
+  background: var(--hover);
 }
 
 .entry-source {
@@ -871,6 +926,26 @@ kbd {
 .row input[readonly]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* Git 自动提交的状态行：说明文字可以换行，初始化按钮跟在后面 */
+.git-row {
+  align-items: center;
+  margin-top: -4px;
+}
+
+.git-row .hint {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.git-row .hint.warn {
+  color: var(--danger);
 }
 
 .text-input {
