@@ -16,6 +16,39 @@ import { startAutoUpdateChecks } from "./updater";
 
 let recording = false;
 
+interface GitStatus {
+  available: boolean;
+  repo: boolean;
+}
+
+/**
+ * 刷新「保存后自动提交」的状态行。
+ * 没装 git 时禁用开关，而不是等保存后才在日志里失败——用户看不到日志。
+ */
+async function paintGitStatus(): Promise<void> {
+  try {
+    const status = await invoke<GitStatus>("get_git_status");
+    // 没装 Git 时禁用开关，但已经开启的必须还能关掉
+    ui.gitBackupCheck.disabled = !status.available && !settings.gitBackup;
+    ui.gitInit.hidden = !status.available || status.repo;
+    ui.gitStatus.classList.toggle("warn", !status.available);
+    if (!status.available) {
+      ui.gitStatus.textContent = "没有找到 git 命令，请先安装 Git";
+      return;
+    }
+    if (status.repo) {
+      ui.gitStatus.textContent = "笔记目录已是 Git 仓库";
+      return;
+    }
+    ui.gitStatus.textContent = settings.gitBackup
+      ? "笔记目录还不是 Git 仓库，自动提交不会生效"
+      : "笔记目录还不是 Git 仓库";
+  } catch (error) {
+    ui.gitStatus.textContent = String(error);
+    ui.gitStatus.classList.add("warn");
+  }
+}
+
 export function isRecording(): boolean {
   return recording;
 }
@@ -62,6 +95,7 @@ export function showSettingsPanel(): void {
   paintSettings();
   paintSyncForm();
   void refreshSyncStatus();
+  void paintGitStatus();
   ui.hotkeyError.textContent = "";
   showPanel(ui.settingsPanel);
   ui.settingsClose.focus();
@@ -105,6 +139,8 @@ export function initSettingsPanel(): void {
       if (typeof selected === "string") {
         await invoke("update_notes_dir", { path: selected });
         await refreshSettings();
+        // 换目录后 Git 状态跟着变（新目录可能不是仓库）
+        await paintGitStatus();
         toast("笔记目录已更新");
       }
     } catch (error) {
@@ -134,6 +170,33 @@ export function initSettingsPanel(): void {
     } catch (error) {
       ui.markdownModeCheck.checked = !ui.markdownModeCheck.checked;
       toast(String(error), true);
+    }
+  });
+
+  ui.gitBackupCheck.addEventListener("change", async () => {
+    try {
+      await invoke("update_git_backup", { enabled: ui.gitBackupCheck.checked });
+      await refreshSettings();
+      await paintGitStatus();
+      toast(
+        ui.gitBackupCheck.checked ? "已开启保存后自动提交" : "已关闭保存后自动提交",
+      );
+    } catch (error) {
+      ui.gitBackupCheck.checked = !ui.gitBackupCheck.checked;
+      toast(String(error), true);
+    }
+  });
+
+  ui.gitInit.addEventListener("click", async () => {
+    ui.gitInit.disabled = true;
+    try {
+      await invoke<GitStatus>("init_notes_git");
+      await paintGitStatus();
+      toast("已初始化 Git 仓库");
+    } catch (error) {
+      toast(String(error), true);
+    } finally {
+      ui.gitInit.disabled = false;
     }
   });
 

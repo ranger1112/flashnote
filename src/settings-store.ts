@@ -8,7 +8,10 @@ import {
 import { applyTheme, paintOpacity } from "./appearance";
 import { ui } from "./dom";
 
+export type SyncKind = "webdav" | "github";
+
 export interface SyncSettings {
+  kind: SyncKind;
   enabled: boolean;
   url: string;
   username: string;
@@ -23,6 +26,7 @@ export interface Settings {
   pinned: boolean;
   captureSource: boolean;
   markdownMode: boolean;
+  gitBackup: boolean;
   historyPreview: boolean;
   autoUpdate: boolean;
   onboarded: boolean;
@@ -39,6 +43,7 @@ export let settings: Settings = {
   pinned: false,
   captureSource: true,
   markdownMode: false,
+  gitBackup: false,
   historyPreview: false,
   autoUpdate: true,
   onboarded: true,
@@ -47,6 +52,7 @@ export let settings: Settings = {
   backgroundOpacity: 1,
   window: null,
   sync: {
+    kind: "webdav",
     enabled: false,
     url: "",
     username: "",
@@ -62,6 +68,7 @@ export function paintSettings(): void {
   ui.notesDirInput.value = settings.notesDir;
   ui.captureSourceCheck.checked = settings.captureSource;
   ui.markdownModeCheck.checked = settings.markdownMode;
+  ui.gitBackupCheck.checked = settings.gitBackup;
   ui.autoUpdateCheck.checked = settings.autoUpdate;
   ui.autoHideCheck.checked = settings.autoHideOnBlur;
   ui.themeSelect.value = settings.theme;

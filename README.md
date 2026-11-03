@@ -24,6 +24,7 @@
 - **可选云同步**：用自己的 WebDAV 空间同步笔记目录（坚果云 / Nextcloud / NAS 等）；默认关闭，不配置不联网。两端同时修改按条目合并，无法合并时保留冲突副本。
 - **Markdown 模式**：可选按块写入，代码块、表格、标题从第一行起即可正常渲染。
 - **笔记历史**：标题栏的笔记按钮打开历史面板，按日期倒序浏览、全文搜索（跨所有日期文件）、加载更早的记录；可切换 Markdown 渲染预览，也能直接编辑或删除单条记录。
+- **标签**：正文里写 `#工作` 就是标签，历史面板按标签一键筛选；格式不变，仍是纯 Markdown。
 - **系统托盘**：左键唤起；右键可打开今日笔记、笔记文件夹、设置或退出。
 - **单实例运行**：重复启动只会唤起已有窗口，不会出现第二个托盘图标或热键冲突。
 - **自动更新**：启动后静默检查 GitHub Release；发现新版本时窗口底部出现提示条，点击即可下载、校验签名并安装，重启后生效。
@@ -67,12 +68,13 @@
 | 笔记目录 | 通过文件夹选择器更换；目录不存在会自动创建。 |
 | 自动记录来源窗口 | 关闭后不再抓取和写入来源标题。 |
 | Markdown 模式 | 开启后每条写成 `### 时间` + 原文，代码块、表格等块级语法可正常渲染；默认关闭。 |
+| 保存后自动提交到 Git | 每次保存、编辑、删除后把笔记目录的 Markdown 提交到本地仓库；笔记目录需要先 `git init`（设置里有「初始化仓库」按钮）。默认关闭，详见下方「版本历史（Git）」。 |
 | 开机自启 | 写入当前用户的启动项，默认关闭。 |
 | 自动检查更新 | 启动后静默检查新版本，常驻运行时每 6 小时复查，默认开启；关闭后立即停止排队的检查，仍可用「检查更新」手动触发。 |
 | 失去焦点时自动收起 | 点击其他窗口后自动收起小窗，默认关闭；常驻模式和面板打开期间不生效。 |
 | 主题 | 跟随系统、浅色或深色；跟随系统时随 Windows 深浅色实时切换。 |
 | 背景不透明度 | 60%–100%，小窗与面板使用同一透明度；默认 100%（不透明）。 |
-| 云同步（WebDAV） | 启用开关、地址、账号、密码、同步间隔与设备名；默认关闭，详见下方「云同步（WebDAV）」。 |
+| 云同步 | 启用开关、同步方式（WebDAV / GitHub 仓库）、地址、账号或分支、密码或令牌、同步间隔与设备名；默认关闭，详见下方「云同步」。 |
 
 设置保存在：
 
@@ -112,8 +114,19 @@
 
 - 默认每次加载 100 条，底部「加载更多」继续向前翻。
 - 搜索会扫描笔记目录下所有 `YYYY-MM-DD.md`，不区分大小写，覆盖正文、时间与来源标题，最多返回 200 条。
+- 搜索 `#标签` 时按标签精确匹配（搜 `#工作` 不会带出 `#工作台`）。
 - 「预览」按 Markdown 渲染条目内容（经 DOMPurify 清洗）；再点一次回到原文。开关状态会记住。
 - 「编辑」直接改写条目并保留来源行与原格式（紧凑列表 / Markdown 块）；「删除」单击即移除，5 秒内可点「撤销」恢复。
+- 开启云同步后，日期分隔行右侧会显示这一天文件的同步状态：已同步 / 待同步 / 有冲突副本。状态按日期文件计算，条目不单独同步。
+
+### 标签
+
+标签直接写在正文里，形如 `#工作`、`#会议`、`#idea`，不需要额外的输入框或设置：
+
+- `#` 必须在行首或空格之后，后面紧跟字母（含中文）、数字、`_`、`-` 或 `/`；
+- 标点处结束，所以 `#工作，` 识别为「工作」；
+- Markdown 标题（`# 标题`）、URL 锚点（`…/page#section`）、代码块与行内代码里的 `#` 都不算；
+- 历史面板会把标签显示成小圆角块，点一下即按该标签筛选，再点一次取消。
 
 ### Markdown 模式
 
@@ -134,7 +147,13 @@ const a = 1;
 
 该模式默认关闭，可在设置中切换。关闭时使用上面的紧凑列表格式，两种格式可以混用，旧条目不会被改写。
 
-## 云同步（WebDAV）
+## 云同步
+
+两种方式二选一，用的是同一套同步引擎（按日期文件、条目级合并、冲突副本）：
+
+- **WebDAV**：自己的网盘或 NAS，见下方「WebDAV」；
+- **GitHub 仓库**：把笔记放在一个私有仓库里，见下方「GitHub 仓库」。
+
 
 默认关闭。只使用你自己的 WebDAV 空间，笔记以**明文 Markdown** 写到：
 
@@ -152,6 +171,29 @@ const a = 1;
 4. 点「测试连接」确认可读写，再点「保存」并勾选「启用云同步」。
 
 Nextcloud、NAS 自带 WebDAV、[dufs](https://github.com/sigoden/dufs)、`rclone serve webdav` 等填各自的 DAV 根地址即可。地址只写到目录，不要带文件名。
+
+### 配置（GitHub 仓库）
+
+同步方式选「GitHub 仓库」，笔记会以 `flashnote/notes/YYYY-MM-DD.md` 的路径提交到仓库里：
+
+1. 在 GitHub 建一个**私有**仓库（公开仓库等于把笔记公开）；
+2. 生成 **Fine-grained token**（推荐）：Settings → Developer settings → Personal access tokens → Fine-grained tokens：
+   - Repository access 选 **Only select repositories**，只勾这一个笔记仓库；
+   - Permissions → Repository permissions → **Contents: Read and write**（Metadata 会自动带上只读）；
+   - 设一个过期时间（最长一年），到期后在这里换新的。
+   经典令牌（classic）也能用，但 `repo` 范围是「所有私有仓库」，不如 fine-grained 划算；
+3. 同步方式选「GitHub 仓库」，仓库地址填 `https://github.com/<owner>/<repo>`，令牌填上一步生成的 PAT；
+4. 分支栏可以留空（用仓库默认分支），也可以写 `main` 或 `flashnote`；把地址写成 `https://github.com/<owner>/<repo>/tree/<分支>` 也认；
+5. 点「测试连接」，确认后保存并启用。
+
+行为与 WebDAV 完全一致：按日期文件同步、条目级合并、冲突副本照常生成。区别在实现层面：
+
+- 版本用 Git 的 blob sha，等价于强 ETag，所以删除会正常传播；
+- **每个变更文件一次提交**，提交信息形如 `flashnote: 2026-10-31.md`，历史会比较碎；
+- 受 GitHub 限流约束（认证请求 5000 次/小时），单轮请求预算用尽时剩余文件留到下一轮；
+- 单轮同步的先后顺序与 WebDAV 相同，但**没有** `PROPFIND` 之类的目录缓存，文件多时往返次数略高于 WebDAV。
+
+先用空的私有仓库试一次「测试连接」最稳妥：它会列出 `flashnote/notes/` 下的文件数（空仓库就是 0）。
 
 ### 行为
 
@@ -172,12 +214,29 @@ Nextcloud、NAS 自带 WebDAV、[dufs](https://github.com/sigoden/dufs)、`rclon
 
 ### 排障
 
-- 「认证失败」：坚果云必须使用应用密码；也检查地址是否以 `/dav/` 结尾。
+- 「认证失败」：坚果云必须使用应用密码；也检查地址是否以 `/dav/` 结尾。GitHub 模式多半是令牌过期、被撤销，或没有给这个仓库的 `Contents: Read and write` 权限。
 - 「请求过于频繁」：服务商限流，闪记会按 `Retry-After` 退避；可把同步间隔调长，或减少同时使用的客户端。
 - 冲突副本不会自动清理；确认内容后手动删除或合并即可。
 - 同步状态与失败原因显示在设置页与历史面板底部。
 
 协议细节（决策表、合并规则、状态文件）见 [docs/sync-protocol.md](docs/sync-protocol.md)；WebDAV 模式不涉及其中的账号与加密部分。
+
+## 版本历史（Git）
+
+云同步解决「多台机器」，Git 解决「可回溯」。两者可以同时开，也可以只开一个：
+
+1. 设置 →「保存后自动提交到 Git」，第一次开启时点旁边的「初始化仓库」（等价于在笔记目录执行 `git init`）；
+2. 之后每次保存、编辑、删除，以及每轮同步下载/合并产生的新内容，都会自动提交一次；
+3. 用 `git log`、`git diff` 或任何 Git 客户端查看历史。想备份到 GitHub，在笔记目录里自己配 `git remote` 和推送即可。
+
+要点：
+
+- 只提交 `*.md`；`.bak-*`、`.tmp-*` 这类备份和临时文件不进历史。
+- 没有改动时不产生空提交；提交信息形如 `笔记 2026-10-31 15:20（1 个文件）`。
+- 没配过 `user.name` / `user.email` 的机器会用一次性身份 `FlashNote <flashnote@localhost>` 提交，不改你的全局 Git 配置。
+- 闪记不 clone、不 push、不接触任何远端凭据；推送策略完全由你决定。
+- 提交失败只写日志，不影响保存本身——笔记落盘永远优先于版本历史。
+- 没装 Git 时设置项会禁用并提示原因。
 
 ## 安装
 
@@ -191,7 +250,7 @@ Nextcloud、NAS 自带 WebDAV、[dufs](https://github.com/sigoden/dufs)、`rclon
 每个 Release 都附带 `SHA256SUMS.txt`，可用来校验下载是否完整：
 
 ```powershell
-Get-FileHash .\FlashNote_0.5.2_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.6.0_x64-setup.exe -Algorithm SHA256
 ```
 
 把输出与 `SHA256SUMS.txt` 中对应行比对即可。
@@ -203,7 +262,7 @@ Get-FileHash .\FlashNote_0.5.2_x64-setup.exe -Algorithm SHA256
 从源码构建的安装包位于：
 
 ```
-src-tauri\target\release\bundle\nsis\FlashNote_0.5.2_x64-setup.exe
+src-tauri\target\release\bundle\nsis\FlashNote_0.6.0_x64-setup.exe
 ```
 
 ## 开发
@@ -246,7 +305,7 @@ npm run tauri build
 产物：
 
 - 可执行文件：`src-tauri\target\release\flashnote.exe`
-- NSIS 安装包：`src-tauri\target\release\bundle\nsis\FlashNote_0.5.2_x64-setup.exe`
+- NSIS 安装包：`src-tauri\target\release\bundle\nsis\FlashNote_0.6.0_x64-setup.exe`
 
 ### 测试
 

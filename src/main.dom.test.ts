@@ -54,6 +54,7 @@ const baseSettings = {
   pinned: false,
   captureSource: true,
   markdownMode: false,
+  gitBackup: false,
   historyPreview: false,
   autoUpdate: false,
   onboarded: true,
@@ -62,6 +63,7 @@ const baseSettings = {
   backgroundOpacity: 1,
   window: null,
   sync: {
+    kind: "webdav",
     enabled: false,
     url: "",
     username: "",
@@ -96,12 +98,13 @@ function syncStatus(overrides: Partial<TestSyncStatus> = {}): TestSyncStatus {
   };
 }
 
-function entry(time: string, content: string): NoteEntry {
+function entry(time: string, content: string, tags: string[] = []): NoteEntry {
   return {
     date: "2026-10-21",
     time,
     content,
     source: null,
+    tags,
     path: "D:\\Notes\\2026-10-21.md",
   };
 }
@@ -125,11 +128,15 @@ function defaultHandlers(): Handlers {
     clear_draft: () => null,
     hide_window: () => null,
     delete_note_entry: () => null,
-    update_note_entry: () => null,
+    update_note_entry: () => [],
     open_note_file: () => null,
     open_notes_dir: () => null,
     complete_onboarding: () => null,
     get_sync_status: () => syncStatus(),
+    get_sync_file_states: () => [],
+    get_git_status: () => ({ available: true, repo: false }),
+    init_notes_git: () => ({ available: true, repo: true }),
+    update_git_backup: () => null,
     update_sync_config: () => syncStatus({ configured: true, enabled: true }),
     save_sync_password: () => ({ persistent: true, warning: null }),
     clear_sync_password: () => null,
@@ -360,6 +367,45 @@ describe("设置", () => {
   });
 });
 
+describe("Git 自动提交", () => {
+  async function openGitSettings(): Promise<void> {
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+  }
+
+  it("未初始化仓库时提示并可一键初始化", async () => {
+    let repo = false;
+    await boot({
+      get_git_status: () => ({ available: true, repo }),
+      init_notes_git: () => {
+        repo = true;
+        return { available: true, repo: true };
+      },
+    });
+    await openGitSettings();
+
+    const init = node<HTMLButtonElement>("#git-init");
+    expect(init.hidden).toBe(false);
+    expect(node<HTMLElement>("#git-status").textContent).toContain("还不是 Git 仓库");
+
+    init.click();
+    await flush();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("init_notes_git");
+    expect(node<HTMLButtonElement>("#git-init").hidden).toBe(true);
+    expect(node<HTMLElement>("#git-status").textContent).toContain("已是 Git 仓库");
+  });
+
+  it("没有 git 命令时禁用开关并说明原因", async () => {
+    await boot({ get_git_status: () => ({ available: false, repo: false }) });
+    await openGitSettings();
+
+    expect(node<HTMLInputElement>("#git-backup").disabled).toBe(true);
+    expect(node<HTMLElement>("#git-status").textContent).toContain("没有找到 git");
+    expect(node<HTMLButtonElement>("#git-init").hidden).toBe(true);
+  });
+});
+
 describe("历史面板错误态", () => {
   it("读取失败时显示持久错误，重试成功后恢复列表", async () => {
     let failing = true;
@@ -425,6 +471,48 @@ describe("云同步", () => {
     });
     expect(node<HTMLInputElement>("#sync-password").value).toBe("");
     expect(node<HTMLElement>("#toast-message").textContent).toContain("已保存");
+  });
+
+  it("切换到 GitHub 时字段标签与提示跟着变", async () => {
+    await boot();
+    await openSettings();
+
+    const kind = node<HTMLSelectElement>("#sync-kind");
+    expect(node<HTMLElement>("#sync-url-label").textContent).toBe("WebDAV 地址");
+
+    kind.value = "github";
+    kind.dispatchEvent(new Event("change"));
+    await flush();
+
+    expect(node<HTMLElement>("#sync-url-label").textContent).toBe("仓库地址");
+    expect(node<HTMLElement>("#sync-username-label").textContent).toContain("分支");
+    expect(node<HTMLElement>("#sync-password-label").textContent).toBe("Personal Access Token");
+    expect(node<HTMLInputElement>("#sync-url").placeholder).toContain("github.com");
+    // 明文 http 只对 WebDAV 有意义
+    expect(node<HTMLElement>("#sync-allow-http").closest("label")?.hidden).toBe(true);
+  });
+
+  it("保存 GitHub 配置时把类型一起提交", async () => {
+    let saved: Record<string, unknown> | undefined;
+    await boot({
+      update_sync_config: (args) => {
+        saved = args?.config as Record<string, unknown>;
+        return syncStatus({ configured: true, enabled: true });
+      },
+    });
+    await openSettings();
+
+    const kind = node<HTMLSelectElement>("#sync-kind");
+    kind.value = "github";
+    kind.dispatchEvent(new Event("change"));
+    node<HTMLInputElement>("#sync-url").value = "https://github.com/alice/notes";
+    node<HTMLButtonElement>("#sync-save").click();
+    await flush();
+
+    expect(saved).toMatchObject({
+      kind: "github",
+      url: "https://github.com/alice/notes",
+    });
   });
 
   it("保存失败时保留输入并显示后端错误", async () => {
@@ -605,6 +693,83 @@ describe("云同步", () => {
     await flush();
 
     expect(node<HTMLElement>("#sync-indicator").textContent).toBe("已同步");
+  });
+});
+
+describe("标签", () => {
+  it("正文标签渲染成可点击的筛选器", async () => {
+    notes = [entry("09:00", "开会 #工作", ["工作"]), entry("08:00", "别的事")];
+    await boot({
+      search_notes: (args) => (String(args?.query) === "#工作" ? [notes[0]] : notes),
+    });
+    await openHistory();
+
+    const chip = document.querySelector<HTMLButtonElement>(".entry-tag");
+    expect(chip?.textContent).toBe("#工作");
+
+    chip?.click();
+    await flush();
+
+    expect(node<HTMLInputElement>("#history-search").value).toBe("#工作");
+    expect(entries()).toHaveLength(1);
+    expect(entries()[0].textContent).toContain("开会");
+
+    // 再点同一个标签取消筛选
+    document.querySelector<HTMLButtonElement>(".entry-tag")?.click();
+    await flush();
+    expect(node<HTMLInputElement>("#history-search").value).toBe("");
+  });
+
+  it("编辑后标签跟着刷新，不用重开面板", async () => {
+    notes = [entry("09:00", "开会 #工作", ["工作"])];
+    await boot({ update_note_entry: () => ["会议"] });
+    await openHistory();
+
+    editButton().click();
+    await flush();
+    const editor = node<HTMLTextAreaElement>(".entry-edit");
+    editor.value = "开会 #会议";
+    node<HTMLButtonElement>(".entry-edit-actions .btn.primary").click();
+    await flush();
+
+    const chips = Array.from(document.querySelectorAll(".entry-tag")).map(
+      (chip) => chip.textContent,
+    );
+    expect(chips).toEqual(["#会议"]);
+  });
+
+  it("没有标签的笔记不渲染标签行", async () => {
+    await boot();
+    await openHistory();
+    expect(document.querySelector(".entry-tag")).toBeNull();
+  });
+});
+
+describe("历史面板的文件同步状态", () => {
+  it("日期行显示后端返回的状态", async () => {
+    await boot({
+      get_sync_file_states: (args) =>
+        (args?.dates as string[]).map((date) => ({ date, state: "pending" })),
+    });
+    await openHistory();
+
+    const badge = document.querySelector<HTMLElement>(".entry-date .date-sync");
+    expect(badge?.textContent).toBe("待同步");
+    expect(badge?.className).toContain("pending");
+    // 只请求当前列表里出现过的日期
+    expect(mocks.invoke).toHaveBeenCalledWith("get_sync_file_states", {
+      dates: ["2026-10-21"],
+    });
+  });
+
+  it("同步状态接口失败时不影响列表", async () => {
+    await boot({
+      get_sync_file_states: () => Promise.reject("状态文件损坏"),
+    });
+    await openHistory();
+
+    expect(entries()).toHaveLength(2);
+    expect(document.querySelector(".entry-date .date-sync")?.textContent).toBe("");
   });
 });
 

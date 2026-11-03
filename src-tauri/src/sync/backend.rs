@@ -142,6 +142,9 @@ impl std::error::Error for SyncError {}
 pub(crate) trait SyncBackend: Send + Sync {
     fn capabilities(&self) -> Capabilities;
 
+    /// 下一轮允许发出的请求数。后端各自按自己的计费方式实现。
+    fn reset_budget(&self, requests: usize);
+
     /// 列出远端全部笔记文件；失败时调用方不得做任何删除。
     async fn list(&self) -> Result<Vec<RemoteMeta>, SyncError>;
 

@@ -109,11 +109,6 @@ impl WebDavBackend {
         })
     }
 
-    /// 下一轮允许发出的请求数；用尽后本轮剩余文件留到下一轮。
-    pub(crate) fn reset_budget(&self, requests: usize) {
-        self.budget.store(requests, Ordering::Relaxed);
-    }
-
     /// 写入/删除前预留够用的预算，避免「写成功了、回读却因预算耗尽失败」，
     /// 导致记录不提交、下一轮误判为并发修改。
     fn reserve_budget(&self, units: usize) -> Result<(), SyncError> {
@@ -531,6 +526,11 @@ impl WebDavBackend {
 impl SyncBackend for WebDavBackend {
     fn capabilities(&self) -> Capabilities {
         self.caps.clone()
+    }
+
+    /// 下一轮允许发出的请求数；用尽后本轮剩余文件留到下一轮。
+    fn reset_budget(&self, requests: usize) {
+        self.budget.store(requests, Ordering::Relaxed);
     }
 
     async fn list(&self) -> Result<Vec<RemoteMeta>, SyncError> {

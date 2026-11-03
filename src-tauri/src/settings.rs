@@ -44,12 +44,24 @@ pub fn clamp_opacity(value: f64) -> f64 {
     }
 }
 
+/// 同步方式。旧配置没有这个字段，一律按 WebDAV 处理。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncKind {
+    #[default]
+    Webdav,
+    Github,
+}
+
 /// 云同步配置。密码不在这里：它只进 Windows 凭据管理器。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SyncSettings {
+    pub kind: SyncKind,
     pub enabled: bool,
+    /// WebDAV 填服务地址；GitHub 填仓库地址 `https://github.com/<owner>/<repo>`。
     pub url: String,
+    /// WebDAV 填账号；GitHub 这一栏当作分支名（留空用默认分支）。
     pub username: String,
     /// 自动同步间隔（分钟），只接受 5 / 15 / 60。
     pub interval_minutes: u32,
@@ -62,6 +74,7 @@ pub struct SyncSettings {
 impl Default for SyncSettings {
     fn default() -> Self {
         Self {
+            kind: SyncKind::default(),
             enabled: false,
             url: String::new(),
             username: String::new(),
@@ -74,7 +87,17 @@ impl Default for SyncSettings {
 
 impl SyncSettings {
     pub fn is_configured(&self) -> bool {
-        !self.url.trim().is_empty() && !self.username.trim().is_empty()
+        match self.kind {
+            // GitHub 的账号信息在仓库地址里，分支可以留空。
+            SyncKind::Github => crate::sync::github::parse_repo(&self.url).is_some(),
+            SyncKind::Webdav => !self.url.trim().is_empty() && !self.username.trim().is_empty(),
+        }
+    }
+
+    /// GitHub 模式下这一栏是分支名；空表示用仓库默认分支。
+    pub fn github_branch(&self) -> Option<String> {
+        let branch = self.username.trim();
+        (!branch.is_empty()).then(|| branch.to_string())
     }
 
     /// 只接受 5 / 15 / 60，其余一律按 15 处理。
@@ -119,6 +142,8 @@ pub struct Settings {
     pub theme: String,
     /// 窗口失去焦点时自动收起；常驻模式下面不生效。
     pub auto_hide_on_blur: bool,
+    /// 保存后把笔记目录的改动提交到本地 Git 仓库；默认关闭。
+    pub git_backup: bool,
     /// 小窗与面板的背景不透明度，0.6–1.0。
     pub background_opacity: f64,
     pub window: Option<WindowGeometry>,
@@ -139,6 +164,7 @@ impl Default for Settings {
             onboarded: false,
             theme: "system".to_string(),
             auto_hide_on_blur: false,
+            git_backup: false,
             background_opacity: 1.0,
             window: None,
             sync: SyncSettings::default(),
@@ -538,6 +564,7 @@ mod tests {
             onboarded: true,
             theme: "dark".to_string(),
             auto_hide_on_blur: true,
+            git_backup: true,
             background_opacity: 0.8,
             window: Some(WindowGeometry {
                 x: -120,

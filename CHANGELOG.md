@@ -2,7 +2,15 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.6.0] - 2026-11-04
+
+### 新增
+
+- 云同步新增「GitHub 仓库」方式：用自己的私有仓库当同步空间，与 WebDAV 共用同一套引擎（按日期文件、条目级合并、冲突副本）。版本用 Git 的 blob sha，删除可正常传播；每个变更文件一次提交。
+- 保存后自动提交到 Git：在设置里开启后，每次保存 / 编辑 / 删除以及每轮同步的新内容都会在笔记目录提交一次，可用 `git log` 回溯；只提交 `*.md`，不产生空提交，不 clone/push，也不接触远端凭据。首次开启可在设置里一键 `git init`。
+- 标签：正文里写 `#工作`、`#idea` 即被识别为标签，历史面板显示为圆角块，点一下按该标签筛选，再点一次取消。格式不变，仍是纯 Markdown，同步与外部编辑都不受影响。
+- 标签搜索按精确匹配：输入 `#工作` 不会带出 `#工作台`；普通关键词仍是子串匹配。
+- 历史面板的日期分隔行显示这一天文件的同步状态（已同步 / 待同步 / 有冲突副本），状态按日期文件的 `local_sha256` 与磁盘内容比对，随同步结束自动刷新（#64）。
 
 ## [0.5.2] - 2026-11-02
 
@@ -196,7 +204,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.6.0
 [0.5.2]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.2
 [0.5.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.0

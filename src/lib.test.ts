@@ -125,8 +125,9 @@ describe("matchesTerm", () => {
   const note = {
     date: "2026-10-21",
     time: "14:32",
-    content: "Rust 所有权笔记",
+    content: "Rust 所有权笔记 #工作",
     source: "Google Chrome — 文章",
+    tags: ["工作", "rust"],
   };
 
   it("匹配正文", () => {
@@ -147,6 +148,14 @@ describe("matchesTerm", () => {
   it("不匹配时返回 false", () => {
     expect(matchesTerm(note, "不存在")).toBe(false);
   });
+
+  it("`#标签` 走精确匹配，不把 `#工作台` 算进来", () => {
+    expect(matchesTerm(note, "#工作")).toBe(true);
+    expect(matchesTerm(note, "#rust")).toBe(true);
+    expect(matchesTerm(note, "#工作台")).toBe(false);
+    // 普通词仍然是子串匹配
+    expect(matchesTerm(note, "工作")).toBe(true);
+  });
 });
 
 function note(overrides: Partial<NoteEntry> = {}): NoteEntry {
@@ -155,6 +164,7 @@ function note(overrides: Partial<NoteEntry> = {}): NoteEntry {
     time: "10:00",
     content: "记一笔",
     source: null,
+    tags: [],
     path: "2026-10-22.md",
     ...overrides,
   };

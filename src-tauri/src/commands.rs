@@ -5,9 +5,9 @@
 
 use crate::{
     files::{self, io_guard},
-    notes,
-    settings::{self, Settings, SyncSettings},
-    sync::{self, backend::SyncBackend, runtime::SyncStatus, webdav},
+    git_backup, notes,
+    settings::{self, Settings, SyncKind, SyncSettings},
+    sync::{self, backend::SyncBackend, github, runtime::SyncStatus, webdav},
     AppState,
 };
 use serde::{Deserialize, Serialize};
@@ -254,6 +254,7 @@ pub async fn save_note(app: AppHandle, content: String) -> Result<SavedNote, Str
         };
         // 落盘成功后再排一轮同步：防抖 5 秒，连续记录只跑一次。
         state.sync.schedule();
+        git_backup::schedule(&app);
 
         Ok(SavedNote {
             path: path.to_string_lossy().to_string(),
@@ -292,6 +293,49 @@ pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String
     persist(&app);
     log::info!("笔记目录已更新为 {}", dir.display());
     Ok(())
+}
+
+/// 笔记目录当前能否用 Git：有没有装 git、是不是仓库。
+#[tauri::command]
+pub async fn get_git_status(app: AppHandle) -> Result<git_backup::GitStatus, String> {
+    run_blocking(move || Ok(git_backup::status(&notes_dir(&app)))).await
+}
+
+/// 给笔记目录建一个本地仓库；已经是仓库时幂等返回。
+#[tauri::command]
+pub async fn init_notes_git(app: AppHandle) -> Result<git_backup::GitStatus, String> {
+    run_blocking(move || {
+        let dir = notes_dir(&app);
+        git_backup::init(&dir)?;
+        Ok(git_backup::status(&dir))
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn update_git_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .git_backup = enabled;
+    persist(&app);
+    Ok(())
+}
+
+fn notes_dir(app: &AppHandle) -> PathBuf {
+    let state = app.state::<AppState>();
+    let dir = state
+        .settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notes_dir
+        .clone();
+    PathBuf::from(dir)
 }
 
 #[tauri::command]
@@ -440,6 +484,7 @@ pub async fn delete_note_entry(
         });
         if result.is_ok() {
             state.sync.schedule();
+            git_backup::schedule(&app);
         }
         result
     })
@@ -454,7 +499,7 @@ pub async fn update_note_entry(
     time: String,
     content: String,
     new_content: String,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if new_content.trim().is_empty() {
         return Err("内容不能为空".to_string());
     }
@@ -465,8 +510,10 @@ pub async fn update_note_entry(
         });
         if result.is_ok() {
             state.sync.schedule();
+            git_backup::schedule(&app);
         }
-        result
+        // 顺带把新正文里的标签算出来：前端改完立刻要刷新标签，不能等下次全量加载。
+        result.map(|_| notes::extract_tags(&new_content))
     })
     .await
 }
@@ -630,8 +677,9 @@ pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opa
 
 /// 前端提交的同步配置。密码不在这里，走 `save_sync_password`。
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct SyncConfigInput {
+    pub kind: SyncKind,
     pub enabled: bool,
     pub url: String,
     pub username: String,
@@ -640,19 +688,49 @@ pub struct SyncConfigInput {
     pub device_name: String,
 }
 
+impl Default for SyncConfigInput {
+    fn default() -> Self {
+        Self {
+            kind: SyncKind::default(),
+            enabled: false,
+            url: String::new(),
+            username: String::new(),
+            interval_minutes: 15,
+            allow_insecure_http: false,
+            device_name: String::new(),
+        }
+    }
+}
+
 impl SyncConfigInput {
-    /// 校验并规范化；启用时必须填全地址与用户名。
+    /// 校验并规范化。两种后端的「地址」含义不同，校验也分开做。
     fn normalize(self) -> Result<SyncSettings, String> {
         let url = self.url.trim().to_string();
         let username = self.username.trim().to_string();
-        if !url.is_empty() {
-            webdav::validate_url(&url, self.allow_insecure_http)
-                .map_err(|error| error.to_string())?;
-        }
-        if self.enabled && (url.is_empty() || username.is_empty()) {
-            return Err("启用同步前请填写 WebDAV 地址和用户名".to_string());
+        match self.kind {
+            SyncKind::Github => {
+                if !url.is_empty() && github::parse_repo(&url).is_none() {
+                    return Err(
+                        "仓库地址应形如 https://github.com/owner/repo（可选 /tree/<分支>）"
+                            .to_string(),
+                    );
+                }
+                if self.enabled && github::parse_repo(&url).is_none() {
+                    return Err("启用前请填写 GitHub 仓库地址".to_string());
+                }
+            }
+            SyncKind::Webdav => {
+                if !url.is_empty() {
+                    webdav::validate_url(&url, self.allow_insecure_http)
+                        .map_err(|error| error.to_string())?;
+                }
+                if self.enabled && (url.is_empty() || username.is_empty()) {
+                    return Err("启用同步前请填写 WebDAV 地址和用户名".to_string());
+                }
+            }
         }
         Ok(SyncSettings {
+            kind: self.kind,
             enabled: self.enabled,
             url,
             username,
@@ -684,11 +762,21 @@ pub async fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
     run_blocking(move || Ok(sync::runtime::status(&app))).await
 }
 
+/// 历史面板里按日期显示文件级同步状态；只算当前列表里的日期，避免全目录哈希。
+#[tauri::command]
+pub async fn get_sync_file_states(
+    app: AppHandle,
+    dates: Vec<String>,
+) -> Result<Vec<sync::runtime::FileSyncState>, String> {
+    run_blocking(move || Ok(sync::runtime::file_states(&app, &dates))).await
+}
+
 /// 两个同步配置是否指向同一远端账号；只差 URL 末尾斜杠视为相同。
 fn same_sync_identity(left: &settings::SyncSettings, right: &settings::SyncSettings) -> bool {
     // 与凭据、状态目录共用同一份身份：大小写/尾斜杠/query 的差异不算换远端。
-    sync::remote_identity(&left.url, &left.username)
-        == sync::remote_identity(&right.url, &right.username)
+    // 用凭据身份：GitHub 只改分支时令牌仍然有效，不该被清掉。
+    sync::credential_identity(left.kind, &left.url, &left.username)
+        == sync::credential_identity(right.kind, &right.url, &right.username)
 }
 
 #[tauri::command]
@@ -712,7 +800,9 @@ pub async fn update_sync_config(
     if !same_sync_identity(&previous, &next) {
         state.sync.forget_password();
         if previous.is_configured() {
-            if let Err(error) = sync::secrets::clear(&previous.url, &previous.username) {
+            if let Err(error) =
+                sync::secrets::clear(previous.kind, &previous.url, &previous.username)
+            {
                 log::warn!("清理旧同步密码失败：{error}");
             }
         }
@@ -741,14 +831,17 @@ pub fn save_sync_password(
         .sync
         .clone();
     if !sync.is_configured() {
-        return Err("请先填写 WebDAV 地址和用户名".to_string());
+        return Err(match sync.kind {
+            SyncKind::Github => "请先填写 GitHub 仓库地址".to_string(),
+            SyncKind::Webdav => "请先填写 WebDAV 地址和用户名".to_string(),
+        });
     }
 
     // 先记在内存里：凭据管理器被禁用时，本次会话仍然能同步。
     state.sync.remember_password(&password);
     // 密码补上后立刻可以同步，不用等下一个定时点。
     state.sync.schedule();
-    match sync::secrets::save(&sync.url, &sync.username, &password) {
+    match sync::secrets::save(sync.kind, &sync.url, &sync.username, &password) {
         Ok(()) => Ok(PasswordSaveResult {
             persistent: true,
             warning: None,
@@ -773,7 +866,7 @@ pub async fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> 
         .clone();
     state.sync.forget_password();
     if sync.is_configured() {
-        sync::secrets::clear(&sync.url, &sync.username)?;
+        sync::secrets::clear(sync.kind, &sync.url, &sync.username)?;
     }
     sync::runtime::emit_status(&app).await;
     Ok(())
@@ -788,7 +881,10 @@ pub async fn test_sync_connection(
 ) -> Result<SyncTestResult, String> {
     let sync = config.normalize()?;
     if !sync.is_configured() {
-        return Err("请先填写 WebDAV 地址和用户名".to_string());
+        return Err(match sync.kind {
+            SyncKind::Github => "请先填写 GitHub 仓库地址".to_string(),
+            SyncKind::Webdav => "请先填写 WebDAV 地址和用户名".to_string(),
+        });
     }
 
     let saved = app
@@ -806,22 +902,44 @@ pub async fn test_sync_connection(
         // 只允许使用新地址自己在凭据管理器里保存过的密码。
         None if same_identity => match runtime.cached_password() {
             Some(password) => password,
-            None => sync::secrets::load(&sync.url, &sync.username)?
+            None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
                 .ok_or_else(|| "还没有保存密码".to_string())?,
         },
-        None => sync::secrets::load(&sync.url, &sync.username)?
+        None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
             .ok_or_else(|| "地址或用户名已修改，请重新输入密码".to_string())?,
     };
 
-    let backend = webdav::WebDavBackend::connect(webdav::WebDavConfig {
-        url: sync.url.clone(),
-        username: sync.username.clone(),
-        password,
-        allow_insecure_http: sync.allow_insecure_http,
-    })
-    .await
-    .map_err(|error| error.to_string())?;
+    match sync.kind {
+        SyncKind::Github => {
+            let Some((owner, repo, url_branch)) = github::parse_repo(&sync.url) else {
+                return Err("GitHub 仓库地址格式不正确".to_string());
+            };
+            let backend = github::GitHubBackend::connect(github::GitHubConfig {
+                owner,
+                repo,
+                branch: url_branch.or_else(|| sync.github_branch()),
+                token: password,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            probe_backend(backend).await
+        }
+        SyncKind::Webdav => {
+            let backend = webdav::WebDavBackend::connect(webdav::WebDavConfig {
+                url: sync.url.clone(),
+                username: sync.username.clone(),
+                password,
+                allow_insecure_http: sync.allow_insecure_http,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            probe_backend(backend).await
+        }
+    }
+}
 
+/// 连上之后列一次目录，作为「测试连接」的结论。
+async fn probe_backend<B: SyncBackend>(backend: B) -> Result<SyncTestResult, String> {
     let degraded = sync::runtime::capability_note(&backend.capabilities());
     let files = backend
         .list()
@@ -884,6 +1002,7 @@ mod tests {
 
     fn sync_input(url: &str, enabled: bool) -> SyncConfigInput {
         SyncConfigInput {
+            kind: SyncKind::Webdav,
             enabled,
             url: url.to_string(),
             username: " ranger ".to_string(),

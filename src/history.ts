@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
+  exactTagTerm,
+  matchesLiteralTag,
   matchesTerm,
   nextOffset,
   withoutEntry,
@@ -10,7 +12,7 @@ import { ui } from "./dom";
 import { settings } from "./settings-store";
 import { hideUndoBar, showUndoBar, toast } from "./toast";
 import { hidePanel, showPanel } from "./panels";
-import { markSyncPending } from "./sync";
+import { markSyncPending, subscribeSyncStatus } from "./sync";
 
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
@@ -23,6 +25,60 @@ let serverFiltered = false;
 let searchSeq = 0;
 /** 历史面板最近一次读取失败的提示；为空表示没有错误。 */
 let historyError: string | null = null;
+/** 日期 → 文件级同步状态（`synced` / `pending` / `conflict`）。 */
+let fileStates = new Map<string, string>();
+let fileStatesSeq = 0;
+
+const DATE_SYNC_LABEL: Record<string, string> = {
+  synced: "已同步",
+  pending: "待同步",
+  conflict: "有冲突副本",
+};
+
+const DATE_SYNC_TITLE: Record<string, string> = {
+  synced: "这一天的文件与云端一致",
+  pending: "这一天的文件有改动，等待下一轮同步",
+  conflict: "这一天存在冲突副本，需要手动合并",
+};
+
+/** 列表里出现的日期，按出现顺序去重；后端只算这些文件。 */
+function visibleDates(): string[] {
+  const seen = new Set<string>();
+  for (const note of notes) seen.add(note.date);
+  return [...seen];
+}
+
+function paintFileStates(): void {
+  ui.entryList.querySelectorAll<HTMLElement>(".entry-date").forEach((row) => {
+    const badge = row.querySelector<HTMLElement>(".date-sync");
+    if (!badge) return;
+    const state = fileStates.get(row.dataset.date ?? "");
+    badge.textContent = state ? (DATE_SYNC_LABEL[state] ?? "") : "";
+    badge.className = state ? `date-sync ${state}` : "date-sync";
+    badge.title = state ? (DATE_SYNC_TITLE[state] ?? "") : "";
+  });
+}
+
+/** 只刷新当前列表涉及的日期，避免每次打开面板都哈希整个笔记目录。 */
+async function refreshFileStates(): Promise<void> {
+  const dates = visibleDates();
+  if (dates.length === 0) {
+    fileStates.clear();
+    return;
+  }
+  const seq = ++fileStatesSeq;
+  try {
+    const states = await invoke<{ date: string; state: string }[]>("get_sync_file_states", {
+      dates,
+    });
+    if (seq !== fileStatesSeq) return;
+    fileStates = new Map(states.map((item) => [item.date, item.state]));
+    paintFileStates();
+  } catch (error) {
+    // 同步状态只是辅助信息，读不到不影响历史列表本身
+    console.error("读取文件同步状态失败", error);
+  }
+}
 
 function dateLabel(date: string): string {
   const now = new Date();
@@ -185,7 +241,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
     }
     save.disabled = true;
     try {
-      await invoke("update_note_entry", {
+      const tags = await invoke<string[]>("update_note_entry", {
         path: note.path,
         date: note.date,
         time: note.time,
@@ -195,6 +251,8 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       markSyncPending();
       // 只更新内存里的这条并局部重渲，保留分页 offset 与滚动位置
       note.content = value;
+      // 标签由后端重新解析：正文改了标签就会变，不能用旧的
+      note.tags = tags;
       close();
       toast("已更新");
       renderNotes();
@@ -236,7 +294,7 @@ function renderNotes(): void {
   if (hasOpenEditor()) return;
 
   const term = serverFiltered ? "" : ui.historySearch.value.trim().toLowerCase();
-  const filtered = term ? notes.filter((note) => matchesTerm(note, term)) : notes;
+  const filtered = term ? notes.filter((note) => matchesLocally(note, term)) : notes;
 
   ui.entryList.replaceChildren();
 
@@ -265,7 +323,12 @@ function renderNotes(): void {
         lastDate = note.date;
         const date = document.createElement("div");
         date.className = "entry-date";
+        // 日期分隔行同时承载文件级同步状态（按日期文件同步，条目本身不单独同步）
+        date.dataset.date = note.date;
         date.textContent = dateLabel(note.date);
+        const sync = document.createElement("span");
+        sync.className = "date-sync";
+        date.append(sync);
         ui.entryList.append(date);
       }
 
@@ -279,6 +342,21 @@ function renderNotes(): void {
       time.className = "entry-time";
       time.textContent = note.time;
       head.append(time);
+
+      if (note.tags.length > 0) {
+        const tags = document.createElement("span");
+        tags.className = "entry-tags";
+        for (const tag of note.tags) {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "entry-tag";
+          chip.textContent = `#${tag}`;
+          chip.title = `只看 #${tag}`;
+          chip.addEventListener("click", () => filterByTag(tag));
+          tags.append(chip);
+        }
+        head.append(tags);
+      }
 
       if (note.source) {
         const source = document.createElement("span");
@@ -358,6 +436,39 @@ function renderNotes(): void {
   } else {
     ui.historyCount.textContent = hasMoreNotes ? `已显示 ${notes.length} 条` : `共 ${notes.length} 条`;
   }
+
+  // 先用上一轮结果铺一遍，再异步取最新状态，避免日期行闪烁空白
+  paintFileStates();
+  void refreshFileStates();
+}
+
+/**
+ * 本地过滤：`#标签` 精确匹配；列表里根本没有这个标签时退回子串匹配，
+ * 否则 `：#项目A` 这种「看着像标签、其实不是」的原文会搜不到。
+ */
+function matchesLocally(note: NoteEntry, term: string): boolean {
+  const tag = exactTagTerm(term);
+  if (tag === null) return matchesTerm(note, term);
+  const known = notes.some((item) =>
+    item.tags.some((value) => value.toLowerCase() === tag.toLowerCase()),
+  );
+  return known
+    ? note.tags.some((value) => value.toLowerCase() === tag.toLowerCase())
+    : matchesLiteralTag(note, term);
+}
+
+/** 点标签即筛选；再点一次（搜索框已经是这个标签）取消筛选。 */
+function filterByTag(tag: string): void {
+  if (hasOpenEditor()) {
+    toast("请先保存或取消正在编辑的笔记", true);
+    return;
+  }
+  if (searchTimer !== undefined) {
+    window.clearTimeout(searchTimer);
+    searchTimer = undefined;
+  }
+  ui.historySearch.value = exactTagTerm(ui.historySearch.value) === tag ? "" : `#${tag}`;
+  void runSearch();
 }
 
 async function loadNotes(reset = true): Promise<void> {
@@ -468,6 +579,7 @@ export function showHistoryPanel(): void {
   noteOffset = 0;
   hasMoreNotes = false;
   historyError = null;
+  fileStates = new Map();
   paintPreviewButton();
   ui.entryList.replaceChildren();
   ui.historyCount.textContent = "";
@@ -490,4 +602,9 @@ export function initHistory(): void {
     void invoke("open_notes_dir").catch((error) => toast(String(error), true));
   });
   ui.undoAction.addEventListener("click", () => undoDelete());
+  // 一轮同步结束后，日期行的状态要跟着变（待同步 → 已同步）
+  subscribeSyncStatus(() => {
+    if (ui.historyPanel.classList.contains("hidden")) return;
+    void refreshFileStates();
+  });
 }

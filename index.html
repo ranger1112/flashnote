@@ -124,6 +124,15 @@
             Markdown 模式
           </label>
 
+          <label class="check" title="笔记目录需要是 Git 仓库；每次保存后自动提交一次">
+            <input id="git-backup" type="checkbox" />
+            保存后自动提交到 Git
+          </label>
+          <div id="git-row" class="row git-row">
+            <span id="git-status" class="hint"></span>
+            <button id="git-init" class="btn tiny" type="button" hidden>初始化仓库</button>
+          </div>
+
           <label class="check">
             <input id="autostart" type="checkbox" />
             开机自启
@@ -154,12 +163,17 @@
           </div>
 
           <div class="field sync-section">
-            <span class="section-title">云同步（WebDAV）</span>
+            <span class="section-title">云同步</span>
             <label class="check" title="默认关闭；不启用时不会发起任何网络请求">
               <input id="sync-enabled" type="checkbox" />
               启用云同步
             </label>
-            <label for="sync-url">WebDAV 地址</label>
+            <label for="sync-kind">同步方式</label>
+            <select id="sync-kind" class="select">
+              <option value="webdav">WebDAV（坚果云 / Nextcloud / NAS）</option>
+              <option value="github">GitHub 仓库</option>
+            </select>
+            <label id="sync-url-label" for="sync-url">WebDAV 地址</label>
             <input
               id="sync-url"
               class="text-input"
@@ -167,7 +181,7 @@
               placeholder="https://dav.example.com/dav/"
               spellcheck="false"
             />
-            <label for="sync-username">用户名</label>
+            <label id="sync-username-label" for="sync-username">用户名</label>
             <input
               id="sync-username"
               class="text-input"
@@ -175,7 +189,7 @@
               autocomplete="off"
               spellcheck="false"
             />
-            <label for="sync-password">密码 / 应用密码</label>
+            <label id="sync-password-label" for="sync-password">密码 / 应用密码</label>
             <input
               id="sync-password"
               class="text-input"

@@ -4,6 +4,7 @@
 //! 会话内改用内存里的密码；任何情况下都不回退到明文落盘。
 
 use super::state::sha256_base64;
+use crate::settings::SyncKind;
 
 const SERVICE: &str = "flashnote-sync";
 
@@ -11,8 +12,9 @@ const SERVICE: &str = "flashnote-sync";
 ///
 /// 大小写、末尾斜杠与 query 都不改变远端身份，统一走 [`super::remote_identity`]，
 /// 避免「补一个 /」或把域名改成小写就找不到密码。
-pub(crate) fn account(url: &str, username: &str) -> String {
-    sha256_base64(super::remote_identity(url, username).as_bytes())
+pub(crate) fn account(kind: SyncKind, url: &str, username: &str) -> String {
+    // 用凭据身份而不是状态身份：GitHub 改分支不该让令牌失效。
+    sha256_base64(super::credential_identity(kind, url, username).as_bytes())
 }
 
 /// 0.5.0 的账号名算法：原始 URL 只去掉末尾斜杠。升级后先按新名字查，查不到
@@ -23,42 +25,60 @@ fn legacy_account(url: &str, username: &str) -> String {
 }
 
 /// 保存密码；覆盖已有凭据。
-pub(crate) fn save(url: &str, username: &str, password: &str) -> Result<(), String> {
-    imp::save(url, username, password)
+pub(crate) fn save(
+    kind: SyncKind,
+    url: &str,
+    username: &str,
+    password: &str,
+) -> Result<(), String> {
+    imp::save(kind, url, username, password)
 }
 
 /// 读取密码；没有保存过时返回 `Ok(None)`。
-pub(crate) fn load(url: &str, username: &str) -> Result<Option<String>, String> {
-    imp::load(url, username)
+pub(crate) fn load(kind: SyncKind, url: &str, username: &str) -> Result<Option<String>, String> {
+    imp::load(kind, url, username)
 }
 
 /// 删除密码；本来就没有也算成功。
-pub(crate) fn clear(url: &str, username: &str) -> Result<(), String> {
-    imp::clear(url, username)
+pub(crate) fn clear(kind: SyncKind, url: &str, username: &str) -> Result<(), String> {
+    imp::clear(kind, url, username)
 }
 
 #[cfg(windows)]
 mod imp {
     use super::*;
 
-    fn entry(url: &str, username: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(SERVICE, &account(url, username))
+    fn entry(kind: SyncKind, url: &str, username: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(SERVICE, &account(kind, url, username))
             .map_err(|error| format!("系统凭据存储不可用：{error}"))
     }
 
-    pub(super) fn save(url: &str, username: &str, password: &str) -> Result<(), String> {
-        entry(url, username)?
+    pub(super) fn save(
+        kind: SyncKind,
+        url: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        entry(kind, url, username)?
             .set_password(password)
             .map_err(|error| format!("保存密码失败：{error}"))
     }
 
-    pub(super) fn load(url: &str, username: &str) -> Result<Option<String>, String> {
-        let current = entry(url, username)?;
+    pub(super) fn load(
+        kind: SyncKind,
+        url: &str,
+        username: &str,
+    ) -> Result<Option<String>, String> {
+        let current = entry(kind, url, username)?;
         match current.get_password() {
             Ok(password) => Ok(Some(password)),
             Err(keyring::Error::NoEntry) => {
+                // 旧账号名只属于 0.5.x 的 WebDAV 配置，其它后端没有可迁移的旧凭据。
+                if kind != SyncKind::Webdav {
+                    return Ok(None);
+                }
                 let legacy_id = legacy_account(url, username);
-                if legacy_id == account(url, username) {
+                if legacy_id == account(kind, url, username) {
                     return Ok(None);
                 }
                 let legacy = keyring::Entry::new(SERVICE, &legacy_id)
@@ -78,8 +98,8 @@ mod imp {
         }
     }
 
-    pub(super) fn clear(url: &str, username: &str) -> Result<(), String> {
-        match entry(url, username)?.delete_credential() {
+    pub(super) fn clear(kind: SyncKind, url: &str, username: &str) -> Result<(), String> {
+        match entry(kind, url, username)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(format!("删除密码失败：{error}")),
         }
@@ -92,15 +112,24 @@ mod imp {
 
     const UNAVAILABLE: &str = "当前系统没有可用的凭据管理器，同步密码只能在本次会话内使用";
 
-    pub(super) fn save(_url: &str, _username: &str, _password: &str) -> Result<(), String> {
+    pub(super) fn save(
+        _kind: SyncKind,
+        _url: &str,
+        _username: &str,
+        _password: &str,
+    ) -> Result<(), String> {
         Err(UNAVAILABLE.to_string())
     }
 
-    pub(super) fn load(_url: &str, _username: &str) -> Result<Option<String>, String> {
+    pub(super) fn load(
+        _kind: SyncKind,
+        _url: &str,
+        _username: &str,
+    ) -> Result<Option<String>, String> {
         Err(UNAVAILABLE.to_string())
     }
 
-    pub(super) fn clear(_url: &str, _username: &str) -> Result<(), String> {
+    pub(super) fn clear(_kind: SyncKind, _url: &str, _username: &str) -> Result<(), String> {
         Ok(())
     }
 }
@@ -111,25 +140,38 @@ mod tests {
 
     #[test]
     fn account_is_stable_and_sensitive_to_both_inputs() {
-        let a = account("https://dav.example.com/", "alice");
-        assert_eq!(a, account(" https://dav.example.com/ ", " alice "));
+        let a = account(SyncKind::Webdav, "https://dav.example.com/", "alice");
         assert_eq!(
-            account("https://dav.example.com/dav", "alice"),
-            account("https://dav.example.com/dav/", "alice"),
+            a,
+            account(SyncKind::Webdav, " https://dav.example.com/ ", " alice ")
+        );
+        assert_eq!(
+            account(SyncKind::Webdav, "https://dav.example.com/dav", "alice"),
+            account(SyncKind::Webdav, "https://dav.example.com/dav/", "alice"),
             "末尾斜杠不应改变凭据身份"
         );
         assert_eq!(
-            account("https://DAV.example.com/dav", "alice"),
-            account("https://dav.example.com/dav", "alice"),
+            account(SyncKind::Webdav, "https://DAV.example.com/dav", "alice"),
+            account(SyncKind::Webdav, "https://dav.example.com/dav", "alice"),
             "域名大小写不改变凭据身份"
         );
         assert_eq!(
-            account("https://dav.example.com/dav?token=1", "alice"),
-            account("https://dav.example.com/dav", "alice"),
+            account(
+                SyncKind::Webdav,
+                "https://dav.example.com/dav?token=1",
+                "alice"
+            ),
+            account(SyncKind::Webdav, "https://dav.example.com/dav", "alice"),
             "query 不改变凭据身份"
         );
-        assert_ne!(a, account("https://dav.example.com/", "bob"));
-        assert_ne!(a, account("https://other.example.com/", "alice"));
+        assert_ne!(
+            a,
+            account(SyncKind::Webdav, "https://dav.example.com/", "bob")
+        );
+        assert_ne!(
+            a,
+            account(SyncKind::Webdav, "https://other.example.com/", "alice")
+        );
         assert_eq!(a.len(), 43, "SHA-256 的 Base64url 长度");
     }
 
@@ -142,7 +184,7 @@ mod tests {
         // 大写域名在旧算法里会得到不同的账号，升级时确实需要回退查找。
         assert_ne!(
             legacy_account("https://DAV.example.com/dav", "alice"),
-            account("https://DAV.example.com/dav", "alice")
+            account(SyncKind::Webdav, "https://DAV.example.com/dav", "alice")
         );
     }
 
@@ -153,11 +195,17 @@ mod tests {
     fn keyring_round_trip() {
         let url = "https://flashnote.invalid/";
         let user = "keyring-test";
-        save(url, user, "secret-1").unwrap();
-        assert_eq!(load(url, user).unwrap().as_deref(), Some("secret-1"));
-        save(url, user, "secret-2").unwrap();
-        assert_eq!(load(url, user).unwrap().as_deref(), Some("secret-2"));
-        clear(url, user).unwrap();
-        assert!(load(url, user).unwrap().is_none());
+        save(SyncKind::Webdav, url, user, "secret-1").unwrap();
+        assert_eq!(
+            load(SyncKind::Webdav, url, user).unwrap().as_deref(),
+            Some("secret-1")
+        );
+        save(SyncKind::Webdav, url, user, "secret-2").unwrap();
+        assert_eq!(
+            load(SyncKind::Webdav, url, user).unwrap().as_deref(),
+            Some("secret-2")
+        );
+        clear(SyncKind::Webdav, url, user).unwrap();
+        assert!(load(SyncKind::Webdav, url, user).unwrap().is_none());
     }
 }

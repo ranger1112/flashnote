@@ -24,6 +24,7 @@ Press the global hotkey and a small window floats above the current window; jot 
 - **Optional cloud sync**: sync your notes directory to your own WebDAV storage (Jianguoyun, Nextcloud, NAS, …); off by default, no network traffic until configured. Concurrent edits are merged entry by entry, with conflict copies when a merge is unsafe.
 - **Markdown mode**: optional block-based writing so code blocks, tables, and headings render correctly from the very first line.
 - **Note history**: the note button in the title bar opens a history panel with reverse-chronological browsing, full-text search (across all date files), and loading of older entries; you can toggle a rendered Markdown preview and edit or delete individual entries directly.
+- **Tags**: write `#work` in the body and it becomes a tag — one click filters the history panel. The format stays plain Markdown.
 - **System tray**: left-click to summon; right-click to open today's notes, the notes folder, settings, or quit.
 - **Single instance**: launching again only summons the existing window — no second tray icon or hotkey conflict.
 - **Auto-update**: silently checks GitHub Releases on startup; when a new version appears, a banner shows at the bottom of the window — click it to download, verify the signature, and install, effective after restart.
@@ -112,8 +113,19 @@ Rules:
 
 - Loads 100 entries at a time by default; "Load more" at the bottom pages further back.
 - Search scans every `YYYY-MM-DD.md` in the notes directory, case-insensitive, covering body text, time, and source title, returning at most 200 results.
+- Searching `#tag` matches tags exactly (searching `#work` will not pull in `#workshop`).
 - "Preview" renders the entry content as Markdown (sanitized with DOMPurify); click again to return to the raw text. The toggle state is remembered.
 - "Edit" rewrites the entry in place while preserving the source line and the original format (compact list / Markdown block); "Delete" removes the entry immediately, with a 5-second undo in the toast.
+- With cloud sync on, each date separator shows that day's file-level sync state: synced / pending / conflict copy. State is per date file; individual entries are not synced separately.
+
+### Tags
+
+Tags live inline in the note body, e.g. `#work`, `#meeting`, `#idea` — no extra field or setting:
+
+- the `#` must start a line or follow whitespace, and the tag must begin with a letter (CJK included), digit, `_`, `-`, or `/`;
+- the tag ends at punctuation, so `#work,` yields "work";
+- Markdown headings (`# Title`), URL anchors (`…/page#section`), code fences, and inline code are ignored;
+- the history panel renders tags as small chips; click one to filter by it, click again to clear.
 
 ### Markdown mode
 
@@ -179,6 +191,23 @@ Nextcloud, NAS WebDAV, [dufs](https://github.com/sigoden/dufs), and `rclone serv
 
 Protocol details (decision table, merge rules, state file) are in [docs/sync-protocol.md](docs/sync-protocol.md) (in Chinese); the WebDAV mode does not use its account or encryption sections.
 
+## Version history (Git)
+
+Cloud sync covers "multiple machines"; Git covers "look back in time". You can use either or both:
+
+1. Settings → "Commit to Git after saving"; the first time, click "Initialize repository" next to it (equivalent to running `git init` in the notes directory);
+2. From then on every save, edit, delete, and every sync round that pulls or merges new content produces one commit;
+3. Inspect history with `git log`, `git diff`, or any Git client. To back up to GitHub, configure `git remote` and push yourself.
+
+Notes:
+
+- Only `*.md` is committed; `.bak-*` and `.tmp-*` backups and temporary files stay out of history.
+- No empty commits: nothing changed means nothing committed. Commit messages look like `笔记 2026-10-31 15:20（1 个文件）`.
+- Machines without `user.name` / `user.email` commit as `FlashNote <flashnote@localhost>`; your global Git config is never modified.
+- FlashNote never clones, pushes, or touches remote credentials — pushing is entirely up to you.
+- A failed commit only logs; it never blocks saving. Notes land on disk before version history.
+- Without Git installed, the setting is disabled and explains why.
+
 ## Installation
 
 Download from [Releases](https://github.com/ranger1112/flashnote/releases/latest):
@@ -191,7 +220,7 @@ Download from [Releases](https://github.com/ranger1112/flashnote/releases/latest
 Each release ships with a `SHA256SUMS.txt` that you can use to verify the download:
 
 ```powershell
-Get-FileHash .\FlashNote_0.5.2_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\FlashNote_0.6.0_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the output with the corresponding line in `SHA256SUMS.txt`.
@@ -203,7 +232,7 @@ Uninstall: Windows "Settings → Apps", or run `uninstall.exe` in the install di
 An installer built from source is located at:
 
 ```
-src-tauri\target\release\bundle\nsis\FlashNote_0.5.2_x64-setup.exe
+src-tauri\target\release\bundle\nsis\FlashNote_0.6.0_x64-setup.exe
 ```
 
 ## Development
@@ -246,7 +275,7 @@ npm run tauri build
 Outputs:
 
 - Executable: `src-tauri\target\release\flashnote.exe`
-- NSIS installer: `src-tauri\target\release\bundle\nsis\FlashNote_0.5.2_x64-setup.exe`
+- NSIS installer: `src-tauri\target\release\bundle\nsis\FlashNote_0.6.0_x64-setup.exe`
 
 ### Testing
 

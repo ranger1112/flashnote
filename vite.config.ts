@@ -3,7 +3,8 @@ import { defineConfig } from "vite";
 export default defineConfig({
   clearScreen: false,
   server: {
-    port: 1420,
+    // 不用 Tauri 默认的 1420：同一台机器上并行开发另一个 Tauri 应用时两边会抢同一个端口。
+    port: 1421,
     strictPort: true,
     watch: {
       ignored: ["**/src-tauri/**"],
