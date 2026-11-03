@@ -368,7 +368,13 @@ export async function refreshSyncStatus(): Promise<void> {
 
 /** 模块加载时绑定同步相关控件与事件（由 main.ts 调用一次）。 */
 export function initSync(): void {
-  ui.syncKind.addEventListener("change", paintSyncKind);
+  ui.syncKind.addEventListener("change", () => {
+    // 两种方式下这一栏的含义不同（账号 vs 分支），切换时清空，避免 WebDAV
+    // 的用户名被当成 GitHub 的分支提交上去。
+    ui.syncUsername.value = "";
+    ui.syncUsername.placeholder = "";
+    paintSyncKind();
+  });
   ui.syncSave.addEventListener("click", () => void saveSyncConfig());
   ui.syncTest.addEventListener("click", () => void testConnection());
   ui.syncNow.addEventListener("click", () => void syncNow());

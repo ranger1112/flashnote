@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   exactTagTerm,
+  matchesSubstring,
   matchesTerm,
   nextOffset,
   withoutEntry,
@@ -240,7 +241,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
     }
     save.disabled = true;
     try {
-      await invoke("update_note_entry", {
+      const tags = await invoke<string[]>("update_note_entry", {
         path: note.path,
         date: note.date,
         time: note.time,
@@ -250,6 +251,8 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       markSyncPending();
       // 只更新内存里的这条并局部重渲，保留分页 offset 与滚动位置
       note.content = value;
+      // 标签由后端重新解析：正文改了标签就会变，不能用旧的
+      note.tags = tags;
       close();
       toast("已更新");
       renderNotes();
@@ -291,7 +294,7 @@ function renderNotes(): void {
   if (hasOpenEditor()) return;
 
   const term = serverFiltered ? "" : ui.historySearch.value.trim().toLowerCase();
-  const filtered = term ? notes.filter((note) => matchesTerm(note, term)) : notes;
+  const filtered = term ? notes.filter((note) => matchesLocally(note, term)) : notes;
 
   ui.entryList.replaceChildren();
 
@@ -437,6 +440,21 @@ function renderNotes(): void {
   // 先用上一轮结果铺一遍，再异步取最新状态，避免日期行闪烁空白
   paintFileStates();
   void refreshFileStates();
+}
+
+/**
+ * 本地过滤：`#标签` 精确匹配；列表里根本没有这个标签时退回子串匹配，
+ * 否则 `：#项目A` 这种「看着像标签、其实不是」的原文会搜不到。
+ */
+function matchesLocally(note: NoteEntry, term: string): boolean {
+  const tag = exactTagTerm(term);
+  if (tag === null) return matchesTerm(note, term);
+  const known = notes.some((item) =>
+    item.tags.some((value) => value.toLowerCase() === tag.toLowerCase()),
+  );
+  return known
+    ? note.tags.some((value) => value.toLowerCase() === tag.toLowerCase())
+    : matchesSubstring(note, term);
 }
 
 /** 点标签即筛选；再点一次（搜索框已经是这个标签）取消筛选。 */

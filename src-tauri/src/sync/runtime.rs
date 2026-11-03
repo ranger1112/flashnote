@@ -311,7 +311,7 @@ async fn drive<B: SyncBackend + 'static>(
     let summary = engine.run().await;
     // 下载、合并和冲突副本都会在本地产生新内容；补一次提交，Git 历史才不会断档。
     // 本地保存/删除已经由各自的命令提交过，这里重复调用只会命中「没有变化」。
-    if summary.downloaded + summary.merged + summary.conflicts > 0 {
+    if summary.downloaded + summary.merged + summary.deleted + summary.conflicts > 0 {
         crate::git_backup::schedule(app);
     }
     RoundOutcome::Done(summary, degraded)

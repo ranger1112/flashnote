@@ -13,7 +13,8 @@ const SERVICE: &str = "flashnote-sync";
 /// 大小写、末尾斜杠与 query 都不改变远端身份，统一走 [`super::remote_identity`]，
 /// 避免「补一个 /」或把域名改成小写就找不到密码。
 pub(crate) fn account(kind: SyncKind, url: &str, username: &str) -> String {
-    sha256_base64(super::remote_identity(kind, url, username).as_bytes())
+    // 用凭据身份而不是状态身份：GitHub 改分支不该让令牌失效。
+    sha256_base64(super::credential_identity(kind, url, username).as_bytes())
 }
 
 /// 0.5.0 的账号名算法：原始 URL 只去掉末尾斜杠。升级后先按新名字查，查不到

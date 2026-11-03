@@ -128,7 +128,7 @@ function defaultHandlers(): Handlers {
     clear_draft: () => null,
     hide_window: () => null,
     delete_note_entry: () => null,
-    update_note_entry: () => null,
+    update_note_entry: () => [],
     open_note_file: () => null,
     open_notes_dir: () => null,
     complete_onboarding: () => null,
@@ -718,6 +718,24 @@ describe("标签", () => {
     document.querySelector<HTMLButtonElement>(".entry-tag")?.click();
     await flush();
     expect(node<HTMLInputElement>("#history-search").value).toBe("");
+  });
+
+  it("编辑后标签跟着刷新，不用重开面板", async () => {
+    notes = [entry("09:00", "开会 #工作", ["工作"])];
+    await boot({ update_note_entry: () => ["会议"] });
+    await openHistory();
+
+    editButton().click();
+    await flush();
+    const editor = node<HTMLTextAreaElement>(".entry-edit");
+    editor.value = "开会 #会议";
+    node<HTMLButtonElement>(".entry-edit-actions .btn.primary").click();
+    await flush();
+
+    const chips = Array.from(document.querySelectorAll(".entry-tag")).map(
+      (chip) => chip.textContent,
+    );
+    expect(chips).toEqual(["#会议"]);
   });
 
   it("没有标签的笔记不渲染标签行", async () => {

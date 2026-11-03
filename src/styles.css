@@ -40,6 +40,12 @@
   box-sizing: border-box;
 }
 
+/* `hidden` 属性只是 UA 的 display:none，作者样式里任何 display 都会覆盖它。
+   页面上用 hidden 控制显隐的地方不少（Git 初始化按钮、明文 http 选项），统一兜底。 */
+[hidden] {
+  display: none !important;
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible {

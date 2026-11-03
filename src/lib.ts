@@ -101,6 +101,14 @@ export function matchesTerm(
   if (tag !== null) {
     return note.tags.some((value) => value.toLowerCase() === tag.toLowerCase());
   }
+  return matchesSubstring(note, term);
+}
+
+/** 纯子串匹配：标签查询找不到对应标签时退回这里，保证 `：#项目A` 这类字面量仍能搜到。 */
+export function matchesSubstring(
+  note: Pick<NoteEntry, "date" | "time" | "content" | "source">,
+  term: string,
+): boolean {
   return [note.date, note.time, note.content, note.source ?? ""].some((value) =>
     value.toLowerCase().includes(term),
   );

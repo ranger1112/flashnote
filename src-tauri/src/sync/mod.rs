@@ -34,15 +34,9 @@ use crate::notes;
 /// 与协议一致：单个笔记文件明文上限 2 MiB。
 pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// 远端身份：规范化后的 URL（scheme/host 小写、去 query/fragment、去尾斜杠）
-/// 加上用户名。凭据、状态目录与「地址是否变了」的判断都必须用同一份身份，
-/// 否则大小写或多余参数的差异会让密码「丢失」、状态目录重新开始。
-pub(crate) fn remote_identity(
-    kind: crate::settings::SyncKind,
-    url: &str,
-    username: &str,
-) -> String {
-    let canonical = match reqwest::Url::parse(url.trim()) {
+/// 规范化 URL：scheme/host 小写、去 query/fragment、去尾斜杠。
+fn canonical_url(url: &str) -> String {
+    match reqwest::Url::parse(url.trim()) {
         Ok(mut parsed) => {
             parsed.set_query(None);
             parsed.set_fragment(None);
@@ -53,9 +47,56 @@ pub(crate) fn remote_identity(
             text
         }
         Err(_) => url.trim().trim_end_matches('/').to_string(),
-    };
-    // 后端类型也算身份的一部分：同一个地址换成 GitHub 解析方式时，状态目录必须换新。
-    format!("{kind:?}\n{canonical}\n{}", username.trim())
+    }
+}
+
+/// 凭据身份：决定「密码 / 令牌存在哪个槽位」。
+///
+/// WebDAV 必须与 0.5.x 的输出**逐字节一致**——升级不能改变已有凭据的键，
+/// 否则所有存量用户都会被要求重新输入密码。GitHub 的令牌属于仓库而不是分支，
+/// 所以分支不参与，改分支不会让用户重输令牌。
+pub(crate) fn credential_identity(
+    kind: crate::settings::SyncKind,
+    url: &str,
+    username: &str,
+) -> String {
+    match kind {
+        crate::settings::SyncKind::Webdav => {
+            format!("{}\n{}", canonical_url(url), username.trim())
+        }
+        crate::settings::SyncKind::Github => match github::parse_repo(url) {
+            Some((owner, repo, _)) => format!("github\n{owner}/{repo}"),
+            None => format!("github\n{}", canonical_url(url)),
+        },
+    }
+}
+
+/// 同步状态身份：决定 `state.json` 放在哪个目录。
+///
+/// 比凭据身份多区分一层：GitHub 的不同分支是两份不同的笔记内容，
+/// 状态不能共用。地址里的 `/tree/<分支>` 与表单里的分支栏视为同一个分支。
+pub(crate) fn remote_identity(
+    kind: crate::settings::SyncKind,
+    url: &str,
+    username: &str,
+) -> String {
+    match kind {
+        // 同样保持 0.5.x 的输出，避免升级后状态目录重建、整库重合并。
+        crate::settings::SyncKind::Webdav => {
+            format!("{}\n{}", canonical_url(url), username.trim())
+        }
+        crate::settings::SyncKind::Github => {
+            let (owner, repo, url_branch) = github::parse_repo(url)
+                .unwrap_or_else(|| (canonical_url(url), String::new(), None));
+            let branch = url_branch
+                .or_else(|| {
+                    let value = username.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                })
+                .unwrap_or_default();
+            format!("github\n{owner}/{repo}\n{branch}")
+        }
+    }
 }
 /// 删除安全阀：超过这个数量、且占比超过阈值才中止。
 const DELETE_MIN_FILES: usize = 5;
@@ -1453,6 +1494,36 @@ mod tests {
         assert_ne!(
             base,
             remote_identity(SyncKind::Github, "https://dav.example.com/dav/", "alice")
+        );
+        // 升级兼容：WebDAV 的身份必须与 0.5.x 逐字节一致，否则存量用户的
+        // 凭据和状态目录都会「丢失」。
+        assert_eq!(base, "https://dav.example.com/dav\nalice");
+    }
+
+    #[test]
+    fn github_identity_separates_branches_but_credentials_do_not() {
+        use crate::settings::SyncKind;
+        let github = SyncKind::Github;
+        let repo = "https://github.com/alice/notes";
+
+        // 不同分支是两份内容：状态目录要分开
+        assert_ne!(
+            remote_identity(github, repo, "main"),
+            remote_identity(github, repo, "notes")
+        );
+        // 分支写在地址里还是表单里，应视为同一个分支
+        assert_eq!(
+            remote_identity(github, repo, "main"),
+            remote_identity(github, "https://github.com/alice/notes/tree/main", "")
+        );
+        // 但令牌属于仓库：改分支不该让用户重新输入令牌
+        assert_eq!(
+            credential_identity(github, repo, "main"),
+            credential_identity(github, repo, "notes")
+        );
+        assert_ne!(
+            credential_identity(github, repo, ""),
+            credential_identity(github, "https://github.com/alice/other", "")
         );
     }
 

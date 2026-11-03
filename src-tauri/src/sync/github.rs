@@ -41,6 +41,10 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}');
 
+/// 查询串里还要转义 `+`、`&`、`=`：它们都是合法的分支名字符，
+/// 不转义会被服务器当成空格或额外的参数。
+const QUERY_ENCODE: &AsciiSet = &PATH_ENCODE.add(b'+').add(b'&').add(b'=').add(b';');
+
 fn base64_engine() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
@@ -92,7 +96,9 @@ pub(crate) fn parse_repo(url: &str) -> Option<(String, String, Option<String>)> 
         return None;
     }
     let branch = match parts.next() {
-        Some("tree") | Some("blob") => {
+        // `/tree/<分支>` 是分支页面；`/blob/<分支>/<文件>` 是文件页面，
+        // 后面的路径不是分支名，宁可忽略也不能拼出一个不存在的分支。
+        Some("tree") => {
             let rest: Vec<&str> = parts.collect();
             (!rest.is_empty()).then(|| rest.join("/"))
         }
@@ -158,7 +164,10 @@ impl GitHubBackend {
         Self::build(config, api)
     }
 
-    /// 仓库与目录各探一次：前者验证令牌，后者确认同步目录是否存在。
+    /// 验证令牌、仓库，以及显式配置的分支是否存在。
+    ///
+    /// 分支必须先确认：如果分支被改名或删除，`contents` 的 404 会被当成
+    /// 「远端一个文件都没有」，进而把本地笔记全部当成已删除。
     async fn probe(&self) -> Result<(), SyncError> {
         let url = format!("{}/repos/{}/{}", self.api, self.owner, self.repo);
         self.spend()?;
@@ -172,6 +181,37 @@ impl GitHubBackend {
             return Err(SyncError::Auth(
                 "令牌无权访问该仓库，或仓库地址不正确".to_string(),
             ));
+        }
+        let response = self.check(response).await?;
+        let info: RepoInfo = response
+            .json()
+            .await
+            .map_err(|error| SyncError::Other(format!("解析仓库信息失败：{error}")))?;
+        // 空仓库还没有任何分支，第一次写入会创建它，不能因此报错。
+        if info.size == 0 {
+            return Ok(());
+        }
+
+        let Some(branch) = &self.branch else {
+            return Ok(());
+        };
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api,
+            self.owner,
+            self.repo,
+            utf8_percent_encode(branch, PATH_ENCODE)
+        );
+        self.spend()?;
+        let response = self
+            .request(Method::GET, &url)
+            .send()
+            .await
+            .map_err(network)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SyncError::Auth(format!(
+                "远端没有分支 {branch}，请检查“分支”这一栏"
+            )));
         }
         self.check(response).await?;
         Ok(())
@@ -231,7 +271,7 @@ impl GitHubBackend {
     /// 所以按路径段转义规则处理。
     fn with_ref(&self, url: &str) -> String {
         match &self.branch {
-            Some(branch) => format!("{url}?ref={}", utf8_percent_encode(branch, PATH_ENCODE)),
+            Some(branch) => format!("{url}?ref={}", utf8_percent_encode(branch, QUERY_ENCODE)),
             None => url.to_string(),
         }
     }
@@ -321,6 +361,12 @@ fn version_token(version: &RemoteVersion) -> Result<String, SyncError> {
 }
 
 #[derive(Deserialize)]
+struct RepoInfo {
+    /// 仓库大小（KB）。0 表示还没有任何提交。
+    size: u64,
+}
+
+#[derive(Deserialize)]
 struct ContentItem {
     name: String,
     sha: String,
@@ -364,8 +410,16 @@ impl SyncBackend for GitHubBackend {
             .send()
             .await
             .map_err(network)?;
-        // 目录还没建出来：不是错误，等同于「远端一个文件都没有」。
         if response.status() == StatusCode::NOT_FOUND {
+            let body = response.text().await.unwrap_or_default();
+            // 分支不存在时 GitHub 也返回 404。把它当成「远端为空」会让引擎
+            // 计划删除全部本地笔记，必须区分开。
+            if body.contains("No commit found for the ref") || body.contains("Branch not found") {
+                return Err(SyncError::Other(
+                    "远端分支不存在或已被删除，请检查同步设置".to_string(),
+                ));
+            }
+            // 目录还没建出来：不是错误，等同于「远端一个文件都没有」。
             return Ok(Vec::new());
         }
         let response = self.check(response).await?;
@@ -373,6 +427,13 @@ impl SyncBackend for GitHubBackend {
             .json()
             .await
             .map_err(|error| SyncError::Other(format!("解析目录列表失败：{error}")))?;
+        // Contents API 单次最多返回 1000 项。达到上限说明列表可能被截断，
+        // 而「没列出来」会被当成「远端已删除」，必须整轮中止。
+        if items.len() >= 1000 {
+            return Err(SyncError::Other(
+                "远端目录条目达到 GitHub 的 1000 项上限，无法安全比较，本轮已中止".to_string(),
+            ));
+        }
         Ok(items
             .into_iter()
             .filter(|item| item.kind == "file" && super::is_sync_name(&item.name))
@@ -476,10 +537,14 @@ impl SyncBackend for GitHubBackend {
         let Expect::Version { version, .. } = &expect else {
             return Err(SyncError::Other("GitHub 删除需要版本信息".to_string()));
         };
-        let body = json!({
+        let mut body = json!({
             "message": format!("flashnote: 删除 {name}"),
             "sha": version_token(version)?,
         });
+        // 不带 branch 时 GitHub 会去默认分支找这个 sha，非默认分支上必然对不上。
+        if let Some(branch) = &self.branch {
+            body["branch"] = json!(branch);
+        }
         self.spend()?;
         let response = self
             .request(Method::DELETE, &self.file_url(name))
@@ -497,9 +562,14 @@ impl GitHubBackend {
     async fn fetch_raw(&self, name: &str) -> Result<Vec<u8>, SyncError> {
         self.spend()?;
         let url = self.with_ref(&self.file_url(name));
+        let mut accept = reqwest::header::HeaderMap::new();
+        accept.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/vnd.github.raw"),
+        );
         let response = self
             .request(Method::GET, &url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github.raw")
+            .headers(accept)
             .send()
             .await
             .map_err(network)?;
@@ -712,6 +782,8 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["sha"], "sha1");
+        // 不带 branch 时 GitHub 会去默认分支找这个 sha，非默认分支上必然 409
+        assert_eq!(body["branch"], "main");
     }
 
     #[tokio::test]

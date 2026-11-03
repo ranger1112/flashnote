@@ -557,21 +557,30 @@ pub fn extract_tags(content: &str) -> Vec<String> {
             }
 
             let mut cursor = index + 1;
-            let mut tag = String::new();
+            // 首字符必须是字母/数字/下划线；`#-1`、`#/path` 之类不是标签。
             let first_ok = chars
                 .get(cursor)
                 .is_some_and(|next| next.is_alphanumeric() || *next == '_');
-            while first_ok && cursor < chars.len() && tag.chars().count() < MAX_TAG_LEN {
-                let next = chars[cursor];
-                if !is_tag_char(next) {
-                    break;
+            let mut tag = String::new();
+            // 超长的连续词多半是正文而不是标签：整段跳过，而不是截断成一个假标签。
+            let mut too_long = false;
+            if first_ok {
+                while cursor < chars.len() {
+                    let next = chars[cursor];
+                    if !is_tag_char(next) {
+                        break;
+                    }
+                    if tag.chars().count() < MAX_TAG_LEN {
+                        tag.push(next);
+                    } else {
+                        too_long = true;
+                    }
+                    cursor += 1;
                 }
-                tag.push(next);
-                cursor += 1;
             }
 
-            if tag.is_empty() {
-                index += 1;
+            if tag.is_empty() || too_long {
+                index = if cursor > index { cursor } else { index + 1 };
                 continue;
             }
             if !tags.iter().any(|seen| seen.eq_ignore_ascii_case(&tag)) {
@@ -742,7 +751,10 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
     // `#标签` 是精确查询：子串匹配会把 `#工作台` 也算进 `#工作`。
     let tag_query = exact_tag_term(needle);
 
-    let mut result = Vec::new();
+    // 标签命中优先，但没有命中时退回子串匹配：
+    // `：#项目A`（前面不是空白）不算标签，用户搜它时仍应能找到原文。
+    let mut tag_hits = Vec::new();
+    let mut text_hits = Vec::new();
     for path in note_files(dir)? {
         let date = path
             .file_stem()
@@ -754,20 +766,35 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
         };
         parsed.reverse();
         for (time, content, source) in parsed {
-            let hit = match tag_query {
-                Some(tag) => extract_tags(&content)
+            let tag_hit = tag_query.is_some_and(|tag| {
+                extract_tags(&content)
                     .iter()
-                    .any(|value| value.eq_ignore_ascii_case(tag)),
-                None => matches_query(&date, &time, &content, source.as_deref(), needle, &folded),
-            };
-            if hit {
-                result.push(entry_for(&path, &date, time, content, source));
-                if result.len() >= limit {
-                    return Ok(result);
-                }
+                    .any(|value| value.eq_ignore_ascii_case(tag))
+            });
+            if tag_hit {
+                tag_hits.push(entry_for(
+                    &path,
+                    &date,
+                    time.clone(),
+                    content.clone(),
+                    source.clone(),
+                ));
+            } else if (tag_query.is_none() || text_hits.len() < limit)
+                && matches_query(&date, &time, &content, source.as_deref(), needle, &folded)
+            {
+                text_hits.push(entry_for(&path, &date, time, content, source));
+            }
+            if tag_hits.len() >= limit && text_hits.len() >= limit {
+                break;
             }
         }
     }
+    let mut result = if tag_hits.is_empty() {
+        text_hits
+    } else {
+        tag_hits
+    };
+    result.truncate(limit);
     Ok(result)
 }
 
@@ -1338,6 +1365,12 @@ mod tests {
     }
 
     #[test]
+    fn over_long_tokens_are_prose_not_tags() {
+        let long = format!("#{}", "很长的连续词".repeat(8));
+        assert!(extract_tags(&long).is_empty(), "超长连续词不该被截断成标签");
+    }
+
+    #[test]
     fn tags_are_case_insensitively_deduplicated() {
         assert_eq!(extract_tags("#Work #work #WORK"), vec!["Work".to_string()]);
     }
@@ -1358,6 +1391,28 @@ mod tests {
             entries[0].tags,
             vec!["想法".to_string(), "idea".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tag_search_falls_back_to_substring_when_no_tag_matches() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-tag-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 冒号后紧跟 `#`：不是标签（`#` 必须在行首或空白之后）
+        fs::write(
+            dir.join("2026-10-21.md"),
+            "# 2026-10-21
+
+- 10:00 今天完成了：#项目A
+",
+        )
+        .unwrap();
+
+        let hits = search_entries(&dir, "#项目A", 10).unwrap();
+        assert_eq!(hits.len(), 1, "没有同名标签时应退回子串匹配");
 
         let _ = fs::remove_dir_all(&dir);
     }

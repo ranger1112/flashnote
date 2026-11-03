@@ -138,6 +138,8 @@ export function initSettingsPanel(): void {
       if (typeof selected === "string") {
         await invoke("update_notes_dir", { path: selected });
         await refreshSettings();
+        // 换目录后 Git 状态跟着变（新目录可能不是仓库）
+        await paintGitStatus();
         toast("笔记目录已更新");
       }
     } catch (error) {

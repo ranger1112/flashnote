@@ -499,7 +499,7 @@ pub async fn update_note_entry(
     time: String,
     content: String,
     new_content: String,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if new_content.trim().is_empty() {
         return Err("内容不能为空".to_string());
     }
@@ -512,7 +512,8 @@ pub async fn update_note_entry(
             state.sync.schedule();
             git_backup::schedule(&app);
         }
-        result
+        // 顺带把新正文里的标签算出来：前端改完立刻要刷新标签，不能等下次全量加载。
+        result.map(|_| notes::extract_tags(&new_content))
     })
     .await
 }
@@ -773,8 +774,9 @@ pub async fn get_sync_file_states(
 /// 两个同步配置是否指向同一远端账号；只差 URL 末尾斜杠视为相同。
 fn same_sync_identity(left: &settings::SyncSettings, right: &settings::SyncSettings) -> bool {
     // 与凭据、状态目录共用同一份身份：大小写/尾斜杠/query 的差异不算换远端。
-    sync::remote_identity(left.kind, &left.url, &left.username)
-        == sync::remote_identity(right.kind, &right.url, &right.username)
+    // 用凭据身份：GitHub 只改分支时令牌仍然有效，不该被清掉。
+    sync::credential_identity(left.kind, &left.url, &left.username)
+        == sync::credential_identity(right.kind, &right.url, &right.username)
 }
 
 #[tauri::command]
