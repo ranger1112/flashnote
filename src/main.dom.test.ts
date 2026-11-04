@@ -485,6 +485,39 @@ describe("Git 自动提交", () => {
     expect(node<HTMLElement>("#git-status").textContent).toContain("没有找到 git");
     expect(node<HTMLButtonElement>("#git-init").hidden).toBe(true);
   });
+
+  it("自动提交失败时设置页显示最近错误", async () => {
+    await boot({
+      get_git_status: () => ({
+        available: true,
+        repo: true,
+        lastSuccess: "2026-11-04 10:00",
+        lastError: "git commit 失败：index.lock 已存在",
+      }),
+    });
+    await openGitSettings();
+
+    const status = node<HTMLElement>("#git-status");
+    expect(status.textContent).toContain("自动提交失败");
+    expect(status.textContent).toContain("index.lock");
+    expect(status.classList.contains("warn")).toBe(true);
+  });
+
+  it("自动提交成功后设置页显示上次提交时间", async () => {
+    await boot({
+      get_git_status: () => ({
+        available: true,
+        repo: true,
+        lastSuccess: "2026-11-04 10:05",
+      }),
+    });
+    await openGitSettings();
+
+    const status = node<HTMLElement>("#git-status");
+    expect(status.textContent).toContain("上次自动提交");
+    expect(status.textContent).toContain("10:05");
+    expect(status.classList.contains("warn")).toBe(false);
+  });
 });
 
 describe("历史面板错误态", () => {

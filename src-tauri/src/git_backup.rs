@@ -28,6 +28,14 @@ static GIT_LOCK: Mutex<()> = Mutex::new(());
 /// 私有索引的临时文件名后缀，避免同一进程内多次调用互相覆盖。
 static INDEX_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// 最近一次自动提交的结果。内存保存即可：设置页需要的是本次运行的情况。
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GitCommitState {
+    pub last_success: Option<String>,
+    pub last_error: Option<String>,
+}
+
 /// 设置面板里展示的 Git 状态。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,12 +44,16 @@ pub(crate) struct GitStatus {
     pub available: bool,
     /// 笔记目录本身是一个仓库（存在 `.git`）。
     pub repo: bool,
+    pub last_success: Option<String>,
+    pub last_error: Option<String>,
 }
 
-pub(crate) fn status(dir: &Path) -> GitStatus {
+pub(crate) fn status(dir: &Path, last: &GitCommitState) -> GitStatus {
     GitStatus {
         available: available(),
         repo: is_repo(dir),
+        last_success: last.last_success.clone(),
+        last_error: last.last_error.clone(),
     }
 }
 
@@ -327,12 +339,34 @@ pub(crate) fn schedule(app: &AppHandle) {
     let Some(dir) = enabled_notes_dir(app) else {
         return;
     };
+    let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = commit(&dir) {
-            // 版本历史失败不该打扰正在记笔记的人，只留日志
+        let result = commit(&dir);
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let state = app.state::<AppState>();
+        let mut last = state
+            .git
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        record_commit(&mut last, &result, &now);
+        if let Err(error) = &result {
+            // 版本历史失败不该打扰正在记笔记的人，只留日志；设置页会读取状态。
             log::warn!("自动提交失败：{error}");
         }
     });
+}
+
+fn record_commit(last: &mut GitCommitState, result: &Result<bool, String>, now: &str) {
+    match result {
+        Ok(changed) => {
+            // 这次 git 操作成功了，之前偶发的错误不再展示。
+            last.last_error = None;
+            if *changed {
+                last.last_success = Some(now.to_string());
+            }
+        }
+        Err(error) => last.last_error = Some(error.clone()),
+    }
 }
 
 fn enabled_notes_dir(app: &AppHandle) -> Option<PathBuf> {
@@ -537,6 +571,26 @@ mod tests {
         let error = commit(&dir).unwrap_err();
         assert!(error.contains("filter"), "{error}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_result_is_recorded_and_cleared() {
+        let mut last = GitCommitState::default();
+        record_commit(&mut last, &Err("index.lock 已存在".to_string()), "10:00");
+        assert_eq!(last.last_error.as_deref(), Some("index.lock 已存在"));
+        assert!(last.last_success.is_none());
+
+        record_commit(&mut last, &Ok(true), "10:05");
+        assert!(last.last_error.is_none());
+        assert_eq!(last.last_success.as_deref(), Some("10:05"));
+
+        record_commit(&mut last, &Ok(false), "10:10");
+        assert!(last.last_error.is_none());
+        assert_eq!(
+            last.last_success.as_deref(),
+            Some("10:05"),
+            "没有产生提交时不要刷新成功时间"
+        );
     }
 
     #[test]

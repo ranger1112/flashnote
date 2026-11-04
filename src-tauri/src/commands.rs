@@ -295,10 +295,19 @@ pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String
     Ok(())
 }
 
-/// 笔记目录当前能否用 Git：有没有装 git、是不是仓库。
+/// 笔记目录当前能否用 Git：有没有装 git、是不是仓库、最近一次自动提交结果。
 #[tauri::command]
 pub async fn get_git_status(app: AppHandle) -> Result<git_backup::GitStatus, String> {
-    run_blocking(move || Ok(git_backup::status(&notes_dir(&app)))).await
+    run_blocking(move || {
+        let last = app
+            .state::<AppState>()
+            .git
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Ok(git_backup::status(&notes_dir(&app), &last))
+    })
+    .await
 }
 
 /// 给笔记目录建一个本地仓库；已经是仓库时幂等返回。
@@ -307,7 +316,13 @@ pub async fn init_notes_git(app: AppHandle) -> Result<git_backup::GitStatus, Str
     run_blocking(move || {
         let dir = notes_dir(&app);
         git_backup::init(&dir)?;
-        Ok(git_backup::status(&dir))
+        let last = app
+            .state::<AppState>()
+            .git
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Ok(git_backup::status(&dir, &last))
     })
     .await
 }

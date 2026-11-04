@@ -19,6 +19,8 @@ let recording = false;
 interface GitStatus {
   available: boolean;
   repo: boolean;
+  lastSuccess?: string | null;
+  lastError?: string | null;
 }
 
 /**
@@ -32,12 +34,21 @@ async function paintGitStatus(): Promise<void> {
     ui.gitBackupCheck.disabled = !status.available && !settings.gitBackup;
     ui.gitInit.hidden = !status.available || status.repo;
     ui.gitStatus.classList.toggle("warn", !status.available);
+    ui.gitStatus.title = "";
     if (!status.available) {
       ui.gitStatus.textContent = "没有找到 git 命令，请先安装 Git";
       return;
     }
     if (status.repo) {
-      ui.gitStatus.textContent = "笔记目录已是 Git 仓库";
+      if (status.lastError) {
+        ui.gitStatus.classList.add("warn");
+        ui.gitStatus.title = status.lastError;
+        ui.gitStatus.textContent = `最近一次自动提交失败：${status.lastError}`;
+      } else {
+        ui.gitStatus.textContent = status.lastSuccess
+          ? `上次自动提交：${status.lastSuccess}`
+          : "笔记目录已是 Git 仓库";
+      }
       return;
     }
     ui.gitStatus.textContent = settings.gitBackup
