@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
   enable: vi.fn(async () => {}),
   disable: vi.fn(async () => {}),
   openDialog: vi.fn(async () => null),
-  check: vi.fn(async () => null),
+  check: vi.fn<() => Promise<unknown>>(async () => null),
   relaunch: vi.fn(async () => {}),
   isVisible: vi.fn(async () => false),
   onFocusChanged: vi.fn(async () => () => {}),
@@ -364,6 +364,87 @@ describe("设置", () => {
     await flush();
 
     expect(banner.inert).toBe(true);
+  });
+});
+
+describe("更新", () => {
+  beforeEach(() => {
+    mocks.check.mockReset();
+    mocks.check.mockResolvedValue(null);
+    mocks.relaunch.mockReset();
+  });
+
+  it("检查到新版本后可在设置面板内直接更新并重启", async () => {
+    await boot({ flush_sync_state: () => null });
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    const inline = node<HTMLButtonElement>("#update-now");
+    expect(inline.hidden).toBe(true);
+
+    const downloadAndInstall = vi.fn(async (onEvent: (event: unknown) => void) => {
+      onEvent({ event: "Started", data: { contentLength: 100 } });
+      onEvent({ event: "Progress", data: { chunkLength: 100 } });
+    });
+    mocks.check.mockResolvedValueOnce({ version: "0.6.0", downloadAndInstall });
+
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+
+    expect(inline.hidden).toBe(false);
+    expect(inline.textContent).toBe("立即更新");
+    expect(node<HTMLElement>("#update-status").textContent).toBe("发现新版本 0.6.0");
+
+    inline.click();
+    await flush();
+
+    expect(downloadAndInstall).toHaveBeenCalledTimes(1);
+    expect(node<HTMLElement>("#update-status").textContent).toContain("已安装 0.6.0");
+    expect(inline.textContent).toBe("重启");
+
+    inline.click();
+    await flush();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("flush_sync_state");
+    expect(mocks.relaunch).toHaveBeenCalledTimes(1);
+  });
+
+  it("已是最新版本时不显示「立即更新」", async () => {
+    await boot();
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+
+    expect(node<HTMLButtonElement>("#update-now").hidden).toBe(true);
+    expect(node<HTMLElement>("#update-status").textContent).toBe("已是最新版本");
+  });
+
+  it("安装失败时按钮变成「重试」，再点一次重新下载", async () => {
+    await boot();
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    const downloadAndInstall = vi.fn(async () => {
+      throw new Error("网络中断");
+    });
+    mocks.check.mockResolvedValueOnce({ version: "0.6.0", downloadAndInstall });
+
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+
+    const inline = node<HTMLButtonElement>("#update-now");
+    inline.click();
+    await flush();
+
+    expect(inline.textContent).toBe("重试");
+    expect(node<HTMLElement>("#update-status").textContent).toBe("更新失败");
+
+    inline.click();
+    await flush();
+
+    expect(downloadAndInstall).toHaveBeenCalledTimes(2);
   });
 });
 

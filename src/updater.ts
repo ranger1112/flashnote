@@ -16,6 +16,16 @@ export function hideUpdateBanner(): void {
   ui.updateBanner.classList.add("hidden");
 }
 
+/**
+ * 设置面板里的更新入口。面板打开时底部的更新横幅会被遮住，
+ * 手动检查发现新版本后必须有一个能点的按钮。
+ */
+function setInlineUpdateAction(label: string | null, disabled = false): void {
+  ui.updateNowButton.hidden = label === null;
+  ui.updateNowButton.disabled = disabled;
+  if (label !== null) ui.updateNowButton.textContent = label;
+}
+
 let pendingUpdate: Update | null = null;
 let updateReady = false;
 let updating = false;
@@ -51,6 +61,7 @@ async function checkForUpdate(manual: boolean): Promise<void> {
     if (manual) {
       ui.updateStatus.textContent = "更新已安装，重启后生效";
       showUpdateBanner("更新已安装，重启后生效", "重启");
+      setInlineUpdateAction("重启");
     }
     return;
   }
@@ -62,6 +73,8 @@ async function checkForUpdate(manual: boolean): Promise<void> {
   try {
     const update = await check();
     if (!update) {
+      pendingUpdate = null;
+      setInlineUpdateAction(null);
       if (manual) {
         ui.updateStatus.textContent = "已是最新版本";
         toast("已是最新版本");
@@ -72,6 +85,7 @@ async function checkForUpdate(manual: boolean): Promise<void> {
     pendingUpdate = update;
     ui.updateStatus.textContent = `发现新版本 ${update.version}`;
     showUpdateBanner(`发现新版本 ${update.version}`, "更新");
+    setInlineUpdateAction("立即更新");
   } catch (error) {
     // 启动时的静默检查失败不打扰用户；手动检查才提示
     if (manual) {
@@ -88,7 +102,10 @@ async function installUpdate(): Promise<void> {
   if (!update || updating) return;
 
   updating = true;
+  ui.checkUpdateButton.disabled = true;
   ui.updateBannerAction.disabled = true;
+  setInlineUpdateAction("正在更新…", true);
+  ui.updateStatus.textContent = "正在下载更新…";
   showUpdateBanner("正在下载更新…", null);
 
   try {
@@ -101,24 +118,40 @@ async function installUpdate(): Promise<void> {
         received += event.data.chunkLength;
         const percent =
           total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
-        showUpdateBanner(
-          percent === null ? "正在下载更新…" : `正在下载更新… ${percent}%`,
-          null,
-        );
+        const message =
+          percent === null ? "正在下载更新…" : `正在下载更新… ${percent}%`;
+        ui.updateStatus.textContent = message;
+        showUpdateBanner(message, null);
       }
     });
 
     updateReady = true;
     ui.updateStatus.textContent = `已安装 ${update.version}，重启后生效`;
     showUpdateBanner(`新版本 ${update.version} 已安装，重启后生效`, "重启");
+    setInlineUpdateAction("重启");
   } catch (error) {
     showUpdateBanner("更新失败，请稍后重试", "重试");
     ui.updateStatus.textContent = "更新失败";
+    setInlineUpdateAction("重试");
     toast(String(error), true);
   } finally {
     updating = false;
+    ui.checkUpdateButton.disabled = false;
     ui.updateBannerAction.disabled = false;
   }
+}
+
+/** 重启前把设置与同步状态落盘，避免更新后重复合并或重复上传。 */
+function restartToApplyUpdate(): void {
+  // 落盘失败也要重启，但必须告诉用户这次「尽力了」。
+  void invoke("flush_sync_state")
+    .catch(async (error) => {
+      console.error("保存同步状态失败", error);
+      toast("同步状态未能落盘，仍将重启", true);
+      // 留一点时间让提示画出来，否则立刻重启等于没提示。
+      await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    })
+    .finally(() => void relaunch());
 }
 
 /** 模块加载时绑定更新相关按钮。 */
@@ -127,21 +160,15 @@ export function initUpdater(): void {
     void checkForUpdate(true);
   });
 
+  ui.updateNowButton.addEventListener("click", () => {
+    if (updating) return;
+    if (updateReady) restartToApplyUpdate();
+    else void installUpdate();
+  });
+
   ui.updateBannerAction.addEventListener("click", () => {
-    if (updateReady) {
-      // 重启前把设置与同步状态落盘，避免更新后重复合并或重复上传。
-      // 落盘失败也要重启，但必须告诉用户这次「尽力了」。
-      void invoke("flush_sync_state")
-        .catch(async (error) => {
-          console.error("保存同步状态失败", error);
-          toast("同步状态未能落盘，仍将重启", true);
-          // 留一点时间让提示画出来，否则立刻重启等于没提示。
-          await new Promise((resolve) => window.setTimeout(resolve, 1500));
-        })
-        .finally(() => void relaunch());
-    } else {
-      void installUpdate();
-    }
+    if (updateReady) restartToApplyUpdate();
+    else void installUpdate();
   });
 
   ui.updateBannerDismiss.addEventListener("click", hideUpdateBanner);
