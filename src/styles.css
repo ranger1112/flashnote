@@ -1176,3 +1176,102 @@ input[type="range"] {
   min-width: 0;
   line-height: 1.4;
 }
+
+/* 应用锁：启动查询完成前先藏住正文，避免内容闪现 */
+#card.booting > header,
+#card.booting > main,
+#card.booting > footer,
+#card.booting > #resize-grip,
+#card.locked > header,
+#card.locked > main,
+#card.locked > footer,
+#card.locked > #resize-grip {
+  visibility: hidden;
+}
+
+#card.locked {
+  background: transparent;
+}
+
+.app-lock {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px 22px;
+  background: var(--bg-solid);
+  backdrop-filter: blur(18px);
+}
+
+.app-lock.hidden {
+  display: none;
+}
+
+.app-lock-body {
+  width: 100%;
+  max-width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-align: center;
+}
+
+.app-lock-icon {
+  color: var(--accent-text);
+}
+
+.app-lock-icon svg {
+  width: 30px;
+  height: 30px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-lock h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.app-lock .hint {
+  display: block;
+  white-space: normal;
+  font-size: 12px;
+}
+
+.app-lock .text-input {
+  width: 100%;
+  text-align: center;
+}
+
+.app-lock .btn {
+  width: 100%;
+}
+
+.app-lock .tip {
+  margin: 4px 0 0;
+  line-height: 1.5;
+}
+
+.lock-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lock-form.hidden {
+  display: none;
+}
+
+.lock-section .tip {
+  margin: 0;
+}
+
+.lock-section .section-title {
+  display: block;
+  margin-bottom: 4px;
+}

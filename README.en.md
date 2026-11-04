@@ -21,6 +21,7 @@ Press the global hotkey and a small window floats above the current window; jot 
 - **Automatic source capture**: grabs the foreground window title when summoned and writes it into the entry when saving (Windows; can be disabled in settings).
 - **Drafts never lost**: unsaved content is preserved when you dismiss with `Esc` and survives an app restart; drafts live in the app's config directory, so clearing browser data won't lose them.
 - **Local-first**: Markdown split into files by day, readable directly with Obsidian, VS Code, and similar tools.
+- **App lock**: optional password lock with a fixed unlock validity of 30 minutes, 2, 4, 8, or 24 hours; lock instantly from the title bar or tray. It gates the UI and app commands only — notes on disk stay plaintext.
 - **Optional cloud sync**: sync your notes directory to your own WebDAV storage (Jianguoyun, Nextcloud, NAS, …); off by default, no network traffic until configured. Concurrent edits are merged entry by entry, with conflict copies when a merge is unsafe.
 - **Markdown mode**: optional block-based writing so code blocks, tables, and headings render correctly from the very first line.
 - **Note history**: the note button in the title bar opens a history panel with reverse-chronological browsing, full-text search (across all date files), and loading of older entries; you can toggle a rendered Markdown preview and edit or delete individual entries directly.

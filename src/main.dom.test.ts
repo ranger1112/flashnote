@@ -71,7 +71,33 @@ const baseSettings = {
     allowInsecureHttp: false,
     deviceName: "",
   },
+  lock: {
+    unlockMinutes: 30,
+  },
 };
+
+interface TestLockStatus {
+  configured: boolean;
+  locked: boolean;
+  remainingSeconds: number | null;
+  retryAfterSeconds: number | null;
+  unlockMinutes: number;
+  theme: string;
+  warning: string | null;
+}
+
+function lockStatus(overrides: Partial<TestLockStatus> = {}): TestLockStatus {
+  return {
+    configured: false,
+    locked: false,
+    remainingSeconds: null,
+    retryAfterSeconds: null,
+    unlockMinutes: 30,
+    theme: "dark",
+    warning: null,
+    ...overrides,
+  };
+}
 
 interface TestSyncStatus {
   configured: boolean;
@@ -142,6 +168,13 @@ function defaultHandlers(): Handlers {
     clear_sync_password: () => null,
     test_sync_connection: () => ({ files: 0, degraded: null, message: "连接成功" }),
     sync_now: () => null,
+    get_lock_status: () => lockStatus(),
+    unlock: () => lockStatus({ configured: true, remainingSeconds: 1800 }),
+    lock_now: () => lockStatus({ configured: true, locked: true }),
+    set_app_lock_password: () => lockStatus({ configured: true }),
+    disable_app_lock: () => lockStatus(),
+    update_lock_validity: (args) =>
+      lockStatus({ unlockMinutes: Number(args?.minutes ?? 30) }),
   };
 }
 
@@ -540,6 +573,205 @@ describe("历史面板错误态", () => {
 
     expect(document.querySelector(".history-error")).toBeNull();
     expect(entries()).toHaveLength(2);
+  });
+});
+
+describe("应用锁", () => {
+  function handler(name: string): (event: { payload?: unknown }) => void {
+    const call = mocks.listen.mock.calls.find(([eventName]) => eventName === name);
+    if (!call) throw new Error(`没有监听 ${name}`);
+    return call[1] as unknown as (event: { payload?: unknown }) => void;
+  }
+
+  it("未启用时不显示锁屏与标题栏锁按钮", async () => {
+    await boot();
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(true);
+    expect(node<HTMLButtonElement>("#lock-btn").hidden).toBe(true);
+  });
+
+  it("锁定启动只显示锁屏，不加载设置、草稿和笔记", async () => {
+    await boot({
+      get_lock_status: () => lockStatus({ configured: true, locked: true }),
+    });
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+    expect(node<HTMLElement>("#card").classList.contains("locked")).toBe(true);
+    expect(mocks.invoke).not.toHaveBeenCalledWith("get_settings");
+    expect(mocks.invoke).not.toHaveBeenCalledWith("load_draft");
+    expect(mocks.invoke).not.toHaveBeenCalledWith("list_notes");
+    expect(node<HTMLElement>("#undo-bar").inert).toBe(true);
+    expect(node<HTMLElement>("#update-banner").inert).toBe(true);
+  });
+
+  it("锁屏吞掉 Esc 与保存快捷键", async () => {
+    await boot({
+      get_lock_status: () => lockStatus({ configured: true, locked: true }),
+    });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }),
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+    expect(mocks.invoke).not.toHaveBeenCalledWith("hide_window");
+    expect(mocks.invoke).not.toHaveBeenCalledWith("save_note", expect.anything());
+  });
+
+  it("错误密码显示内联错误并保持锁屏", async () => {
+    await boot({
+      get_lock_status: () => lockStatus({ configured: true, locked: true }),
+      unlock: () => Promise.reject("密码错误"),
+    });
+    node<HTMLInputElement>("#app-lock-password").value = "wrong-pass";
+    node<HTMLButtonElement>("#app-lock-submit").click();
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock-error").textContent).toContain("密码错误");
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+  });
+
+  it("正确密码解锁后加载设置与草稿", async () => {
+    let locked = true;
+    await boot({
+      get_lock_status: () =>
+        lockStatus({
+          configured: true,
+          locked,
+          remainingSeconds: locked ? null : 1800,
+        }),
+      unlock: () => {
+        locked = false;
+        return lockStatus({ configured: true, locked: false, remainingSeconds: 1800 });
+      },
+    });
+    node<HTMLInputElement>("#app-lock-password").value = "correct-pass";
+    node<HTMLButtonElement>("#app-lock-submit").click();
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(true);
+    expect(mocks.invoke).toHaveBeenCalledWith("get_settings");
+    expect(mocks.invoke).toHaveBeenCalledWith("load_draft");
+  });
+
+  it("标题栏按钮主动上锁", async () => {
+    await boot({
+      get_lock_status: () =>
+        lockStatus({ configured: true, locked: false, remainingSeconds: 1800 }),
+      lock_now: () => lockStatus({ configured: true, locked: true }),
+    });
+    expect(node<HTMLButtonElement>("#lock-btn").hidden).toBe(false);
+    node<HTMLButtonElement>("#lock-btn").click();
+    await flush();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("lock_now");
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+  });
+
+  it("托盘上锁事件会进入锁屏", async () => {
+    let locked = false;
+    await boot({
+      get_lock_status: () =>
+        lockStatus({
+          configured: true,
+          locked,
+          remainingSeconds: locked ? null : 1800,
+        }),
+    });
+    locked = true;
+    handler("app-locked")({});
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+  });
+
+  it("未启用时托盘上锁事件不会显示锁屏", async () => {
+    await boot();
+    handler("app-locked")({});
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(true);
+  });
+
+  it("锁定时忽略托盘打开设置/历史事件", async () => {
+    await boot({
+      get_lock_status: () => lockStatus({ configured: true, locked: true }),
+    });
+    handler("open-settings")({});
+    handler("open-history")({});
+    await flush();
+
+    expect(node<HTMLElement>("#settings").classList.contains("hidden")).toBe(true);
+    expect(node<HTMLElement>("#history").classList.contains("hidden")).toBe(true);
+  });
+
+  it("window-shown 报告锁定后不再刷新笔记", async () => {
+    await boot({
+      get_lock_status: () => lockStatus({ configured: true, locked: true }),
+    });
+    const before = mocks.invoke.mock.calls.filter(([cmd]) => cmd === "list_notes").length;
+    handler("window-shown")({ payload: { locked: true, source: null } });
+    await flush();
+
+    expect(mocks.invoke.mock.calls.filter(([cmd]) => cmd === "list_notes").length).toBe(before);
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+  });
+
+  it("有效期到期后重新上锁", async () => {
+    vi.useFakeTimers();
+    let locked = false;
+    await boot({
+      get_lock_status: () =>
+        lockStatus({
+          configured: true,
+          locked,
+          remainingSeconds: locked ? null : 1,
+        }),
+    });
+    locked = true;
+    await vi.advanceTimersByTimeAsync(1500);
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("设置页启用应用锁要求两次密码一致", async () => {
+    await boot();
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    node<HTMLInputElement>("#lock-new-password").value = "12345678";
+    node<HTMLInputElement>("#lock-confirm-password").value = "12345679";
+    node<HTMLButtonElement>("#lock-enable").click();
+    await flush();
+
+    expect(mocks.invoke).not.toHaveBeenCalledWith(
+      "set_app_lock_password",
+      expect.anything(),
+    );
+    expect(node<HTMLElement>("#lock-setup-error").textContent).toContain("不一致");
+  });
+
+  it("设置页启用应用锁成功", async () => {
+    await boot();
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    node<HTMLInputElement>("#lock-new-password").value = "12345678";
+    node<HTMLInputElement>("#lock-confirm-password").value = "12345678";
+    node<HTMLSelectElement>("#lock-validity").value = "120";
+    node<HTMLButtonElement>("#lock-enable").click();
+    await flush();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("set_app_lock_password", {
+      currentPassword: null,
+      newPassword: "12345678",
+      unlockMinutes: 120,
+    });
+    expect(node<HTMLElement>("#lock-settings-status").textContent).toContain("已启用");
   });
 });
 
