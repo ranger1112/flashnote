@@ -118,6 +118,8 @@ pub struct AppState {
     pub settings_last_saved_seq: AtomicU64,
     /// 串行化设置文件写入，避免两个快照同时写同一个临时文件。
     pub settings_write_lock: Mutex<()>,
+    /// 最近一次自动 Git 提交的结果，供设置页显示失败原因。
+    pub(crate) git: Mutex<git_backup::GitCommitState>,
     startup_notice: Mutex<Option<StartupNotice>>,
 }
 
@@ -227,6 +229,7 @@ fn main() {
                 settings_write_seq: AtomicU64::new(0),
                 settings_last_saved_seq: AtomicU64::new(0),
                 settings_write_lock: Mutex::new(()),
+                git: Mutex::new(git_backup::GitCommitState::default()),
                 startup_notice: Mutex::new(startup_notice),
             });
 
