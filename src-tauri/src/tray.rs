@@ -25,6 +25,7 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
     let today_item = MenuItem::with_id(app, "today", "打开今日笔记", true, None::<&str>)?;
     let folder_item = MenuItem::with_id(app, "folder", "打开笔记文件夹", true, None::<&str>)?;
     let sync_item = MenuItem::with_id(app, "sync", "立即同步", true, None::<&str>)?;
+    let lock_item = MenuItem::with_id(app, "lock", "立即上锁", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
     let logs_item = MenuItem::with_id(app, "logs", "打开日志文件夹", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -37,6 +38,7 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
             &today_item,
             &folder_item,
             &sync_item,
+            &lock_item,
             &settings_item,
             &logs_item,
             &quit_item,
@@ -52,31 +54,65 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
             "show" => commands::show_window_impl(app),
             "history" => {
                 commands::show_window_impl(app);
-                let _ = app.emit("open-history", ());
+                if !commands::is_locked(app) {
+                    let _ = app.emit("open-history", ());
+                }
             }
-            "today" => run_off_thread(app, files::open_today_note_impl, "打开今日笔记失败"),
-            "folder" => run_off_thread(app, files::open_notes_dir_impl, "打开笔记目录失败"),
-            "logs" => run_off_thread(app, files::open_log_dir_impl, "打开日志目录失败"),
-            "sync" => {
-                let sync = app
-                    .state::<AppState>()
-                    .settings
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sync
-                    .clone();
-                if sync.enabled && sync.is_configured() {
-                    // trigger 只起一个后台任务，菜单线程立刻返回。
-                    crate::sync::runtime::trigger(app);
-                } else {
-                    // 没配置好就去设置页，而不是静默失败。
+            "today" => {
+                if commands::is_locked(app) {
                     commands::show_window_impl(app);
+                } else {
+                    run_off_thread(app, files::open_today_note_impl, "打开今日笔记失败");
+                }
+            }
+            "folder" => {
+                if commands::is_locked(app) {
+                    commands::show_window_impl(app);
+                } else {
+                    run_off_thread(app, files::open_notes_dir_impl, "打开笔记目录失败");
+                }
+            }
+            "logs" => {
+                if commands::is_locked(app) {
+                    commands::show_window_impl(app);
+                } else {
+                    run_off_thread(app, files::open_log_dir_impl, "打开日志目录失败");
+                }
+            }
+            "sync" => {
+                if commands::is_locked(app) {
+                    commands::show_window_impl(app);
+                } else {
+                    let sync = app
+                        .state::<AppState>()
+                        .settings
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sync
+                        .clone();
+                    if sync.enabled && sync.is_configured() {
+                        // trigger 只起一个后台任务，菜单线程立刻返回。
+                        crate::sync::runtime::trigger(app);
+                    } else {
+                        // 没配置好就去设置页，而不是静默失败。
+                        commands::show_window_impl(app);
+                        let _ = app.emit("open-settings", ());
+                    }
+                }
+            }
+            "lock" => {
+                let status = commands::lock_now_impl(app);
+                commands::show_window_impl(app);
+                if !status.configured {
+                    // 还没设置应用锁：打开设置页引导用户启用。
                     let _ = app.emit("open-settings", ());
                 }
             }
             "settings" => {
                 commands::show_window_impl(app);
-                let _ = app.emit("open-settings", ());
+                if !commands::is_locked(app) {
+                    let _ = app.emit("open-settings", ());
+                }
             }
             "quit" => app.exit(0),
             _ => {}
