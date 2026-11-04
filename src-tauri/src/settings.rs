@@ -391,9 +391,7 @@ pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
     }
     let data = serde_json::to_vec_pretty(settings)
         .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, path)
+    crate::files::write_atomic(path, &data)
 }
 
 #[cfg(test)]

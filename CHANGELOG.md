@@ -2,6 +2,15 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 安全
+
+- 自动 Git 提交改用私有索引，并禁用仓库 hooks、fsmonitor、GPG 签名与外部 Markdown filter；共享/网络笔记目录里的仓库配置不能再借保存操作执行命令，也不会覆盖用户自己的暂存区。
+- 保存、同步下载、编辑、设置与草稿写入拒绝符号链接/重解析点，临时文件改为随机名 + `create_new`，避免写入逃出目标目录。
+- 同步密码缓存与同步身份绑定；修改地址/账号时在持锁期间清除缓存，避免旧密码被发往新主机。
+- WebDAV 地址禁止携带 query/fragment，避免令牌以明文写进 `settings.json`。
+
 ## [0.6.0] - 2026-11-04
 
 ### 新增

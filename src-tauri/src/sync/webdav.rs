@@ -757,7 +757,17 @@ fn parse_root(raw: &str, allow_insecure_http: bool) -> Result<Url, SyncError> {
 }
 
 /// 只校验地址格式，不联网；保存配置前调用。
+///
+/// query/fragment 在请求前会被清掉，如果允许保存，用户粘进来的 token 会
+/// 原样写进 settings.json，形成「既存在明文里又实际不用」的凭据泄漏。
 pub(crate) fn validate_url(raw: &str, allow_insecure_http: bool) -> Result<(), SyncError> {
+    let parsed = Url::parse(raw.trim())
+        .map_err(|error| SyncError::Other(format!("地址格式不正确：{error}")))?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(SyncError::Other(
+            "地址中不要包含查询参数或片段；凭据请填在密码框".to_string(),
+        ));
+    }
     parse_root(raw, allow_insecure_http).map(|_| ())
 }
 
@@ -1186,6 +1196,13 @@ mod tests {
     #[test]
     fn credentials_with_userinfo_are_rejected() {
         assert!(parse_root("https://user:pw@dav.example.com/dav", false).is_err());
+    }
+
+    #[test]
+    fn url_with_query_or_fragment_is_rejected() {
+        assert!(validate_url("https://dav.example.com/dav?token=abc", false).is_err());
+        assert!(validate_url("https://dav.example.com/dav#section", false).is_err());
+        assert!(validate_url("https://dav.example.com/dav", false).is_ok());
     }
 
     #[test]

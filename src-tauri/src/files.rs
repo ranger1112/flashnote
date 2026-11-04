@@ -5,8 +5,13 @@
 
 use crate::{notes, settings, AppState};
 use std::{
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
-    sync::MutexGuard,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        MutexGuard,
+    },
 };
 use tauri::{AppHandle, Manager};
 
@@ -16,6 +21,75 @@ pub(crate) fn io_guard(state: &AppState) -> MutexGuard<'_, ()> {
         .io
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// 路径本身是不是符号链接/重解析点；只查路径，不跟随目标。
+pub(crate) fn is_reparse_point(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        fs::symlink_metadata(path)
+            .map(|meta| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+}
+
+/// 拒绝写入重解析点，避免把笔记/同步内容写到链接目标（可能是目录外文件）。
+pub(crate) fn reject_reparse(path: &Path) -> io::Result<()> {
+    if is_reparse_point(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "拒绝写入符号链接或重解析点",
+        ));
+    }
+    Ok(())
+}
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(".{name}.{}.{nanos}.{seq}.tmp", std::process::id()))
+}
+
+/// 原子写入：随机临时名 + `create_new`，预先放置的临时文件/符号链接不会被跟随。
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    reject_reparse(path)?;
+    let tmp = temp_sibling(path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn open_with_explorer(path: &Path) -> Result<(), String> {
@@ -174,8 +248,12 @@ pub(crate) fn ensure_writable_dir(path: &str) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建目录：{err}"))?;
 
-    let probe = dir.join(format!(".flashnote-write-test-{}", std::process::id()));
-    std::fs::write(&probe, b"flashnote").map_err(|err| format!("该目录不可写：{err}"))?;
+    let probe = dir.join(format!(
+        ".flashnote-write-test-{}-{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    write_atomic(&probe, b"flashnote").map_err(|err| format!("该目录不可写：{err}"))?;
     if let Err(err) = std::fs::remove_file(&probe) {
         log::warn!("清理写入测试文件失败（{}）：{err}", probe.display());
     }
@@ -228,17 +306,11 @@ where
         .unwrap_or("notes");
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let backup = target.with_file_name(format!("{stem}.md.bak-{stamp}"));
+    crate::files::reject_reparse(&backup).map_err(|err| format!("备份失败：{err}"))?;
     std::fs::copy(&target, &backup).map_err(|err| format!("备份失败：{err}"))?;
 
-    // 临时文件带唯一后缀：上次异常退出残留的同名 tmp 不会挡住这次写入
-    let unique = chrono::Local::now().format("%Y%m%d-%H%M%S%.6f");
-    let tmp = target.with_file_name(format!("{stem}.md.tmp-{unique}"));
-    if let Err(err) = std::fs::write(&tmp, updated.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("写入失败：{err}"));
-    }
-    if let Err(err) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
+    // 随机临时名 + create_new：预先放置的临时文件/符号链接不会被跟随。
+    if let Err(err) = crate::files::write_atomic(&target, updated.as_bytes()) {
         return Err(format!("写入失败：{err}"));
     }
     // 解析缓存按 mtime+size 判断，但同一秒内的改写可能撞上旧值；这里的 target

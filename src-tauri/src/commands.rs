@@ -571,12 +571,8 @@ pub async fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
         let state = app.state::<AppState>();
         let _guard = io_guard(&state);
         let path = draft_path(&app);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| format!("保存草稿失败：{err}"))?;
-        }
-        let tmp = path.with_extension("txt.tmp");
-        std::fs::write(&tmp, content.as_bytes()).map_err(|err| format!("保存草稿失败：{err}"))?;
-        std::fs::rename(&tmp, &path).map_err(|err| format!("保存草稿失败：{err}"))
+        crate::files::write_atomic(&path, content.as_bytes())
+            .map_err(|err| format!("保存草稿失败：{err}"))
     })
     .await
 }
@@ -786,25 +782,25 @@ pub async fn update_sync_config(
     config: SyncConfigInput,
 ) -> Result<SyncStatus, String> {
     let next = config.normalize()?;
-    let previous = {
+    let (previous, identity_changed) = {
         let mut settings = state
             .settings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = settings.sync.clone();
         settings.sync = next.clone();
-        previous
+        let changed = !same_sync_identity(&previous, &next);
+        // 持锁时就清掉缓存：否则并发的一轮同步可能读到新配置 + 旧密码。
+        if changed {
+            state.sync.forget_password();
+        }
+        (previous, changed)
     };
 
     // 换服务器或换账号后旧密码不再适用，顺手清掉，免得留下孤儿凭据。
-    if !same_sync_identity(&previous, &next) {
-        state.sync.forget_password();
-        if previous.is_configured() {
-            if let Err(error) =
-                sync::secrets::clear(previous.kind, &previous.url, &previous.username)
-            {
-                log::warn!("清理旧同步密码失败：{error}");
-            }
+    if identity_changed && previous.is_configured() {
+        if let Err(error) = sync::secrets::clear(previous.kind, &previous.url, &previous.username) {
+            log::warn!("清理旧同步密码失败：{error}");
         }
     }
 
@@ -838,7 +834,8 @@ pub fn save_sync_password(
     }
 
     // 先记在内存里：凭据管理器被禁用时，本次会话仍然能同步。
-    state.sync.remember_password(&password);
+    let identity = sync::credential_identity(sync.kind, &sync.url, &sync.username);
+    state.sync.remember_password(&identity, &password);
     // 密码补上后立刻可以同步，不用等下一个定时点。
     state.sync.schedule();
     match sync::secrets::save(sync.kind, &sync.url, &sync.username, &password) {
@@ -900,11 +897,14 @@ pub async fn test_sync_connection(
         Some(password) => password,
         // 表单地址与已保存配置不一致时，绝不能把缓存里的旧密码发给新地址；
         // 只允许使用新地址自己在凭据管理器里保存过的密码。
-        None if same_identity => match runtime.cached_password() {
-            Some(password) => password,
-            None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
-                .ok_or_else(|| "还没有保存密码".to_string())?,
-        },
+        None if same_identity => {
+            let identity = sync::credential_identity(sync.kind, &sync.url, &sync.username);
+            match runtime.cached_password(&identity) {
+                Some(password) => password,
+                None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
+                    .ok_or_else(|| "还没有保存密码".to_string())?,
+            }
+        }
         None => sync::secrets::load(sync.kind, &sync.url, &sync.username)?
             .ok_or_else(|| "地址或用户名已修改，请重新输入密码".to_string())?,
     };
