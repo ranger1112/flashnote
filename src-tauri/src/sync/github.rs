@@ -26,6 +26,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 与 WebDAV 后端保持一致的单文件上限。
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+/// 错误响应只保留前 8 KiB，避免被异常/恶意响应撑爆内存。
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const UNLIMITED: usize = usize::MAX;
 /// 只读请求遇到网络抖动时的轮内重试次数；与 WebDAV 后端保持一致的口径。
 const MAX_RETRIES: u32 = 2;
@@ -80,6 +82,8 @@ pub(crate) fn parse_repo(url: &str) -> Option<(String, String, Option<String>)> 
     if trimmed.is_empty() {
         return None;
     }
+    // 从浏览器地址栏复制来的地址可能带 ?query / #fragment，它们不是分支的一部分。
+    let trimmed = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
     let without_scheme = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
@@ -102,12 +106,10 @@ pub(crate) fn parse_repo(url: &str) -> Option<(String, String, Option<String>)> 
         return None;
     }
     let branch = match parts.next() {
-        // `/tree/<分支>` 是分支页面；`/blob/<分支>/<文件>` 是文件页面，
-        // 后面的路径不是分支名，宁可忽略也不能拼出一个不存在的分支。
-        Some("tree") => {
-            let rest: Vec<&str> = parts.collect();
-            (!rest.is_empty()).then(|| rest.join("/"))
-        }
+        // `/tree/<分支>` 是分支页面；`/blob/<分支>/<文件>` 是文件页面。
+        // 这里只取第一段：`/tree/main/src` 是目录页，不是分支 `main/src`；
+        // 带斜杠的分支请在「分支」输入框里单独填写。
+        Some("tree") => parts.next().map(|value| value.to_string()),
         _ => None,
     };
     Some((owner, repo, branch))
@@ -116,6 +118,30 @@ pub(crate) fn parse_repo(url: &str) -> Option<(String, String, Option<String>)> 
 /// GitHub 的用户名/仓库名只允许这些字符；`/` 与 `..` 在第 4 步之前就被切掉了。
 fn is_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+#[derive(Deserialize)]
+struct RepoPermissions {
+    #[serde(default)]
+    push: bool,
+    #[serde(default)]
+    maintain: bool,
+    #[serde(default)]
+    admin: bool,
+}
+
+#[derive(Deserialize)]
+struct RepoInfo {
+    permissions: Option<RepoPermissions>,
+}
+
+impl RepoInfo {
+    /// `None` 表示接口没有返回权限信息，不能据此拒绝连接。
+    fn can_write(&self) -> Option<bool> {
+        self.permissions
+            .as_ref()
+            .map(|permissions| permissions.push || permissions.maintain || permissions.admin)
+    }
 }
 
 pub(crate) struct GitHubBackend {
@@ -183,7 +209,18 @@ impl GitHubBackend {
                 "令牌无权访问该仓库，或仓库地址不正确".to_string(),
             ));
         }
-        self.check(response).await?;
+        let response = self.check(response).await?;
+        // 只有 Contents: Read 的令牌能通过上面的 GET，但无法写入。仓库响应里的
+        // permissions 能提前暴露这一点，避免每轮同步都逐文件 403。
+        let info: RepoInfo = response
+            .json()
+            .await
+            .map_err(|error| SyncError::Other(format!("解析仓库信息失败：{error}")))?;
+        if info.can_write() == Some(false) {
+            return Err(SyncError::Auth(
+                "令牌缺少该仓库的 Contents: write 权限".to_string(),
+            ));
+        }
 
         let Some(branch) = &self.branch else {
             return Ok(());
@@ -327,7 +364,7 @@ impl GitHubBackend {
                     .headers()
                     .contains_key(reqwest::header::RETRY_AFTER);
                 let wait = retry_after(&response);
-                let body = response.text().await.unwrap_or_default();
+                let body = error_body(response).await;
                 let mentions_limit = body.to_ascii_lowercase().contains("rate limit");
                 if remaining_zero || has_retry_after || mentions_limit {
                     Err(SyncError::RateLimited {
@@ -339,7 +376,7 @@ impl GitHubBackend {
                 }
             }
             StatusCode::UNPROCESSABLE_ENTITY => {
-                let body = response.text().await.unwrap_or_default();
+                let body = error_body(response).await;
                 // 带 sha 的写入在版本不匹配时是 409；422 一般意味着「没带 sha 但文件已存在」
                 if body.contains("sha") {
                     Err(SyncError::VersionMismatch)
@@ -351,7 +388,7 @@ impl GitHubBackend {
                 }
             }
             other => {
-                let body = response.text().await.unwrap_or_default();
+                let body = error_body(response).await;
                 Err(SyncError::Network(format!(
                     "GitHub 返回 {other}：{}",
                     short(&body)
@@ -359,6 +396,22 @@ impl GitHubBackend {
             }
         }
     }
+}
+
+/// 读取错误响应正文，但最多保留 `MAX_ERROR_BODY_BYTES`，不信任对端长度。
+async fn error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() >= MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 fn network(error: reqwest::Error) -> SyncError {
@@ -611,9 +664,17 @@ impl GitHubBackend {
         let response = self
             .send_retry(|| self.request(Method::GET, &url).headers(accept.clone()))
             .await?;
-        let response = self.check(response).await?;
-        let bytes = response.bytes().await.map_err(network)?;
-        Ok(bytes.to_vec())
+        let mut response = self.check(response).await?;
+        // 和 WebDAV 一样按块读取：Tree API 里的 size 与真正 GET 之间可能变化，
+        // 不能先缓冲整个响应体再检查上限。
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(network)? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_FILE_BYTES {
+                return Err(SyncError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 }
 
@@ -639,6 +700,24 @@ mod tests {
                 Some("dev".to_string())
             ))
         );
+        assert_eq!(
+            parse_repo("https://github.com/ranger1112/flashnote/tree/main?tab=readme-ov-file"),
+            Some((
+                "ranger1112".to_string(),
+                "flashnote".to_string(),
+                Some("main".to_string())
+            )),
+            "浏览器地址里的 query 不能拼进分支名"
+        );
+        assert_eq!(
+            parse_repo("https://github.com/ranger1112/flashnote/tree/main/src/components"),
+            Some((
+                "ranger1112".to_string(),
+                "flashnote".to_string(),
+                Some("main".to_string())
+            )),
+            "目录页的后续路径不是分支名"
+        );
         assert_eq!(parse_repo("https://gitlab.com/a/b"), None);
         assert_eq!(parse_repo("https://github.com/only-owner"), None);
         assert_eq!(parse_repo(""), None);
@@ -652,6 +731,24 @@ mod tests {
             parse_repo("https://github.com/a/b/issues"),
             Some(("a".to_string(), "b".to_string(), None))
         );
+    }
+
+    #[test]
+    fn repo_permissions_decide_write_access() {
+        let read_only: RepoInfo = serde_json::from_value(json!({
+            "permissions": {"push": false, "pull": true}
+        }))
+        .unwrap();
+        assert_eq!(read_only.can_write(), Some(false));
+
+        let writable: RepoInfo = serde_json::from_value(json!({
+            "permissions": {"push": true, "pull": true}
+        }))
+        .unwrap();
+        assert_eq!(writable.can_write(), Some(true));
+
+        let unknown: RepoInfo = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(unknown.can_write(), None, "没有权限字段时不能误判");
     }
 
     #[test]
@@ -696,6 +793,40 @@ mod tests {
             &server.uri(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_read_only_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "permissions": {"push": false, "pull": true}
+            })))
+            .mount(&server)
+            .await;
+
+        let error = backend(&server).probe().await.unwrap_err();
+        match error {
+            SyncError::Auth(message) => assert!(message.contains("Contents: write"), "{message}"),
+            other => panic!("预期权限错误，实际：{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_raw_stops_at_the_size_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/flashnote/notes/2026-10-31.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; MAX_FILE_BYTES + 1]))
+            .mount(&server)
+            .await;
+
+        let error = backend(&server)
+            .fetch_raw("2026-10-31.md")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::TooLarge), "{error:?}");
     }
 
     #[tokio::test]

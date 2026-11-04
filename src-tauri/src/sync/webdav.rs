@@ -296,6 +296,13 @@ impl WebDavBackend {
         if !response.status().is_success() {
             return Err(map_status("下载", &response));
         }
+        // SSO/反向代理把未认证的 GET 引到登录页时，登录页通常是 200 text/html。
+        // 不校验就会把它当笔记写盘，并覆盖 base 记录。
+        if response_is_html(response.headers()) {
+            return Err(SyncError::Other(
+                "远端返回 HTML 页面（可能是登录页），已拒绝写入本地笔记".to_string(),
+            ));
+        }
         let version = response_version(response.headers());
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -953,6 +960,23 @@ fn response_version(headers: &HeaderMap) -> RemoteVersion {
     RemoteVersion::Hash(version_token(modified, size))
 }
 
+/// HTML 通常意味着 SSO/反向代理的登录页；不能把它当笔记内容。
+fn response_is_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let mime = value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            mime == "text/html" || mime == "application/xhtml+xml"
+        })
+        .unwrap_or(false)
+}
+
 fn entry_version(entry: &Props) -> RemoteVersion {
     if let Some(tag) = entry.etag.as_deref().and_then(normalize_etag) {
         return RemoteVersion::Etag(tag);
@@ -1203,6 +1227,27 @@ mod tests {
         assert!(validate_url("https://dav.example.com/dav?token=abc", false).is_err());
         assert!(validate_url("https://dav.example.com/dav#section", false).is_err());
         assert!(validate_url("https://dav.example.com/dav", false).is_ok());
+    }
+
+    #[test]
+    fn html_responses_are_not_treated_as_notes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert!(response_is_html(&headers));
+
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/xhtml+xml"),
+        );
+        assert!(response_is_html(&headers));
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/markdown"));
+        assert!(!response_is_html(&headers));
+
+        assert!(!response_is_html(&HeaderMap::new()), "缺少类型时保持兼容");
     }
 
     #[test]
