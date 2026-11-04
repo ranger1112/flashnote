@@ -4,6 +4,7 @@
 //! 非阻塞的 `persist`：UI 线程与 tokio worker 都不该等磁盘。
 
 use crate::{
+    app_lock::{self, runtime::LockStatus},
     files::{self, io_guard},
     git_backup, notes,
     settings::{self, Settings, SyncKind, SyncSettings},
@@ -17,6 +18,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex,
     },
+    time::{Instant, SystemTime},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -25,6 +27,7 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 #[serde(rename_all = "camelCase")]
 pub struct ShowPayload {
     pub source: Option<String>,
+    pub locked: bool,
 }
 
 #[derive(Serialize)]
@@ -130,15 +133,279 @@ pub fn persist_on_exit(app: &AppHandle) {
     let _ = persist_sync(app);
 }
 
+fn lock_status_from(state: &AppState) -> LockStatus {
+    let (unlock_minutes, theme) = {
+        let settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (settings.lock.unlock_minutes, settings.theme.clone())
+    };
+    let mut runtime = state
+        .app_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    runtime.status(unlock_minutes, theme, Instant::now(), SystemTime::now())
+}
+
+pub(crate) fn is_locked(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let mut runtime = state
+        .app_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    runtime.is_locked(Instant::now(), SystemTime::now())
+}
+
+pub(crate) fn require_unlocked(state: &AppState) -> Result<(), String> {
+    let mut runtime = state
+        .app_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if runtime.is_locked(Instant::now(), SystemTime::now()) {
+        Err(app_lock::LOCKED_ERROR.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn require_unlocked_app(app: &AppHandle) -> Result<(), String> {
+    require_unlocked(&app.state::<AppState>())
+}
+
+/// 上锁并清掉可能残留的前台窗口标题；托盘与命令共用。
+pub(crate) fn lock_now_impl(app: &AppHandle) -> LockStatus {
+    let state = app.state::<AppState>();
+    {
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.force_lock();
+    }
+    *state
+        .last_source
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    let status = lock_status_from(&state);
+    let _ = app.emit("app-locked", ());
+    status
+}
+
+/// 校验当前密码（修改/关闭应用锁时使用）。调用方需持有 `lock_verify`。
+async fn verify_current_password(state: &AppState, password: String) -> Result<(), String> {
+    let now = Instant::now();
+    let verifier = {
+        let runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !runtime.configured() {
+            return Err("应用锁未启用".to_string());
+        }
+        runtime.precheck_unlock(now)?;
+        runtime
+            .verifier()
+            .ok_or_else(|| "应用锁凭据不可用".to_string())?
+            .to_string()
+    };
+    let ok = run_blocking(move || app_lock::verify_password(&password, &verifier)).await?;
+    if ok {
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.reset_attempts();
+        Ok(())
+    } else {
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.record_failure(Instant::now());
+        Err("密码错误".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn get_lock_status(app: AppHandle) -> LockStatus {
+    lock_status_from(&app.state::<AppState>())
+}
+
+#[tauri::command]
+pub async fn unlock(state: State<'_, AppState>, password: String) -> Result<LockStatus, String> {
+    let _verify_guard = state.lock_verify.lock().await;
+    let now = Instant::now();
+    let verifier = {
+        let runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !runtime.configured() {
+            return Err("应用锁未启用".to_string());
+        }
+        runtime.precheck_unlock(now)?;
+        runtime
+            .verifier()
+            .ok_or_else(|| "应用锁凭据不可用".to_string())?
+            .to_string()
+    };
+    let unlocked = run_blocking(move || app_lock::verify_password(&password, &verifier)).await?;
+    if unlocked {
+        let minutes = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock
+            .unlock_minutes;
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.record_success(minutes, Instant::now(), SystemTime::now());
+        drop(runtime);
+        Ok(lock_status_from(&state))
+    } else {
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.record_failure(Instant::now());
+        Err("密码错误".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn lock_now(app: AppHandle) -> LockStatus {
+    lock_now_impl(&app)
+}
+
+#[tauri::command]
+pub async fn set_app_lock_password(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    current_password: Option<String>,
+    new_password: String,
+    unlock_minutes: u32,
+) -> Result<LockStatus, String> {
+    let minutes = settings::LockSettings::normalize_minutes(unlock_minutes);
+    app_lock::validate_new_password(&new_password)?;
+    let _verify_guard = state.lock_verify.lock().await;
+
+    let existing = {
+        let runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.configured()
+    };
+    if existing {
+        let current = current_password.unwrap_or_default();
+        if current.is_empty() {
+            return Err("请输入当前密码".to_string());
+        }
+        verify_current_password(&state, current).await?;
+    }
+
+    let phc = run_blocking(move || app_lock::hash_password(&new_password)).await?;
+    let save_value = phc.clone();
+    run_blocking(move || app_lock::secrets::save(&save_value)).await?;
+
+    {
+        let mut settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        settings.lock.unlock_minutes = minutes;
+    }
+    persist(&app);
+
+    {
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.set_verifier(Some(phc));
+        if existing {
+            runtime.reset_attempts();
+        } else {
+            runtime.record_success(minutes, Instant::now(), SystemTime::now());
+        }
+    }
+    Ok(lock_status_from(&state))
+}
+
+#[tauri::command]
+pub async fn disable_app_lock(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<LockStatus, String> {
+    let _verify_guard = state.lock_verify.lock().await;
+    let configured = {
+        let runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.configured()
+    };
+    if !configured {
+        return Ok(lock_status_from(&state));
+    }
+    if password.is_empty() {
+        return Err("请输入当前密码".to_string());
+    }
+    verify_current_password(&state, password).await?;
+    run_blocking(app_lock::secrets::clear).await?;
+
+    {
+        let mut runtime = state
+            .app_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.set_verifier(None);
+        runtime.reset_attempts();
+        runtime.force_lock();
+    }
+    Ok(lock_status_from(&state))
+}
+
+#[tauri::command]
+pub fn update_lock_validity(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    minutes: u32,
+) -> Result<LockStatus, String> {
+    require_unlocked(&state)?;
+    let minutes = settings::LockSettings::normalize_minutes(minutes);
+    {
+        let mut settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        settings.lock.unlock_minutes = minutes;
+    }
+    persist(&app);
+    Ok(lock_status_from(&state))
+}
+
 pub fn show_window_impl(app: &AppHandle) {
     let state = app.state::<AppState>();
+    let locked = is_locked(app);
     let capture = state
         .settings
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .capture_source;
 
-    let source = if capture {
+    if locked {
+        // 锁定期间不要抓取/沿用前台窗口标题；解锁后保存也不该带出上锁前的来源。
+        *state
+            .last_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    let source = if capture && !locked {
         match crate::source::foreground_window_title() {
             Some(title) => {
                 *state
@@ -169,7 +436,7 @@ pub fn show_window_impl(app: &AppHandle) {
         if let Err(err) = window.set_focus() {
             log::warn!("聚焦窗口失败：{err}");
         }
-        if let Err(err) = app.emit("window-shown", ShowPayload { source }) {
+        if let Err(err) = app.emit("window-shown", ShowPayload { source, locked }) {
             log::warn!("发送 window-shown 事件失败：{err}");
         }
     }
@@ -206,16 +473,18 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> Settings {
-    state
+pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+    require_unlocked(state.inner())?;
+    Ok(state
         .settings
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+        .clone())
 }
 
 #[tauri::command]
 pub async fn save_note(app: AppHandle, content: String) -> Result<SavedNote, String> {
+    require_unlocked_app(&app)?;
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err("内容为空".to_string());
@@ -266,6 +535,7 @@ pub async fn save_note(app: AppHandle, content: String) -> Result<SavedNote, Str
 
 #[tauri::command]
 pub fn set_pinned(app: AppHandle, state: State<'_, AppState>, pinned: bool) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -277,6 +547,7 @@ pub fn set_pinned(app: AppHandle, state: State<'_, AppState>, pinned: bool) -> R
 
 #[tauri::command]
 pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     // 网络目录掉线时 create_dir_all 会阻塞很久：探测不能持 io_guard，
     // 否则所有笔记读写都会排在后面等这次超时。
     let dir = run_blocking(move || files::ensure_writable_dir(&path)).await?;
@@ -298,6 +569,7 @@ pub async fn update_notes_dir(app: AppHandle, path: String) -> Result<(), String
 /// 笔记目录当前能否用 Git：有没有装 git、是不是仓库、最近一次自动提交结果。
 #[tauri::command]
 pub async fn get_git_status(app: AppHandle) -> Result<git_backup::GitStatus, String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || {
         let last = app
             .state::<AppState>()
@@ -313,6 +585,7 @@ pub async fn get_git_status(app: AppHandle) -> Result<git_backup::GitStatus, Str
 /// 给笔记目录建一个本地仓库；已经是仓库时幂等返回。
 #[tauri::command]
 pub async fn init_notes_git(app: AppHandle) -> Result<git_backup::GitStatus, String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || {
         let dir = notes_dir(&app);
         git_backup::init(&dir)?;
@@ -333,6 +606,7 @@ pub fn update_git_backup(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -359,6 +633,7 @@ pub fn update_hotkey(
     state: State<'_, AppState>,
     accel: String,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     let shortcut = crate::parse_hotkey(&accel)?;
 
     let old = state
@@ -400,6 +675,7 @@ pub fn update_capture_source(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -421,6 +697,7 @@ pub fn update_markdown_mode(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -436,6 +713,7 @@ pub async fn list_notes(
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
+    require_unlocked_app(&app)?;
     let dir = {
         let state = app.state::<AppState>();
         let notes_dir = state
@@ -461,6 +739,7 @@ pub async fn search_notes(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<notes::NoteEntry>, String> {
+    require_unlocked_app(&app)?;
     let dir = {
         let state = app.state::<AppState>();
         let notes_dir = state
@@ -492,6 +771,7 @@ pub async fn delete_note_entry(
     time: String,
     content: String,
 ) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || {
         let state = app.state::<AppState>();
         let result = files::rewrite_note(&state, &path, |text| {
@@ -515,6 +795,7 @@ pub async fn update_note_entry(
     content: String,
     new_content: String,
 ) -> Result<Vec<String>, String> {
+    require_unlocked_app(&app)?;
     if new_content.trim().is_empty() {
         return Err("内容不能为空".to_string());
     }
@@ -535,6 +816,7 @@ pub async fn update_note_entry(
 
 #[tauri::command]
 pub async fn open_note_file(app: AppHandle, path: String) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || {
         let state = app.state::<AppState>();
         files::open_note_file_impl(&state, &path)
@@ -544,11 +826,13 @@ pub async fn open_note_file(app: AppHandle, path: String) -> Result<(), String> 
 
 #[tauri::command]
 pub async fn open_today_note(app: AppHandle) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || files::open_today_note_impl(&app)).await
 }
 
 #[tauri::command]
 pub async fn open_notes_dir(app: AppHandle) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || files::open_notes_dir_impl(&app)).await
 }
 
@@ -558,12 +842,15 @@ pub fn hide_window(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn take_startup_notice(state: State<'_, AppState>) -> Option<crate::StartupNotice> {
-    state
+pub fn take_startup_notice(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::StartupNotice>, String> {
+    require_unlocked(state.inner())?;
+    Ok(state
         .startup_notice
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
+        .take())
 }
 
 fn draft_path(app: &AppHandle) -> PathBuf {
@@ -572,6 +859,7 @@ fn draft_path(app: &AppHandle) -> PathBuf {
 
 #[tauri::command]
 pub async fn load_draft(app: AppHandle) -> Result<String, String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || match std::fs::read_to_string(draft_path(&app)) {
         Ok(text) => Ok(text),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -582,6 +870,7 @@ pub async fn load_draft(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = io_guard(&state);
@@ -594,6 +883,7 @@ pub async fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn clear_draft(app: AppHandle) -> Result<(), String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = io_guard(&state);
@@ -608,6 +898,7 @@ pub async fn clear_draft(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn complete_onboarding(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -623,6 +914,7 @@ pub fn update_history_preview(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -638,6 +930,7 @@ pub fn update_auto_update(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -648,7 +941,12 @@ pub fn update_auto_update(
 }
 
 #[tauri::command]
-pub fn update_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> String {
+pub fn update_theme(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    theme: String,
+) -> Result<String, String> {
+    require_unlocked(state.inner())?;
     let applied = settings::normalize_theme(&theme);
     state
         .settings
@@ -656,7 +954,7 @@ pub fn update_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .theme = applied.clone();
     persist(&app);
-    applied
+    Ok(applied)
 }
 
 #[tauri::command]
@@ -665,6 +963,7 @@ pub fn update_auto_hide(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     state
         .settings
         .lock()
@@ -675,7 +974,12 @@ pub fn update_auto_hide(
 }
 
 #[tauri::command]
-pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opacity: f64) -> f64 {
+pub fn update_background_opacity(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    opacity: f64,
+) -> Result<f64, String> {
+    require_unlocked(state.inner())?;
     let applied = settings::clamp_opacity(opacity);
     state
         .settings
@@ -683,7 +987,7 @@ pub fn update_background_opacity(app: AppHandle, state: State<'_, AppState>, opa
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .background_opacity = applied;
     persist(&app);
-    applied
+    Ok(applied)
 }
 
 /// 前端提交的同步配置。密码不在这里，走 `save_sync_password`。
@@ -770,6 +1074,7 @@ pub struct SyncTestResult {
 
 #[tauri::command]
 pub async fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || Ok(sync::runtime::status(&app))).await
 }
 
@@ -779,6 +1084,7 @@ pub async fn get_sync_file_states(
     app: AppHandle,
     dates: Vec<String>,
 ) -> Result<Vec<sync::runtime::FileSyncState>, String> {
+    require_unlocked_app(&app)?;
     run_blocking(move || Ok(sync::runtime::file_states(&app, &dates))).await
 }
 
@@ -796,6 +1102,7 @@ pub async fn update_sync_config(
     state: State<'_, AppState>,
     config: SyncConfigInput,
 ) -> Result<SyncStatus, String> {
+    require_unlocked(state.inner())?;
     let next = config.normalize()?;
     let (previous, identity_changed) = {
         let mut settings = state
@@ -832,6 +1139,7 @@ pub fn save_sync_password(
     state: State<'_, AppState>,
     password: String,
 ) -> Result<PasswordSaveResult, String> {
+    require_unlocked(state.inner())?;
     if password.is_empty() {
         return Err("密码不能为空".to_string());
     }
@@ -870,6 +1178,7 @@ pub fn save_sync_password(
 
 #[tauri::command]
 pub async fn clear_sync_password(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     let sync = state
         .settings
         .lock()
@@ -891,6 +1200,7 @@ pub async fn test_sync_connection(
     config: SyncConfigInput,
     password: Option<String>,
 ) -> Result<SyncTestResult, String> {
+    require_unlocked_app(&app)?;
     let sync = config.normalize()?;
     if !sync.is_configured() {
         return Err(match sync.kind {
@@ -975,6 +1285,7 @@ async fn probe_backend<B: SyncBackend>(backend: B) -> Result<SyncTestResult, Str
 
 #[tauri::command]
 pub fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    require_unlocked(state.inner())?;
     let sync = state
         .settings
         .lock()
