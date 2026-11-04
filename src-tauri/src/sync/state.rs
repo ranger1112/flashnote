@@ -234,16 +234,7 @@ pub(crate) fn mtime_ns(modified: SystemTime) -> u64 {
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    let tmp = path.with_file_name(format!(".{name}.tmp"));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)
+    crate::files::write_atomic(path, bytes)
 }
 
 fn stamp(now: chrono::DateTime<Local>) -> String {

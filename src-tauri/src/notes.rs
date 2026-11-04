@@ -475,7 +475,8 @@ fn note_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         .filter_map(|item| item.ok())
         .map(|item| item.path())
         .filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("md")
+            !crate::files::is_reparse_point(path)
+                && path.extension().and_then(|ext| ext.to_str()) == Some("md")
                 && path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -636,6 +637,10 @@ pub(crate) fn invalidate_all() {
 
 /// 读取并解析一个日期文件；命中缓存时只需一次 stat，不用读盘和重新解析。
 fn entries_of(path: &Path) -> Option<Vec<(String, String, Option<String>)>> {
+    if crate::files::is_reparse_point(path) {
+        log::warn!("跳过符号链接/重解析点笔记：{}", path.display());
+        return None;
+    }
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(error) => {
@@ -829,6 +834,8 @@ fn exact_tag_term(needle: &str) -> Option<&str> {
 pub fn append_note(dir: &Path, date: &str, entry: &str) -> std::io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join(format!("{date}.md"));
+    // 共享/网络笔记目录里可能预先放着同名符号链接，不能顺着它写出去。
+    crate::files::reject_reparse(&path)?;
     // 只有文件确实不存在时才按空文件处理；读取失败必须上抛，否则会重复写入日期标题。
     let existing = match read_note(&path) {
         Ok(text) => text,

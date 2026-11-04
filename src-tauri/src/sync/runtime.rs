@@ -65,7 +65,8 @@ pub(crate) struct SyncRuntime {
     pending: AtomicBool,
     stopping: AtomicBool,
     /// 凭据管理器不可用时，密码只放在这里，退出即丢。
-    session_password: Mutex<Option<String>>,
+    /// 同时记录它属于哪个同步身份，避免改地址后把旧密码发给新主机。
+    session_password: Mutex<Option<(String, String)>>,
     last: Mutex<LastRound>,
 }
 
@@ -95,16 +96,19 @@ impl SyncRuntime {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn remember_password(&self, password: &str) {
-        *lock(&self.session_password) = Some(password.to_string());
+    pub(crate) fn remember_password(&self, identity: &str, password: &str) {
+        *lock(&self.session_password) = Some((identity.to_string(), password.to_string()));
     }
 
     pub(crate) fn forget_password(&self) {
         *lock(&self.session_password) = None;
     }
 
-    pub(crate) fn cached_password(&self) -> Option<String> {
-        lock(&self.session_password).clone()
+    pub(crate) fn cached_password(&self, identity: &str) -> Option<String> {
+        lock(&self.session_password)
+            .as_ref()
+            .filter(|(cached_identity, _)| cached_identity == identity)
+            .map(|(_, password)| password.clone())
     }
 
     fn apply(&self, outcome: RoundOutcome) {
@@ -318,12 +322,13 @@ async fn drive<B: SyncBackend + 'static>(
 }
 
 fn resolve_password(runtime: &SyncRuntime, sync: &SyncSettings) -> Result<String, String> {
-    if let Some(password) = runtime.cached_password() {
+    let identity = super::credential_identity(sync.kind, &sync.url, &sync.username);
+    if let Some(password) = runtime.cached_password(&identity) {
         return Ok(password);
     }
     match secrets::load(sync.kind, &sync.url, &sync.username) {
         Ok(Some(password)) => {
-            runtime.remember_password(&password);
+            runtime.remember_password(&identity, &password);
             Ok(password)
         }
         Ok(None) => Err("还没有保存同步密码，请在设置里重新填写".to_string()),
@@ -539,11 +544,15 @@ mod tests {
     #[test]
     fn session_password_is_memory_only() {
         let runtime = SyncRuntime::new();
-        assert!(runtime.cached_password().is_none());
-        runtime.remember_password("s3cret");
-        assert_eq!(runtime.cached_password().as_deref(), Some("s3cret"));
+        assert!(runtime.cached_password("id-a").is_none());
+        runtime.remember_password("id-a", "s3cret");
+        assert_eq!(runtime.cached_password("id-a").as_deref(), Some("s3cret"));
+        assert!(
+            runtime.cached_password("id-b").is_none(),
+            "换同步身份后不能复用旧密码"
+        );
         runtime.forget_password();
-        assert!(runtime.cached_password().is_none());
+        assert!(runtime.cached_password("id-a").is_none());
     }
 
     #[test]
