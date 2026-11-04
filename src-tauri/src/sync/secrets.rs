@@ -85,9 +85,13 @@ mod imp {
                     .map_err(|error| format!("系统凭据存储不可用：{error}"))?;
                 match legacy.get_password() {
                     Ok(password) => {
-                        // 顺手迁移到新账号名，之后就不用再回退。
-                        let _ = current.set_password(&password);
-                        let _ = legacy.delete_credential();
+                        // 只在写入新账号成功后删除旧条目；否则写失败 + 删除
+                        // 会让用户重启后两边都没有密码。
+                        if current.set_password(&password).is_ok() {
+                            let _ = legacy.delete_credential();
+                        } else {
+                            log::warn!("迁移旧同步密码失败，保留原凭据条目");
+                        }
                         Ok(Some(password))
                     }
                     Err(keyring::Error::NoEntry) => Ok(None),
