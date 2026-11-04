@@ -17,7 +17,7 @@ export function setBackgroundInert(inert: boolean): void {
 }
 
 export function anyPanelOpen(): boolean {
-  return [ui.welcomePanel, ui.settingsPanel, ui.historyPanel].some(
+  return [ui.lockPanel, ui.welcomePanel, ui.settingsPanel, ui.historyPanel].some(
     (panel) => !panel.classList.contains("hidden"),
   );
 }
@@ -25,7 +25,7 @@ export function anyPanelOpen(): boolean {
 /** 把 Tab 焦点限制在当前打开的面板内。 */
 export function trapFocus(event: KeyboardEvent): void {
   if (event.key !== "Tab") return;
-  const panel = [ui.welcomePanel, ui.settingsPanel, ui.historyPanel].find(
+  const panel = [ui.lockPanel, ui.welcomePanel, ui.settingsPanel, ui.historyPanel].find(
     (node) => !node.classList.contains("hidden"),
   );
   if (!panel) return;

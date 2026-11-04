@@ -417,5 +417,4 @@ export function initSync(): void {
   void listen<SyncStatus>("sync-status", (event) => paintSyncStatus(event.payload)).catch(
     (error) => console.error("监听同步状态失败", error),
   );
-  void refreshSyncStatus();
 }

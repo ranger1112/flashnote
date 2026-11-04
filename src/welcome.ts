@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { isAppLocked } from "./app-lock";
 import { formatAccel } from "./lib";
 import { ui } from "./dom";
 import { settings } from "./settings-store";
@@ -13,9 +14,12 @@ export function showWelcomePanel(): void {
 
 export function closeWelcome(animate = true): void {
   if (ui.welcomePanel.classList.contains("hidden")) return;
-  settings.onboarded = true;
-  void invoke("complete_onboarding").catch(() => {
-    // 下次启动时重新展示引导
-  });
+  // 上锁导致的关闭不算完成引导，也不能调用被锁拦截的命令。
+  if (!isAppLocked()) {
+    settings.onboarded = true;
+    void invoke("complete_onboarding").catch(() => {
+      // 下次启动时重新展示引导
+    });
+  }
   hidePanel(ui.welcomePanel, animate);
 }
