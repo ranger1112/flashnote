@@ -58,6 +58,7 @@ export const ui = {
   syncFootStatus: el<HTMLSpanElement>("sync-foot-status"),
   syncConflicts: el<HTMLButtonElement>("sync-conflicts"),
   checkUpdateButton: el<HTMLButtonElement>("check-update"),
+  updateNowButton: el<HTMLButtonElement>("update-now"),
   updateStatus: el<HTMLParagraphElement>("update-status"),
   appVersionLabel: el<HTMLSpanElement>("app-version"),
   updateBanner: el<HTMLDivElement>("update-banner"),
