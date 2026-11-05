@@ -90,8 +90,27 @@ function dateLabel(date: string): string {
   return date === today ? `今天 · ${date}` : date;
 }
 
-export function closeHistory(animate = true, force = false): void {
-  if (ui.historyPanel.classList.contains("hidden")) return;
+/**
+ * 上锁时调用：取消搜索与尚未落盘的删除，避免锁定后定时器再触发被拦截的命令。
+ * 历史面板已经关闭，不需要重绘；解锁后重新打开会重新加载。
+ */
+export function suspendHistoryForLock(): void {
+  if (searchTimer !== undefined) {
+    window.clearTimeout(searchTimer);
+    searchTimer = undefined;
+  }
+  searchSeq += 1;
+  if (pendingDelete) {
+    const pending = pendingDelete;
+    pendingDelete = null;
+    window.clearTimeout(pending.timer);
+    hideUndoBar();
+    // 把条目放回内存列表，但不渲染：面板关闭，且渲染会调用被锁拦截的同步状态命令。
+    notes.splice(Math.min(pending.index, notes.length), 0, pending.note);
+  }
+}
+
+export function closeHistory(animate = true, force = false): void {  if (ui.historyPanel.classList.contains("hidden")) return;
   // 编辑框里有未保存的改动：直接关闭会静默丢掉，必须先保存或取消。
   // 收起窗口（force）例外，否则用户没法用快捷键收起小窗。
   if (!force && hasOpenEditor()) {

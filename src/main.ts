@@ -13,7 +13,7 @@ import {
   restoreDraft,
   scheduleDraftSave,
 } from "./draft";
-import { initSync, markSyncPending } from "./sync";
+import { initSync, markSyncPending, refreshSyncStatus } from "./sync";
 import { initUpdater, startAutoUpdateChecks } from "./updater";
 import {
   closeHistory,
@@ -22,6 +22,7 @@ import {
   paintPreviewButton,
   refreshNotes,
   showHistoryPanel,
+  suspendHistoryForLock,
 } from "./history";
 import {
   closeSettings,
@@ -31,6 +32,17 @@ import {
   isRecording,
   showSettingsPanel,
 } from "./settings-panel";
+import {
+  applyLockStatus,
+  enterLockedMode,
+  enterUnlockedMode,
+  getLockStatus,
+  initAppLock,
+  isAppLocked,
+  lockNow,
+  paintLockButton,
+} from "./app-lock";
+import { initLockSettings } from "./lock-settings";
 import { closeWelcome, showWelcomePanel } from "./welcome";
 
 interface SavedNote {
@@ -40,6 +52,7 @@ interface SavedNote {
 
 interface ShowPayload {
   source: string | null;
+  locked: boolean;
 }
 
 interface StartupNotice {
@@ -62,6 +75,7 @@ function registerAutoHide(): void {
         return;
       }
       if (!windowFocusedOnce || !settings.autoHideOnBlur || pinned || isRecording()) return;
+      if (isAppLocked()) return;
       if (Date.now() < suppressBlurUntil || anyPanelOpen()) return;
       if (!(await getCurrentWindow().isVisible())) return;
 
@@ -88,6 +102,11 @@ function setSource(source: string | null): void {
 }
 
 async function hideWindow(): Promise<void> {
+  if (isAppLocked()) {
+    // 锁屏时草稿与面板命令都被后端拦截；只隐藏窗口，解锁状态保持不变。
+    await invoke("hide_window");
+    return;
+  }
   // 收起窗口时不做退出动画，避免面板还停留在一半
   closeSettings(false);
   // 收起窗口是明确的「离开」动作：编辑框内容随窗口一起收起，不阻塞热键。
@@ -99,7 +118,7 @@ async function hideWindow(): Promise<void> {
 }
 
 async function saveNote(): Promise<void> {
-  if (saving) return;
+  if (saving || isAppLocked()) return;
 
   const content = ui.textarea.value.trim();
   if (!content) {
@@ -156,7 +175,15 @@ async function dismissWelcome(openSettingsAfter = false): Promise<void> {
   if (openSettingsAfter) openSettings();
 }
 
-async function init(): Promise<void> {
+let hydrateStarted = false;
+
+/** 解锁后（或本来就没锁）才加载设置、草稿与同步状态。 */
+async function hydrate(): Promise<void> {
+  if (hydrateStarted) {
+    ui.textarea.focus();
+    return;
+  }
+  hydrateStarted = true;
   try {
     await refreshSettings();
     pinned = settings.pinned;
@@ -165,8 +192,8 @@ async function init(): Promise<void> {
     registerAutoHide();
 
     await initAutostart();
-
     await restoreDraft();
+    await refreshSyncStatus();
 
     appReady = true;
 
@@ -187,6 +214,25 @@ async function init(): Promise<void> {
     ui.textarea.focus();
   } catch (error) {
     toast(String(error), true);
+  } finally {
+    ui.card.classList.remove("booting");
+  }
+}
+
+async function init(): Promise<void> {
+  try {
+    const status = await getLockStatus();
+    paintLockButton(status);
+    if (status.warning) toast(status.warning, true);
+    if (status.configured && status.locked) {
+      await enterLockedMode(status);
+      ui.card.classList.remove("booting");
+      return;
+    }
+    await applyLockStatus(status);
+  } catch (error) {
+    toast(String(error), true);
+    ui.card.classList.remove("booting");
   }
 }
 
@@ -217,8 +263,36 @@ async function showStartupNotice(): Promise<boolean> {
 initDraft();
 initHistory();
 initSettingsPanel();
+initLockSettings();
 initSync();
 initUpdater();
+
+initAppLock({
+  onLocked: () => {
+    closeSettings(false);
+    closeHistory(false, true);
+    closeWelcome(false);
+    suspendHistoryForLock();
+  },
+  onUnlocked: async () => {
+    if (!appReady) {
+      await hydrate();
+    } else if (!anyPanelOpen()) {
+      ui.textarea.focus();
+    }
+  },
+});
+
+ui.lockButton.addEventListener("click", async () => {
+  if (isAppLocked()) return;
+  try {
+    // 先尽力保存草稿，再让后端上锁；上锁后草稿命令会被拦截。
+    await flushDraft();
+    await lockNow();
+  } catch (error) {
+    toast(String(error), true);
+  }
+});
 
 ui.welcomeStart.addEventListener("click", () => void dismissWelcome());
 ui.welcomeSettings.addEventListener("click", () => void dismissWelcome(true));
@@ -260,6 +334,19 @@ window.addEventListener(
   (event) => {
     // 输入法组合期间不处理任何全局快捷键：Esc 应只取消候选，Ctrl+S 也不该落盘
     if (event.isComposing || event.keyCode === 229) return;
+
+    if (isAppLocked()) {
+      trapFocus(event);
+      if (event.key === "Escape") event.preventDefault();
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        (event.key === "Enter" || event.key.toLowerCase() === "s")
+      ) {
+        event.preventDefault();
+      }
+      // 密码框自己的 Enter 监听仍会收到事件；这里只吞掉会离开锁屏/触发保存的组合。
+      return;
+    }
 
     if (isRecording()) {
       handleRecordingKey(event);
@@ -356,9 +443,27 @@ const reportListenerError = (error: unknown): void => {
   console.error("监听窗口事件失败", error);
 };
 
-void listen<ShowPayload>("window-shown", (event) => {
+void listen<ShowPayload>("window-shown", async (event) => {
   // 唤起瞬间可能有一次焦点切换，避免误触发失焦收起
   suppressBlurUntil = Date.now() + 600;
+  if (event.payload.locked) {
+    try {
+      const status = await getLockStatus();
+      await enterLockedMode(status);
+    } catch (error) {
+      toast(String(error), true);
+    }
+    return;
+  }
+  if (isAppLocked()) {
+    try {
+      const status = await getLockStatus();
+      await enterUnlockedMode(status);
+    } catch (error) {
+      toast(String(error), true);
+    }
+  }
+
   setSource(event.payload.source);
   if (!appReady) return;
   if (!ui.historyPanel.classList.contains("hidden")) {
@@ -374,11 +479,13 @@ void listen<ShowPayload>("window-shown", (event) => {
 }).catch(reportListenerError);
 
 void listen("open-settings", () => {
+  if (isAppLocked()) return;
   suppressBlurUntil = Date.now() + 600;
   openSettings();
 }).catch(reportListenerError);
 
 void listen("open-history", () => {
+  if (isAppLocked()) return;
   suppressBlurUntil = Date.now() + 600;
   openHistory();
 }).catch(reportListenerError);
