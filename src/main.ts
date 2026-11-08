@@ -35,7 +35,6 @@ import {
 import {
   applyLockStatus,
   enterLockedMode,
-  enterUnlockedMode,
   getLockStatus,
   initAppLock,
   isAppLocked,
@@ -213,6 +212,8 @@ async function hydrate(): Promise<void> {
 
     ui.textarea.focus();
   } catch (error) {
+    // 失败后允许下一次解锁重新 hydrate；否则整个进程都不会再加载草稿/设置。
+    hydrateStarted = false;
     toast(String(error), true);
   } finally {
     ui.card.classList.remove("booting");
@@ -458,7 +459,9 @@ void listen<ShowPayload>("window-shown", async (event) => {
   if (isAppLocked()) {
     try {
       const status = await getLockStatus();
-      await enterUnlockedMode(status);
+      // 状态可能仍是锁定（例如托盘刚上锁）：交给 applyLockStatus 分流，
+      // 不能无条件进入解锁态。
+      await applyLockStatus(status);
     } catch (error) {
       toast(String(error), true);
     }

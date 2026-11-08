@@ -91,10 +91,20 @@ export function hidePanel(panel: HTMLElement, animate = true): void {
   panelLeaveTimers.set(panel, timer);
 }
 
-/** 没有面板可见时恢复背景交互，焦点回到输入框而不是标题栏按钮。 */
+/** 内容面板（不含锁屏）：锁屏是独立遮罩，不需要 panel-open。 */
+function anyContentPanelOpen(): boolean {
+  return [ui.welcomePanel, ui.settingsPanel, ui.historyPanel].some(
+    (panel) => !panel.classList.contains("hidden"),
+  );
+}
+
+/** 没有内容面板可见时恢复背景交互，焦点回到输入框而不是标题栏按钮。 */
 export function afterPanelClosed(): void {
-  if (anyPanelOpen()) return;
+  if (anyContentPanelOpen()) return;
   ui.card.classList.remove("panel-open");
-  setBackgroundInert(false);
-  ui.textarea.focus();
+  // 锁屏还开着时保持背景 inert，也不要把焦点还给正文。
+  if (ui.lockPanel.classList.contains("hidden")) {
+    setBackgroundInert(false);
+    ui.textarea.focus();
+  }
 }

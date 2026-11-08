@@ -150,7 +150,16 @@ fn lock_status_from(state: &AppState) -> LockStatus {
         .app_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    runtime.status(unlock_minutes, theme, Instant::now(), SystemTime::now())
+    let status = runtime.status(unlock_minutes, theme, Instant::now(), SystemTime::now());
+    drop(runtime);
+    if status.locked {
+        // 到期或托盘上锁后不要再把上锁前的前台窗口标题写进下一条笔记。
+        *state
+            .last_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+    status
 }
 
 pub(crate) fn is_locked(app: &AppHandle) -> bool {
@@ -875,7 +884,8 @@ pub async fn load_draft(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn save_draft(app: AppHandle, content: String) -> Result<(), String> {
-    require_unlocked_app(&app)?;
+    // 草稿保存不做锁校验：上锁瞬间 500ms 防抖里的文字还没落盘，
+    // 拒绝保存会直接丢掉用户刚输入的内容。读取草稿仍受锁保护。
     run_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = io_guard(&state);

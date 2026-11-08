@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { paintLockButton, type LockStatus } from "./app-lock";
+import { applyLockStatus, paintLockButton, type LockStatus } from "./app-lock";
 import { ui } from "./dom";
 import { toast } from "./toast";
 
@@ -67,6 +67,8 @@ async function enable(): Promise<void> {
     });
     ui.lockNewPassword.value = "";
     ui.lockConfirmPassword.value = "";
+    // 后端在设置密码时记录了本次解锁，前端要跟着排有效期计时器。
+    await applyLockStatus(status);
     paint(status);
     toast("应用锁已启用");
   } catch (error) {
@@ -100,6 +102,7 @@ async function change(): Promise<void> {
     ui.lockCurrentPassword.value = "";
     ui.lockChangePassword.value = "";
     ui.lockChangeConfirm.value = "";
+    await applyLockStatus(status);
     paint(status);
     toast("应用锁密码已更新");
   } catch (error) {
@@ -120,6 +123,8 @@ async function disable(): Promise<void> {
   try {
     const status = await invoke<LockStatus>("disable_app_lock", { password });
     ui.lockDisablePassword.value = "";
+    // 关闭时如果到期计时器刚好把锁屏打开，这里要把锁屏收掉。
+    await applyLockStatus(status);
     paint(status);
     toast("应用锁已关闭");
   } catch (error) {
@@ -133,6 +138,7 @@ async function saveValidity(): Promise<void> {
   const minutes = Number(ui.lockValidity.value);
   try {
     const status = await invoke<LockStatus>("update_lock_validity", { minutes });
+    await applyLockStatus(status);
     paint(status);
     toast(`解锁有效期已设为 ${label(status.unlockMinutes)}`);
   } catch (error) {

@@ -689,6 +689,81 @@ describe("应用锁", () => {
     expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(true);
     expect(mocks.invoke).toHaveBeenCalledWith("get_settings");
     expect(mocks.invoke).toHaveBeenCalledWith("load_draft");
+    // 解锁后焦点直接回到输入框，第一次敲键盘就能写。
+    expect(document.activeElement).toBe(node<HTMLElement>("#note"));
+  });
+
+  it("hydration 期间再次上锁不会被解锁覆盖", async () => {
+    let locked = true;
+    let finishSettings: ((value: unknown) => void) | undefined;
+    await boot({
+      get_lock_status: () =>
+        lockStatus({
+          configured: true,
+          locked,
+          remainingSeconds: locked ? null : 1800,
+        }),
+      unlock: () => {
+        locked = false;
+        return lockStatus({ configured: true, locked: false, remainingSeconds: 1800 });
+      },
+      get_settings: () =>
+        new Promise((resolve) => {
+          finishSettings = resolve;
+        }),
+    });
+
+    node<HTMLInputElement>("#app-lock-password").value = "correct-pass";
+    node<HTMLButtonElement>("#app-lock-submit").click();
+    await flush();
+
+    // hydrate 卡在 get_settings 时，托盘上锁
+    locked = true;
+    handler("app-locked")({});
+    await flush();
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+
+    // 旧的解锁请求返回后，不能把新的锁屏收掉
+    finishSettings?.({ ...baseSettings });
+    await flush();
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+    expect(node<HTMLElement>("#card").classList.contains("locked")).toBe(true);
+  });
+
+  it("启用应用锁后到期会重新上锁", async () => {
+    vi.useFakeTimers();
+    let locked = false;
+    let configured = false;
+    await boot({
+      get_lock_status: () =>
+        lockStatus({
+          configured,
+          locked,
+          remainingSeconds: configured && !locked ? 1 : null,
+        }),
+      set_app_lock_password: () => {
+        configured = true;
+        return lockStatus({
+          configured: true,
+          locked: false,
+          remainingSeconds: 1,
+        });
+      },
+    });
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    node<HTMLInputElement>("#lock-new-password").value = "12345678";
+    node<HTMLInputElement>("#lock-confirm-password").value = "12345678";
+    node<HTMLButtonElement>("#lock-enable").click();
+    await flush();
+
+    locked = true;
+    await vi.advanceTimersByTimeAsync(1500);
+    await flush();
+
+    expect(node<HTMLElement>("#app-lock").classList.contains("hidden")).toBe(false);
+    vi.useRealTimers();
   });
 
   it("标题栏按钮主动上锁", async () => {

@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { applyTheme } from "./appearance";
 import { ui } from "./dom";
 import { normalizeTheme } from "./lib";
-import { setBackgroundInert } from "./panels";
+import { anyPanelOpen, setBackgroundInert } from "./panels";
 
 export interface LockStatus {
   configured: boolean;
@@ -32,6 +32,8 @@ let expiryTimer: number | undefined;
 let retryTimer: number | undefined;
 let retryRemaining = 0;
 let submitting = false;
+/** 每次进入锁屏自增，用来识别 hydration 期间又发生了一次上锁。 */
+let lockGeneration = 0;
 
 export function isAppLocked(): boolean {
   return locked;
@@ -67,6 +69,16 @@ export function initAppLock(nextHooks: LockHooks): void {
       console.error("处理应用锁事件失败", error);
     }
   }).catch((error) => console.error("监听应用锁事件失败", error));
+
+  // 系统时间前跳或休眠恢复后，后端可能已按墙上时钟上锁；回到窗口时补查一次。
+  window.addEventListener("focus", () => {
+    void getLockStatus()
+      .then((status) => {
+        if (status.configured && status.locked) return enterLockedMode(status);
+        return undefined;
+      })
+      .catch((error) => console.error("检查应用锁状态失败", error));
+  });
 }
 
 function clearExpiryTimer(): void {
@@ -123,6 +135,7 @@ export async function enterLockedMode(status: LockStatus): Promise<void> {
   applyTheme(normalizeTheme(status.theme));
   currentStatus = status;
   locked = true;
+  lockGeneration += 1;
   submitting = false;
   clearExpiryTimer();
   hooks.onLocked();
@@ -142,6 +155,7 @@ export async function enterLockedMode(status: LockStatus): Promise<void> {
 export async function enterUnlockedMode(status: LockStatus): Promise<void> {
   currentStatus = status;
   const wasLocked = locked;
+  const generation = lockGeneration;
   clearExpiryTimer();
   clearRetryTimer();
   ui.lockPassword.disabled = false;
@@ -152,11 +166,20 @@ export async function enterUnlockedMode(status: LockStatus): Promise<void> {
   // 首次解锁时在遮罩下面完成 hydration，避免正文闪一下。
   await hooks.onUnlocked();
 
+  // hydration 期间可能又上锁了：不能把新的锁屏覆盖掉。
+  // 注意不能用 `locked` 判断——进入本函数时它本来就已经是 true。
+  if (generation !== lockGeneration) return;
+
   locked = false;
   ui.lockPassword.value = "";
   ui.lockPanel.classList.add("hidden");
   ui.card.classList.remove("locked");
   if (wasLocked) setBackgroundInert(false);
+  // 锁屏关闭时如果也没有其他面板，顺手清掉 panel-open，并把焦点还给输入框。
+  if (!anyPanelOpen()) {
+    ui.card.classList.remove("panel-open");
+    ui.textarea.focus();
+  }
   paintLockButton(status);
   scheduleExpiry(status);
 }
@@ -180,6 +203,26 @@ export function scheduleExpiry(status: LockStatus): void {
       }
     } catch (error) {
       console.error("检查解锁有效期失败", error);
+      // 查询失败不能一直保持解锁：稍后重试，仍失败就按已锁定处理。
+      expiryTimer = window.setTimeout(async () => {
+        try {
+          const next = await getLockStatus();
+          if (next.configured && next.locked) {
+            await enterLockedMode(next);
+          } else {
+            scheduleExpiry(next);
+          }
+        } catch (retryError) {
+          console.error("检查解锁有效期失败", retryError);
+          if (currentStatus?.configured) {
+            await enterLockedMode({
+              ...currentStatus,
+              locked: true,
+              remainingSeconds: null,
+            });
+          }
+        }
+      }, 5_000);
     }
   }, delay);
 }
@@ -234,7 +277,8 @@ async function submitPassword(): Promise<void> {
     }
   } finally {
     submitting = false;
-    if (retryRemaining <= 0) {
+    // 解锁成功后锁屏已经收起，不要再把焦点抢到隐藏的密码框上。
+    if (retryRemaining <= 0 && isAppLocked()) {
       ui.lockSubmit.disabled = false;
       ui.lockPassword.disabled = false;
       ui.lockPassword.focus();
