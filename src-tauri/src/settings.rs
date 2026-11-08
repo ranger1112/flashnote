@@ -124,6 +124,32 @@ impl SyncSettings {
     }
 }
 
+/// 应用锁策略。密码验证器只进 Windows 凭据管理器，不在设置文件里。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LockSettings {
+    /// 解锁后固定的有效期（分钟），只接受 30 / 120 / 240 / 480 / 1440。
+    pub unlock_minutes: u32,
+}
+
+impl Default for LockSettings {
+    fn default() -> Self {
+        Self { unlock_minutes: 30 }
+    }
+}
+
+impl LockSettings {
+    pub const ALLOWED_MINUTES: [u32; 5] = [30, 120, 240, 480, 1440];
+
+    pub fn normalize_minutes(value: u32) -> u32 {
+        if Self::ALLOWED_MINUTES.contains(&value) {
+            value
+        } else {
+            30
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -150,6 +176,8 @@ pub struct Settings {
     pub window: Option<WindowGeometry>,
     /// WebDAV 同步参数；默认关闭，不配置时不产生任何网络请求。
     pub sync: SyncSettings,
+    /// 应用锁策略；密码验证器在 Windows 凭据管理器里。
+    pub lock: LockSettings,
 }
 
 impl Default for Settings {
@@ -169,6 +197,7 @@ impl Default for Settings {
             background_opacity: 1.0,
             window: None,
             sync: SyncSettings::default(),
+            lock: LockSettings::default(),
         }
     }
 }
@@ -237,6 +266,7 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     settings.background_opacity = clamp_opacity(settings.background_opacity);
     settings.sync.interval_minutes =
         SyncSettings::normalize_interval(settings.sync.interval_minutes);
+    settings.lock.unlock_minutes = LockSettings::normalize_minutes(settings.lock.unlock_minutes);
     settings
 }
 
@@ -640,6 +670,7 @@ mod tests {
                 scale: Some(1.0),
             }),
             sync: SyncSettings::default(),
+            lock: LockSettings::default(),
         };
 
         save(&path, &settings).unwrap();
@@ -692,6 +723,34 @@ mod tests {
     }
 
     #[test]
+    fn lock_minutes_only_accepts_presets() {
+        let dir = temp_dir("lock-minutes");
+        let path = dir.join("settings.json");
+
+        fs::write(
+            &path,
+            r#"{"notesDir":"D:\\Notes","lock":{"unlockMinutes":7}}"#,
+        )
+        .unwrap();
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings.lock.unlock_minutes, 30);
+        assert_eq!(loaded.settings.notes_dir, "D:\\Notes");
+
+        fs::write(&path, r#"{"lock":{"unlockMinutes":120}}"#).unwrap();
+        assert_eq!(load_from_path(&path).settings.lock.unlock_minutes, 120);
+
+        fs::write(&path, r#"{"lock":{"unlockMinutes":-1}}"#).unwrap();
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings.lock.unlock_minutes, 30);
+        assert!(loaded.warning.is_none(), "非法值只纠正字段，不算损坏");
+
+        fs::write(&path, r#"{"lock":{"unlockMinutes":"120"}}"#).unwrap();
+        assert_eq!(load_from_path(&path).settings.lock.unlock_minutes, 30);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn partial_file_falls_back_to_defaults() {
         let dir = temp_dir("partial");
         let path = dir.join("settings.json");
@@ -707,6 +766,7 @@ mod tests {
         assert!(!loaded.settings.history_preview);
         assert!(loaded.settings.auto_update, "老配置缺字段时默认检查更新");
         assert!(loaded.settings.onboarded, "老配置缺字段时视为已完成引导");
+        assert_eq!(loaded.settings.lock.unlock_minutes, 30, "老配置默认半小时");
         assert_eq!(loaded.settings.theme, "system", "老配置缺字段时跟随系统");
         assert!(!loaded.settings.auto_hide_on_blur);
         assert_eq!(loaded.settings.background_opacity, 1.0);

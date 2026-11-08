@@ -13,6 +13,7 @@ import { hidePanel, showPanel } from "./panels";
 import { toast } from "./toast";
 import { paintSyncForm, refreshSyncStatus } from "./sync";
 import { startAutoUpdateChecks } from "./updater";
+import { refreshLockSettings } from "./lock-settings";
 
 let recording = false;
 
@@ -118,6 +119,7 @@ export function showSettingsPanel(): void {
   paintSyncForm();
   void refreshSyncStatus();
   void paintGitStatus();
+  void refreshLockSettings();
   ui.hotkeyError.textContent = "";
   showPanel(ui.settingsPanel);
   ui.settingsClose.focus();

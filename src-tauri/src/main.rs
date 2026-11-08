@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_lock;
 mod commands;
 mod files;
 mod geometry;
@@ -122,6 +123,10 @@ pub struct AppState {
     pub settings_read_failed: bool,
     /// 最近一次自动 Git 提交的结果，供设置页显示失败原因。
     pub(crate) git: Mutex<git_backup::GitCommitState>,
+    /// 应用锁：配置状态、解锁截止时间与失败退避。
+    pub(crate) app_lock: Mutex<app_lock::runtime::LockRuntime>,
+    /// 串行化 Argon2 校验，避免并发尝试把 CPU 打满。
+    pub(crate) lock_verify: tokio::sync::Mutex<()>,
     startup_notice: Mutex<Option<StartupNotice>>,
 }
 
@@ -224,6 +229,10 @@ fn main() {
                 open_settings,
             });
             let first_run = !settings.onboarded;
+            let lock_runtime = app_lock::runtime::LockRuntime::from_store();
+            if let Some(warning) = lock_runtime.warning() {
+                log::warn!("{warning}");
+            }
 
             handle.manage(AppState {
                 settings: Mutex::new(settings),
@@ -236,6 +245,8 @@ fn main() {
                 settings_write_lock: Mutex::new(()),
                 settings_read_failed,
                 git: Mutex::new(git_backup::GitCommitState::default()),
+                app_lock: Mutex::new(lock_runtime),
+                lock_verify: tokio::sync::Mutex::new(()),
                 startup_notice: Mutex::new(startup_notice),
             });
 
@@ -303,6 +314,12 @@ fn main() {
             commands::sync_now,
             commands::flush_sync_state,
             commands::app_version,
+            commands::get_lock_status,
+            commands::unlock,
+            commands::lock_now,
+            commands::set_app_lock_password,
+            commands::disable_app_lock,
+            commands::update_lock_validity,
         ])
         .build(tauri::generate_context!());
 

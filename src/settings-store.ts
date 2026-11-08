@@ -10,6 +10,16 @@ import { ui } from "./dom";
 
 export type SyncKind = "webdav" | "github";
 
+export interface LockSettings {
+  unlockMinutes: number;
+}
+
+export const LOCK_MINUTES = [30, 120, 240, 480, 1440];
+
+export function normalizeLockMinutes(value: number): number {
+  return LOCK_MINUTES.includes(value) ? value : 30;
+}
+
 export interface SyncSettings {
   kind: SyncKind;
   enabled: boolean;
@@ -35,6 +45,7 @@ export interface Settings {
   backgroundOpacity: number;
   window: unknown;
   sync: SyncSettings;
+  lock: LockSettings;
 }
 
 export let settings: Settings = {
@@ -60,6 +71,9 @@ export let settings: Settings = {
     allowInsecureHttp: false,
     deviceName: "",
   },
+  lock: {
+    unlockMinutes: 30,
+  },
 };
 
 /** 把当前 settings 回填到设置面板的各个控件。 */
@@ -79,6 +93,8 @@ export async function refreshSettings(): Promise<void> {
   settings = await invoke<Settings>("get_settings");
   settings.theme = normalizeTheme(settings.theme);
   settings.backgroundOpacity = clampOpacity(settings.backgroundOpacity);
+  if (!settings.lock) settings.lock = { unlockMinutes: 30 };
+  settings.lock.unlockMinutes = normalizeLockMinutes(settings.lock.unlockMinutes);
   applyTheme(settings.theme);
   paintSettings();
 }
