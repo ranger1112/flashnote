@@ -1,8 +1,9 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tauri::{AppHandle, Manager};
 
@@ -176,6 +177,9 @@ impl Default for Settings {
 pub struct LoadedSettings {
     pub settings: Settings,
     pub warning: Option<String>,
+    /// 设置文件存在但读不出来（被锁、权限等）。本次运行禁止写回，避免用
+    /// 默认值覆盖仍然有效的原文件。
+    pub read_failed: bool,
 }
 
 pub fn settings_path(app: &AppHandle) -> PathBuf {
@@ -201,11 +205,30 @@ pub fn load(app: &AppHandle) -> LoadedSettings {
     loaded
 }
 
+/// 读设置文件。杀软或同步盘可能短暂锁住文件，重试几次再放弃。
+fn read_settings_file(path: &Path) -> io::Result<String> {
+    let mut last = None;
+    for attempt in 0..3 {
+        match fs::read_to_string(path) {
+            Ok(raw) => return Ok(raw),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(err),
+            Err(err) => {
+                last = Some(err);
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(80));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("读取设置文件失败")))
+}
+
 /// 读取指定路径的设置文件。损坏时先备份原文件，再返回默认值。
 pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     let mut warning = None;
+    let mut read_failed = false;
 
-    let mut settings = match fs::read_to_string(path) {
+    let mut settings = match read_settings_file(path) {
         Ok(raw) => match parse_settings(&raw) {
             // 手工编辑出的非法值只纠正字段，不把整份设置当成损坏
             Ok(mut parsed) => {
@@ -230,9 +253,13 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
                 recovered_default()
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Settings::default(),
         Err(err) => {
-            log::warn!("读取设置文件失败（{}）：{err}", path.display());
+            log::error!("读取设置文件失败（{}）：{err}", path.display());
+            // 读不出来 ≠ 没有设置。用默认值继续运行，但本次运行不能写回，
+            // 否则一次瞬时锁文件就会把笔记目录、快捷键和云同步配置全部抹掉。
+            read_failed = true;
+            warning = Some("设置文件暂时无法读取，本次运行的修改不会保存；请重启应用".to_string());
             recovered_default()
         }
     };
@@ -240,7 +267,11 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     // 手改出的相对路径会跟着进程 CWD 漂移（自启动 vs 手动启动），读到时就固定成绝对路径
     settings.notes_dir = absolute_notes_dir(&settings.notes_dir);
 
-    LoadedSettings { settings, warning }
+    LoadedSettings {
+        settings,
+        warning,
+        read_failed,
+    }
 }
 
 /// 宽松解析：单个字段类型写错（例如 `intervalMinutes` 写成字符串）时只丢弃该

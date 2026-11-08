@@ -118,6 +118,8 @@ pub struct AppState {
     pub settings_last_saved_seq: AtomicU64,
     /// 串行化设置文件写入，避免两个快照同时写同一个临时文件。
     pub settings_write_lock: Mutex<()>,
+    /// 启动时设置文件读不出来：本次运行不写回，避免默认值覆盖原文件。
+    pub settings_read_failed: bool,
     /// 最近一次自动 Git 提交的结果，供设置页显示失败原因。
     pub(crate) git: Mutex<git_backup::GitCommitState>,
     startup_notice: Mutex<Option<StartupNotice>>,
@@ -169,6 +171,7 @@ fn main() {
             let handle = app.handle().clone();
             let loaded = settings::load(&handle);
             let settings_path = settings::settings_path(&handle);
+            let settings_read_failed = loaded.read_failed;
             let mut settings = loaded.settings;
             let mut notices = Vec::new();
             let mut open_settings = false;
@@ -195,8 +198,10 @@ fn main() {
                     Some(candidate) => {
                         log::warn!("已改用备用快捷键 {candidate}");
                         settings.hotkey = candidate.to_string();
-                        if let Err(save_err) = settings::save(&settings_path, &settings) {
-                            log::error!("保存备用快捷键失败：{save_err}");
+                        if !settings_read_failed {
+                            if let Err(save_err) = settings::save(&settings_path, &settings) {
+                                log::error!("保存备用快捷键失败：{save_err}");
+                            }
                         }
                         notices.push(format!(
                             "快捷键 {failed} 被占用，已临时改用 {candidate}，可在设置中修改"
@@ -229,6 +234,7 @@ fn main() {
                 settings_write_seq: AtomicU64::new(0),
                 settings_last_saved_seq: AtomicU64::new(0),
                 settings_write_lock: Mutex::new(()),
+                settings_read_failed,
                 git: Mutex::new(git_backup::GitCommitState::default()),
                 startup_notice: Mutex::new(startup_notice),
             });

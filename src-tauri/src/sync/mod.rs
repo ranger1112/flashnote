@@ -551,10 +551,16 @@ impl<B: SyncBackend> SyncEngine<B> {
             && deletions * 100 > tracked.saturating_mul(DELETE_RATIO_PERCENT);
         // 「本地消失」只算本地真的没了的已跟踪文件：TrashLocal 是远端删除传播到
         // 本地，本地内容还在，不属于「目录被清空」。Forget 也算，避免远端刚好已删
-        // 掉一两篇时差几个数漏判。
+        // 掉一两篇时差几个数漏判。RestoreLocal 同样是「本地没了、远端还在」，
+        // 漏掉它会让目录被清空时仍删掉那些远端没变的文件。
         let local_gone = plans
             .iter()
-            .filter(|(_, action)| matches!(action, Action::DeleteRemote | Action::Forget))
+            .filter(|(_, action)| {
+                matches!(
+                    action,
+                    Action::DeleteRemote | Action::Forget | Action::RestoreLocal
+                )
+            })
             .count();
         let remote_deletes = plans
             .iter()
@@ -742,9 +748,12 @@ impl<B: SyncBackend> SyncEngine<B> {
                     }
                     // 版本令牌可能来自 GET 与 PROPFIND 两个来源。内容与我们上次
                     // 同步的完全一致时，只把列表版本补进记录，避免反复下载。
-                    if record
-                        .as_ref()
-                        .is_some_and(|record| sha256_base64(&bytes) == record.remote_sha256)
+                    // 仅限 Download：RestoreLocal 表示本地文件已经不存在，必须
+                    // 先把内容写回去，否则下一轮会把它当成用户删除而删掉远端。
+                    if matches!(action, Action::Download)
+                        && record
+                            .as_ref()
+                            .is_some_and(|record| sha256_base64(&bytes) == record.remote_sha256)
                     {
                         let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
                         self.commit(name, &bytes, version, summary).await;
@@ -1677,6 +1686,28 @@ mod tests {
     }
 
     #[test]
+    fn restore_local_writes_the_file_instead_of_recording_a_missing_one() {
+        let backend = FakeBackend::strong();
+        let harness = Harness::with_backend("restore-local-dedupe", backend.clone());
+        let text = "# 2026-10-23\n\n- 10:00 a\n";
+        harness.write("2026-10-23.md", text);
+        assert_eq!(harness.run().uploaded, 1);
+
+        // 本地文件意外消失，同时远端版本令牌漂移但内容没变。
+        fs::remove_file(harness.notes.join("2026-10-23.md")).unwrap();
+        backend.diverge_list_versions();
+
+        let summary = harness.run();
+        assert_eq!(summary.downloaded, 1, "{summary:?}");
+        assert_eq!(harness.read("2026-10-23.md"), text);
+
+        // 下一轮不能把远端唯一副本当成用户删除。
+        let summary = harness.run();
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert!(backend.content("2026-10-23.md").is_some());
+    }
+
+    #[test]
     fn concurrent_edits_converge_without_duplicates() {
         let backend = FakeBackend::strong();
         let first = Harness::with_backend("converge-a", backend.clone());
@@ -1830,6 +1861,42 @@ mod tests {
         assert!(!summary.aborted, "{summary:?}");
         assert!(summary.errors.iter().any(|error| error.contains("安全阀")));
         assert_eq!(harness.backend.names().len(), 3);
+    }
+
+    #[test]
+    fn safety_valve_counts_restore_local_as_a_missing_local_file() {
+        let backend = FakeBackend::strong();
+        let harness = Harness::with_backend("valve-restore-local", backend.clone());
+        for day in 1..=4 {
+            harness.write(
+                &format!("2026-10-{day:02}.md"),
+                &format!("# 2026-10-{day:02}\n"),
+            );
+        }
+        harness.run();
+
+        // 目录被清空，同时另一台设备改了其中两篇：这两篇会走 RestoreLocal。
+        for day in 1..=4 {
+            fs::remove_file(harness.notes.join(format!("2026-10-{day:02}.md"))).unwrap();
+        }
+        backend.put_remote(
+            "2026-10-01.md",
+            b"# 2026-10-01\n\n- 11:00 changed\n".to_vec(),
+        );
+        backend.put_remote(
+            "2026-10-02.md",
+            b"# 2026-10-02\n\n- 11:00 changed\n".to_vec(),
+        );
+
+        let summary = harness.run();
+        assert!(
+            summary.errors.iter().any(|error| error.contains("安全阀")),
+            "{summary:?}"
+        );
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        // 未变的远端文件不能被删。
+        assert!(backend.content("2026-10-03.md").is_some());
+        assert!(backend.content("2026-10-04.md").is_some());
     }
 
     #[test]

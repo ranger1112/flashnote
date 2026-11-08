@@ -23,24 +23,15 @@ pub(crate) fn io_guard(state: &AppState) -> MutexGuard<'_, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-
-/// 路径本身是不是符号链接/重解析点；只查路径，不跟随目标。
+/// 路径本身是不是符号链接/目录联接；只查路径，不跟随目标。
+///
+/// 不能只看 `FILE_ATTRIBUTE_REPARSE_POINT`：OneDrive「按需文件」的云端占位符
+/// 也带这个属性（实测 0x401620），但它们就是普通笔记文件。`FileType::is_symlink`
+/// 会继续检查重解析标签，只把符号链接与 junction 算作链接。
 pub(crate) fn is_reparse_point(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        fs::symlink_metadata(path)
-            .map(|meta| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        fs::symlink_metadata(path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-    }
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// 拒绝写入重解析点，避免把笔记/同步内容写到链接目标（可能是目录外文件）。
