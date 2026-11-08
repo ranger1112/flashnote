@@ -108,7 +108,11 @@ function paintSyncIndicator(status: SyncStatus): void {
   if (status.lastSyncAt) {
     el.textContent = "已同步";
     el.classList.add("synced");
-    el.title = `上次同步 ${formatTime(status.lastSyncAt)}`;
+    const warnings = status.summary?.warnings ?? [];
+    el.title =
+      warnings.length > 0
+        ? `上次同步 ${formatTime(status.lastSyncAt)}；${warnings.join("；")}`
+        : `上次同步 ${formatTime(status.lastSyncAt)}`;
   } else {
     el.textContent = "等待同步";
   }
@@ -143,6 +147,13 @@ export function describeStatus(status: SyncStatus): string[] {
         `上传 ${summary.uploaded} · 下载 ${summary.downloaded} · 合并 ${summary.merged} · 删除 ${summary.deleted}`,
       );
     }
+    // 警告（超过 2 MiB、文件读不了等）以前只留在后端日志里，界面照样显示
+    // 「已同步」；这里至少把第一条摆到状态行上。
+    if (summary.warnings.length > 0) {
+      const rest =
+        summary.warnings.length > 1 ? `（共 ${summary.warnings.length} 条）` : "";
+      parts.push(`${summary.warnings[0]}${rest}`);
+    }
   }
   return parts;
 }
@@ -159,8 +170,15 @@ export function paintSyncStatus(status: SyncStatus): void {
     ui.syncError.textContent = "";
   }
 
+  const hasWarnings = Boolean(
+    status.summary?.warnings.length &&
+      status.configured &&
+      status.enabled &&
+      !status.running &&
+      !status.lastError,
+  );
   ui.syncStatusText.textContent = describeStatus(status).join(" · ");
-  ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded));
+  ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded) || hasWarnings);
   ui.syncStatusText.classList.toggle("bad", Boolean(status.lastError));
 
   ui.syncFootStatus.textContent =

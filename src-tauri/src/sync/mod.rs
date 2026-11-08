@@ -848,6 +848,16 @@ impl<B: SyncBackend> SyncEngine<B> {
                             } else {
                                 result.text.clone()
                             };
+                        // 合并结果超过协议上限时不能上传：本地会被扫描永久跳过，
+                        // 远端也会被 GitHub 拒绝。退回冲突副本，至少两边内容都留着。
+                        if merged_text.len() as u64 > MAX_FILE_BYTES {
+                            summary
+                                .warnings
+                                .push(format!("{name}：合并结果超过 2 MiB，已改为保存冲突副本"));
+                            self.conflict_copy(name, local, &remote_text, remote_version, summary)
+                                .await;
+                            return;
+                        }
                         if merged_text != local.text {
                             if let Err(error) = self
                                 .write_local(

@@ -83,12 +83,20 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// explorer 不认 `\\?\` verbatim 前缀，遇到会直接报「找不到文件」；先剥掉再传。
+/// UNC 路径的 verbatim 形式是 `\\?\UNC\server\share`，剥完要还原成 `\\server\share`。
+fn explorer_path(display: &str) -> String {
+    if let Some(rest) = display.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        display.strip_prefix(r"\\?\").unwrap_or(display).to_string()
+    }
+}
+
 fn open_with_explorer(path: &Path) -> Result<(), String> {
-    // explorer 不认 `\\?\` verbatim 前缀，遇到会直接报「找不到文件」；先剥掉再传
     let display = path.to_string_lossy();
-    let target = display.strip_prefix(r"\\?\").unwrap_or(&display);
     std::process::Command::new("explorer")
-        .arg(target)
+        .arg(explorer_path(&display))
         .spawn()
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -170,6 +178,9 @@ fn ensure_note_file(dir: &Path, date: &str) -> Result<PathBuf, String> {
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(format!("创建今日笔记失败：{err}")),
     }
+    // 已存在时也要确认不是符号链接：托盘「打开今日笔记」会把它交给系统，
+    // 共享目录里预先放好的链接可能把 ShellExecuteW 引到目录外。
+    reject_reparse(&path).map_err(|err| format!("今日笔记不可用：{err}"))?;
     Ok(path)
 }
 
@@ -502,6 +513,16 @@ mod tests {
             preserve_line_endings("# d\n\n- 10:00 a", "# d\n\n- 11:00 b\n".into()),
             "# d\n\n- 11:00 b"
         );
+    }
+
+    #[test]
+    fn explorer_path_strips_verbatim_prefixes() {
+        assert_eq!(explorer_path(r"\\?\C:\notes\a.md"), r"C:\notes\a.md");
+        assert_eq!(
+            explorer_path(r"\\?\UNC\nas\notes\a.md"),
+            r"\\nas\notes\a.md"
+        );
+        assert_eq!(explorer_path(r"\\nas\notes\a.md"), r"\\nas\notes\a.md");
     }
 
     #[test]
