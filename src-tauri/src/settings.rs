@@ -1,8 +1,9 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tauri::{AppHandle, Manager};
 
@@ -176,6 +177,9 @@ impl Default for Settings {
 pub struct LoadedSettings {
     pub settings: Settings,
     pub warning: Option<String>,
+    /// 设置文件存在但读不出来（被锁、权限等）。本次运行禁止写回，避免用
+    /// 默认值覆盖仍然有效的原文件。
+    pub read_failed: bool,
 }
 
 pub fn settings_path(app: &AppHandle) -> PathBuf {
@@ -201,20 +205,55 @@ pub fn load(app: &AppHandle) -> LoadedSettings {
     loaded
 }
 
+/// 只有这类错误值得重试：杀软/同步盘短暂锁住文件。
+fn transient_read_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+    )
+}
+
+/// 读设置文件。杀软或同步盘可能短暂锁住文件，重试几次再放弃。
+fn read_settings_file(path: &Path) -> io::Result<String> {
+    let mut attempt = 0;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(raw) => return Ok(raw),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(err),
+            Err(err) if transient_read_error(err.kind()) && attempt < 2 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn normalize_settings(mut settings: Settings) -> Settings {
+    settings.theme = normalize_theme(&settings.theme);
+    settings.background_opacity = clamp_opacity(settings.background_opacity);
+    settings.sync.interval_minutes =
+        SyncSettings::normalize_interval(settings.sync.interval_minutes);
+    settings
+}
+
+/// 上次成功保存的副本。主文件被杀软/同步盘锁住或写坏时用它恢复配置。
+fn good_path(path: &Path) -> PathBuf {
+    path.with_file_name("settings.json.good")
+}
+
 /// 读取指定路径的设置文件。损坏时先备份原文件，再返回默认值。
 pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
     let mut warning = None;
+    let mut read_failed = false;
 
-    let mut settings = match fs::read_to_string(path) {
+    let mut settings = match read_settings_file(path) {
         Ok(raw) => match parse_settings(&raw) {
             // 手工编辑出的非法值只纠正字段，不把整份设置当成损坏
-            Ok(mut parsed) => {
-                parsed.theme = normalize_theme(&parsed.theme);
-                parsed.background_opacity = clamp_opacity(parsed.background_opacity);
-                parsed.sync.interval_minutes =
-                    SyncSettings::normalize_interval(parsed.sync.interval_minutes);
-                parsed
-            }
+            Ok(parsed) => normalize_settings(parsed),
             Err(err) => {
                 log::error!("设置文件解析失败（{}）：{err}", path.display());
                 warning = Some(match backup_corrupt(path) {
@@ -230,17 +269,41 @@ pub(crate) fn load_from_path(path: &Path) -> LoadedSettings {
                 recovered_default()
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Settings::default(),
         Err(err) => {
-            log::warn!("读取设置文件失败（{}）：{err}", path.display());
-            recovered_default()
+            log::error!("读取设置文件失败（{}）：{err}", path.display());
+            // 读不出来 ≠ 没有设置。优先用上次成功保存的副本，至少笔记目录和
+            // 同步配置是对的；本次运行不写回，避免覆盖仍然有效的原文件。
+            read_failed = true;
+            match read_settings_file(&good_path(path))
+                .and_then(|raw| parse_settings(&raw).map_err(io::Error::other))
+            {
+                Ok(parsed) => {
+                    warning = Some(
+                        "设置文件暂时无法读取，已使用上次成功保存的配置；本次运行的修改不会保存"
+                            .to_string(),
+                    );
+                    normalize_settings(parsed)
+                }
+                Err(_) => {
+                    warning = Some(
+                        "设置文件暂时无法读取，本次运行使用默认设置且不会保存；请检查文件权限后重启"
+                            .to_string(),
+                    );
+                    recovered_default()
+                }
+            }
         }
     };
 
     // 手改出的相对路径会跟着进程 CWD 漂移（自启动 vs 手动启动），读到时就固定成绝对路径
     settings.notes_dir = absolute_notes_dir(&settings.notes_dir);
 
-    LoadedSettings { settings, warning }
+    LoadedSettings {
+        settings,
+        warning,
+        read_failed,
+    }
 }
 
 /// 宽松解析：单个字段类型写错（例如 `intervalMinutes` 写成字符串）时只丢弃该
@@ -391,7 +454,12 @@ pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
     }
     let data = serde_json::to_vec_pretty(settings)
         .map_err(|err| std::io::Error::other(err.to_string()))?;
-    crate::files::write_atomic(path, &data)
+    crate::files::write_atomic(path, &data)?;
+    // 上次成功保存的副本：主文件读不出来时用它恢复配置。
+    if let Err(err) = crate::files::write_atomic(&good_path(path), &data) {
+        log::warn!("写入设置备份失败：{err}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -597,6 +665,28 @@ mod tests {
             (geometry.x, geometry.y, geometry.w, geometry.h),
             (-120, 40, 480, 360)
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn good_copy_is_used_when_the_main_file_cannot_be_read() {
+        let dir = temp_dir("good-copy");
+        let path = dir.join("settings.json");
+        let settings = Settings {
+            notes_dir: "D:\\GoodNotes".to_string(),
+            hotkey: "ctrl+shift+g".to_string(),
+            ..Settings::default()
+        };
+        save(&path, &settings).unwrap();
+
+        // 主文件变成非 UTF-8：读不出来，但上次成功保存的副本还在。
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let loaded = load_from_path(&path);
+        assert!(loaded.read_failed, "读失败时本次运行不能写回");
+        assert_eq!(loaded.settings.notes_dir, "D:\\GoodNotes");
+        assert_eq!(loaded.settings.hotkey, "ctrl+shift+g");
+        assert!(loaded.warning.is_some());
 
         let _ = fs::remove_dir_all(&dir);
     }

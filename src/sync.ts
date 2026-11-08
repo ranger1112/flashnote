@@ -108,10 +108,21 @@ function paintSyncIndicator(status: SyncStatus): void {
   if (status.lastSyncAt) {
     el.textContent = "已同步";
     el.classList.add("synced");
-    el.title = `上次同步 ${formatTime(status.lastSyncAt)}`;
+    const warnings = status.summary?.warnings ?? [];
+    el.title =
+      warnings.length > 0
+        ? `上次同步 ${formatTime(status.lastSyncAt)}；${warnings.join("；")}`
+        : `上次同步 ${formatTime(status.lastSyncAt)}`;
   } else {
     el.textContent = "等待同步";
   }
+}
+
+/** 上一轮明细/警告是否应该显示：未配置、关闭、同步中或有错误时都不显示。 */
+function summaryVisible(status: SyncStatus): boolean {
+  return Boolean(
+    status.summary && status.configured && status.enabled && !status.running && !status.lastError,
+  );
 }
 
 /** 一句话状态：设置区显示完整版，历史面板只显示第一段。 */
@@ -135,13 +146,20 @@ export function describeStatus(status: SyncStatus): string[] {
 
   // 只有启用中的配置才展示上一轮明细，否则「未配置」旁边挂一串数字很误导
   const summary = status.summary;
-  if (summary && status.configured && status.enabled && !status.running && !status.lastError) {
+  if (summary && summaryVisible(status)) {
     const changed =
       summary.uploaded + summary.downloaded + summary.merged + summary.deleted;
     if (changed > 0) {
       parts.push(
         `上传 ${summary.uploaded} · 下载 ${summary.downloaded} · 合并 ${summary.merged} · 删除 ${summary.deleted}`,
       );
+    }
+    // 警告（超过 2 MiB、文件读不了等）以前只留在后端日志里，界面照样显示
+    // 「已同步」；这里至少把第一条摆到状态行上。
+    if (summary.warnings.length > 0) {
+      const rest =
+        summary.warnings.length > 1 ? `（共 ${summary.warnings.length} 条）` : "";
+      parts.push(`${summary.warnings[0]}${rest}`);
     }
   }
   return parts;
@@ -159,8 +177,9 @@ export function paintSyncStatus(status: SyncStatus): void {
     ui.syncError.textContent = "";
   }
 
+  const hasWarnings = Boolean(status.summary?.warnings.length && summaryVisible(status));
   ui.syncStatusText.textContent = describeStatus(status).join(" · ");
-  ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded));
+  ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded) || hasWarnings);
   ui.syncStatusText.classList.toggle("bad", Boolean(status.lastError));
 
   ui.syncFootStatus.textContent =

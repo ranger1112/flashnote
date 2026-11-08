@@ -232,6 +232,41 @@ describe("编辑保护", () => {
     expect(reopened?.value).toBe(editorValue);
   });
 
+  it("保存期间继续输入时保留编辑器，不丢掉新文字", async () => {
+    notes = [entry("09:00", "旧内容")];
+    let finish: ((tags: string[]) => void) | undefined;
+    await boot({
+      update_note_entry: () =>
+        new Promise<string[]>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await openHistory();
+
+    editButton().click();
+    await flush();
+    const editor = node<HTMLTextAreaElement>(".entry-edit");
+    editor.value = "第一版";
+    node<HTMLButtonElement>(".entry-edit-actions .btn.primary").click();
+    await flush();
+
+    // 保存还没返回时再按一次 Ctrl+Enter 不会重复提交
+    editor.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+    expect(
+      mocks.invoke.mock.calls.filter(([cmd]) => cmd === "update_note_entry"),
+    ).toHaveLength(1);
+
+    // 等待期间继续输入；保存返回后编辑器必须保持打开。
+    editor.value = "第一版 + 新输入";
+    finish?.([]);
+    await flush();
+
+    expect(node<HTMLTextAreaElement>(".entry-edit").value).toBe("第一版 + 新输入");
+  });
+
   it("撤销条初始不可聚焦", async () => {
     await boot();
     expect(node<HTMLElement>("#undo-bar").hasAttribute("inert")).toBe(true);
@@ -554,6 +589,29 @@ describe("云同步", () => {
     if (!call) throw new Error("没有监听 sync-status");
     return call[1] as unknown as (event: { payload: TestSyncStatus }) => void;
   }
+
+  function openSettingsEvent(): void {
+    const call = mocks.listen.mock.calls.find(([name]) => name === "open-settings");
+    if (!call) throw new Error("没有监听 open-settings");
+    (call[1] as unknown as () => void)();
+  }
+
+  it("重新打开设置面板不会清空未保存的同步表单", async () => {
+    await boot();
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-url").value = "https://draft.example.com/";
+    node<HTMLInputElement>("#sync-username").value = "draft-user";
+    node<HTMLInputElement>("#sync-password").value = "draft-pass";
+
+    // 托盘「设置…」会再次走 openSettings()，不能重填表单
+    openSettingsEvent();
+    await flush();
+
+    expect(node<HTMLInputElement>("#sync-url").value).toBe("https://draft.example.com/");
+    expect(node<HTMLInputElement>("#sync-username").value).toBe("draft-user");
+    expect(node<HTMLInputElement>("#sync-password").value).toBe("draft-pass");
+  });
 
   it("保存时提交表单，密码单独落盘并清空输入框", async () => {
     let saved: Record<string, unknown> | undefined;

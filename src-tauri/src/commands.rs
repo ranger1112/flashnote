@@ -84,6 +84,11 @@ pub fn persist_sync(app: &AppHandle) -> Result<(), String> {
 }
 
 fn write_snapshot(state: &AppState, path: &Path, seq: u64, snapshot: &Settings) -> bool {
+    if state.settings_read_failed {
+        // 启动时读不出来：内存里是默认值，写回会把原配置覆盖掉。
+        log::error!("设置文件启动时读取失败，本次运行不写回设置");
+        return false;
+    }
     write_snapshot_locked(
         path,
         seq,

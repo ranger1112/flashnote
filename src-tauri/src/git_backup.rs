@@ -6,6 +6,7 @@
 //! 提交失败只记日志，绝不影响保存本身：笔记落盘永远优先于版本历史。
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,7 +43,7 @@ pub(crate) struct GitCommitState {
 pub(crate) struct GitStatus {
     /// 系统里能找到 `git` 命令。
     pub available: bool,
-    /// 笔记目录本身是一个仓库（存在 `.git`）。
+    /// 笔记目录本身是一个仓库（存在真实的 `.git` 目录）。
     pub repo: bool,
     pub last_success: Option<String>,
     pub last_error: Option<String>,
@@ -57,8 +58,39 @@ pub(crate) fn status(dir: &Path, last: &GitCommitState) -> GitStatus {
     }
 }
 
+/// 笔记目录本身是一个普通仓库：`.git` 必须是真实目录，且不能是 linked worktree
+/// 的 gitdir（带 `commondir`）。
+///
+/// `.git` 是 gitfile（内容 `gitdir: …`）或带 `commondir` 的目录时，提交会被引到
+/// 另一个仓库；共享/网络笔记目录里被放入这样的结构，自动提交就成了对目录外仓库
+/// 的写入。worktree/submodule 因此不被支持——笔记目录应当是一个独立仓库。
 pub(crate) fn is_repo(dir: &Path) -> bool {
-    dir.join(".git").exists()
+    let git = dir.join(".git");
+    fs::symlink_metadata(&git)
+        .map(|meta| {
+            meta.is_dir()
+                && !crate::files::is_reparse_point(&git)
+                && !git.join("commondir").exists()
+        })
+        .unwrap_or(false)
+}
+
+/// 用 git 自己解析仓库根目录，确认就是笔记目录。
+///
+/// `is_repo` 只挡住了 gitfile/commondir；`.git/config` 里的 `core.worktree`
+/// 仍可能把工作区指到别处。提交前做一次正向校验。
+fn repo_root_matches(dir: &Path) -> bool {
+    let Ok(out) = run(Some(dir), &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (Ok(root), Ok(dir)) = (fs::canonicalize(root), fs::canonicalize(dir)) else {
+        return false;
+    };
+    root == dir
 }
 
 /// 系统里有没有 git。找不到时设置项直接禁用，而不是等保存后才报错。
@@ -76,6 +108,11 @@ pub(crate) fn init(dir: &Path) -> Result<(), String> {
     if is_repo(dir) {
         return Ok(());
     }
+    // `.git` 是文件或链接时（worktree 或恶意的 gitdir 重定向）不要初始化：
+    // `git init` 可能顺着它去改另一个仓库。
+    if fs::symlink_metadata(dir.join(".git")).is_ok() {
+        return Err("笔记目录里的 .git 不是普通目录，已拒绝初始化".to_string());
+    }
     let out = run(Some(dir), &["init", "-q"])?;
     if !out.status.success() {
         return Err(format!("git init 失败：{}", stderr(&out)));
@@ -90,6 +127,9 @@ pub(crate) fn init(dir: &Path) -> Result<(), String> {
 pub(crate) fn commit(dir: &Path) -> Result<bool, String> {
     if !is_repo(dir) {
         return Err("笔记目录还不是 Git 仓库".to_string());
+    }
+    if !repo_root_matches(dir) {
+        return Err("笔记目录不是该 Git 仓库的工作区，已跳过自动提交".to_string());
     }
     let _guard = GIT_LOCK
         .lock()
@@ -319,9 +359,18 @@ fn has_external_filter(dir: &Path, names: &[String]) -> Result<bool, String> {
     if names.is_empty() {
         return Ok(false);
     }
-    let mut args: Vec<&str> = vec!["check-attr", "-z", "filter", "--"];
-    args.extend(names.iter().map(String::as_str));
-    let out = run(Some(dir), &args)?;
+    // 路径走标准输入：笔记多了也不会超过 Windows 32K 命令行上限
+    // （约 2,200 个日期文件就会撞上）。
+    let mut input = Vec::with_capacity(names.iter().map(|name| name.len() + 1).sum());
+    for name in names {
+        input.extend_from_slice(name.as_bytes());
+        input.push(0);
+    }
+    let out = run_with_stdin(
+        Some(dir),
+        &["check-attr", "-z", "--stdin", "filter"],
+        &input,
+    )?;
     if !out.status.success() {
         return Err(format!("检查 Git filter 失败：{}", stderr(&out)));
     }
@@ -397,11 +446,7 @@ fn run(dir: Option<&Path>, args: &[&str]) -> Result<Output, String> {
     run_with_env(dir, args, &[])
 }
 
-fn run_with_env(
-    dir: Option<&Path>,
-    args: &[&str],
-    envs: &[(&str, String)],
-) -> Result<Output, String> {
+fn git_command(dir: Option<&Path>, envs: &[(&str, String)]) -> Command {
     let mut command = Command::new("git");
     if dir.is_some() {
         // 笔记目录可能是共享盘/NAS：仓库里的 hooks、fsmonitor 和签名配置
@@ -416,11 +461,6 @@ fn run_with_env(
             "commit.gpgsign=false",
         ]);
     }
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -430,8 +470,60 @@ fn run_with_env(
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+fn run_with_env(
+    dir: Option<&Path>,
+    args: &[&str],
+    envs: &[(&str, String)],
+) -> Result<Output, String> {
+    git_command(dir, envs)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|error| format!("无法运行 git：{error}"))
+}
+
+/// 从标准输入喂路径，避开命令行长度上限。
+///
+/// 必须在写 stdin 的同时读 stdout：`check-attr` 会边读边输出，输出管道填满后
+/// git 停止读 stdin，而调用方还在写，双方互相等待，大笔记库会直接死锁。
+fn run_with_stdin(dir: Option<&Path>, args: &[&str], input: &[u8]) -> Result<Output, String> {
+    let mut child = git_command(dir, &[])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法运行 git：{error}"))?;
+    let mut stdin = child.stdin.take();
+    let (write_result, output) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> Result<(), String> {
+            if let Some(stdin) = stdin.as_mut() {
+                stdin
+                    .write_all(input)
+                    .map_err(|error| format!("向 git 写入路径失败：{error}"))?;
+            }
+            Ok(())
+        });
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("等待 git 失败：{error}"));
+        let write_result = writer
+            .join()
+            .unwrap_or_else(|_| Err("向 git 写入路径的线程异常退出".to_string()));
+        (write_result, output)
+    });
+    if let Err(err) = write_result {
+        // git 提前失败时 stdin 会断开，真正的错误在 stderr 里，交给调用方；
+        // 但如果 git 报成功、路径却没写完，这个成功不能信。
+        if output.as_ref().is_ok_and(|out| out.status.success()) {
+            return Err(err);
+        }
+    }
+    output
 }
 
 /// git 的报错主要在 stderr；有些版本也会写 stdout。
@@ -455,6 +547,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn gitfile_is_not_treated_as_a_repository() {
+        let dir = temp_dir("gitfile");
+        fs::write(dir.join(".git"), "gitdir: C:/elsewhere/.git\n").unwrap();
+        assert!(!is_repo(&dir));
+        assert!(init(&dir).is_err());
+    }
+
+    #[test]
+    fn commondir_git_directory_is_not_treated_as_a_repository() {
+        let dir = temp_dir("commondir");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git").join("commondir"), "../elsewhere").unwrap();
+        assert!(!is_repo(&dir));
+        assert!(init(&dir).is_err());
     }
 
     #[test]

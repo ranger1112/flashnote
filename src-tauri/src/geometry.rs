@@ -47,6 +47,27 @@ fn overlap_area(a: Rect, b: Rect) -> i64 {
     }
 }
 
+/// 保存位置所在显示器（完整矩形，不是工作区）及其当前缩放。
+/// 用工作区会把落在任务栏区域的坐标判成「没有显示器」。
+fn monitor_at(window: &WebviewWindow, x: i32, y: i32) -> Option<(Rect, f64)> {
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .find_map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            let rect = Rect {
+                x: position.x,
+                y: position.y,
+                w: size.width,
+                h: size.height,
+            };
+            (x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom())
+                .then_some((rect, monitor.scale_factor()))
+        })
+}
+
 fn monitor_rects(window: &WebviewWindow) -> Vec<Rect> {
     window
         .available_monitors()
@@ -126,8 +147,14 @@ pub(crate) fn clamp_rect(rect: Rect, monitors: &[Rect]) -> (i32, i32) {
 }
 
 /// 把保存的物理像素几何从旧 DPI 缩放换算到当前缩放，保证逻辑位置/尺寸不变。
+/// 坐标只缩放相对显示器原点的偏移，否则副屏原点也会被乘一遍。
 /// 老配置没有缩放字段（None）或数值异常时原样返回。
-pub(crate) fn scale_geometry(rect: Rect, saved_scale: Option<f64>, current_scale: f64) -> Rect {
+pub(crate) fn scale_geometry(
+    rect: Rect,
+    saved_scale: Option<f64>,
+    current_scale: f64,
+    origin: (i32, i32),
+) -> Rect {
     let factor = match saved_scale {
         Some(saved) if saved > 0.0 && current_scale > 0.0 => current_scale / saved,
         _ => return rect,
@@ -136,8 +163,8 @@ pub(crate) fn scale_geometry(rect: Rect, saved_scale: Option<f64>, current_scale
         return rect;
     }
 
-    let point = |value: i32| -> i32 {
-        (value as f64 * factor)
+    let point = |value: i32, base: i32| -> i32 {
+        (base as f64 + (value as f64 - base as f64) * factor)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     };
@@ -145,8 +172,8 @@ pub(crate) fn scale_geometry(rect: Rect, saved_scale: Option<f64>, current_scale
         |value: u32| -> u32 { (value as f64 * factor).round().clamp(0.0, u32::MAX as f64) as u32 };
 
     Rect {
-        x: point(rect.x),
-        y: point(rect.y),
+        x: point(rect.x, origin.0),
+        y: point(rect.y, origin.1),
         w: extent(rect.w),
         h: extent(rect.h),
     }
@@ -208,8 +235,13 @@ pub fn apply_initial_geometry(app: &AppHandle) {
     match saved {
         Some(geometry) => {
             let monitors = monitor_rects(&window);
-            // 物理像素会随 DPI 缩放变化，按保存时的缩放换算回同样的逻辑位置/尺寸
+            // 物理像素会随 DPI 缩放变化，按保存时的缩放换算回同样的逻辑位置/尺寸。
+            // 窗口启动时在主屏，scale_factor() 是主屏的；保存的几何可能在另一块屏，
+            // 必须用保存位置那块屏的当前缩放。
             let current_scale = window.scale_factor().unwrap_or(1.0);
+            let (origin, target_scale) = monitor_at(&window, geometry.x, geometry.y)
+                .map(|(rect, scale)| ((rect.x, rect.y), scale))
+                .unwrap_or(((0, 0), current_scale));
             let scaled = scale_geometry(
                 Rect {
                     x: geometry.x,
@@ -218,7 +250,8 @@ pub fn apply_initial_geometry(app: &AppHandle) {
                     h: geometry.h,
                 },
                 geometry.scale,
-                current_scale,
+                target_scale,
+                origin,
             );
             let (x, y) = clamp_rect(scaled, &monitors);
             let (w, h) = clamp_size(scaled.w, scaled.h, x, y, &monitors);
@@ -372,15 +405,29 @@ mod tests {
             h: 360,
         };
 
-        let scaled = scale_geometry(rect, Some(1.0), 1.5);
+        let scaled = scale_geometry(rect, Some(1.0), 1.5, (0, 0));
         assert_eq!(
             (scaled.x, scaled.y, scaled.w, scaled.h),
             (150, 75, 720, 540)
         );
 
         // 老配置没有 scale 字段：保持原样，不能凭空放大
-        let untouched = scale_geometry(rect, None, 2.0);
+        let untouched = scale_geometry(rect, None, 2.0, (0, 0));
         assert_eq!((untouched.x, untouched.y, untouched.w), (100, 50, 480));
+    }
+
+    #[test]
+    fn scale_geometry_keeps_the_monitor_origin_fixed() {
+        let rect = Rect {
+            x: 2000,
+            y: 100,
+            w: 480,
+            h: 360,
+        };
+        // 副屏原点 1920 不参与缩放，只缩放窗口相对原点的偏移。
+        let scaled = scale_geometry(rect, Some(1.0), 1.5, (1920, 0));
+        assert_eq!((scaled.x, scaled.y), (2040, 150));
+        assert_eq!((scaled.w, scaled.h), (720, 540));
     }
 
     #[test]

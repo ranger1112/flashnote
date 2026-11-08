@@ -23,24 +23,15 @@ pub(crate) fn io_guard(state: &AppState) -> MutexGuard<'_, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-
-/// 路径本身是不是符号链接/重解析点；只查路径，不跟随目标。
+/// 路径本身是不是符号链接/目录联接；只查路径，不跟随目标。
+///
+/// 不能只看 `FILE_ATTRIBUTE_REPARSE_POINT`：OneDrive「按需文件」的云端占位符
+/// 也带这个属性（实测 0x401620），但它们就是普通笔记文件。`FileType::is_symlink`
+/// 会继续检查重解析标签，只把符号链接与 junction 算作链接。
 pub(crate) fn is_reparse_point(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        fs::symlink_metadata(path)
-            .map(|meta| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        fs::symlink_metadata(path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-    }
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// 拒绝写入重解析点，避免把笔记/同步内容写到链接目标（可能是目录外文件）。
@@ -92,12 +83,20 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// explorer 不认 `\\?\` verbatim 前缀，遇到会直接报「找不到文件」；先剥掉再传。
+/// UNC 路径的 verbatim 形式是 `\\?\UNC\server\share`，剥完要还原成 `\\server\share`。
+fn explorer_path(display: &str) -> String {
+    if let Some(rest) = display.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        display.strip_prefix(r"\\?\").unwrap_or(display).to_string()
+    }
+}
+
 fn open_with_explorer(path: &Path) -> Result<(), String> {
-    // explorer 不认 `\\?\` verbatim 前缀，遇到会直接报「找不到文件」；先剥掉再传
     let display = path.to_string_lossy();
-    let target = display.strip_prefix(r"\\?\").unwrap_or(&display);
     std::process::Command::new("explorer")
-        .arg(target)
+        .arg(explorer_path(&display))
         .spawn()
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -165,6 +164,9 @@ fn open_with_default_app(path: &Path) -> Result<(), String> {
 fn ensure_note_file(dir: &Path, date: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     let path = dir.join(format!("{date}.md"));
+    // 必须先检查再 create_new：Windows 上 create_new 会跟随悬空的符号链接，
+    // 在链接目标处创建文件；等写完再拒绝，目录外已经被写入了。
+    reject_reparse(&path).map_err(|err| format!("今日笔记不可用：{err}"))?;
     // create_new 而不是 exists + write：文件已存在时保持原样，不会截断当天笔记
     match std::fs::OpenOptions::new()
         .write(true)
@@ -179,6 +181,8 @@ fn ensure_note_file(dir: &Path, date: &str) -> Result<PathBuf, String> {
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(format!("创建今日笔记失败：{err}")),
     }
+    // 创建后再检查一次，缩小检查与打开之间的竞态窗口。
+    reject_reparse(&path).map_err(|err| format!("今日笔记不可用：{err}"))?;
     Ok(path)
 }
 
@@ -511,6 +515,16 @@ mod tests {
             preserve_line_endings("# d\n\n- 10:00 a", "# d\n\n- 11:00 b\n".into()),
             "# d\n\n- 11:00 b"
         );
+    }
+
+    #[test]
+    fn explorer_path_strips_verbatim_prefixes() {
+        assert_eq!(explorer_path(r"\\?\C:\notes\a.md"), r"C:\notes\a.md");
+        assert_eq!(
+            explorer_path(r"\\?\UNC\nas\notes\a.md"),
+            r"\\nas\notes\a.md"
+        );
+        assert_eq!(explorer_path(r"\\nas\notes\a.md"), r"\\nas\notes\a.md");
     }
 
     #[test]

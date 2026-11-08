@@ -113,7 +113,31 @@ pub fn format_entry(time: &str, content: &str, source: Option<&str>) -> String {
 
 /// Markdown 模式：时间作为三级标题，原文不做缩进，来源写成 HTML 注释。
 pub fn format_entry_markdown(time: &str, content: &str, source: Option<&str>) -> String {
-    let mut out = format!("### {time}\n{}", content.trim());
+    let mut out = format!("### {time}");
+    let mut previous_blank = false;
+    let mut open_fence: Option<Fence> = None;
+    for line in content.trim().lines() {
+        out.push('\n');
+        if let Some(open) = open_fence {
+            // 围栏里的内容一个字都不能改。
+            out.push_str(line);
+            if closes_fence(line, open) {
+                open_fence = None;
+            }
+        } else {
+            // 正文里形似条目头的行加一个保护空格：Markdown 渲染不变（标题与
+            // 列表允许 1–3 个空格缩进），但 split_spans 不会把它当成新条目。
+            if needs_protection(line, previous_blank) {
+                out.push(' ');
+            }
+            out.push_str(line);
+            open_fence = fence_marker(line);
+        }
+        previous_blank = line.trim().is_empty();
+    }
+    if content.trim().is_empty() {
+        out.push('\n');
+    }
 
     if let Some(source) = sanitize_source(source) {
         out.push_str("\n\n<!-- 来源：");
@@ -310,13 +334,22 @@ pub(crate) fn parse_block(block: &RawEntry) -> Option<(String, String, Option<St
         .filter(|index| !fenced[*index])
         .filter(|index| source_line(&body[*index]).is_some());
 
+    let mut previous_blank = false;
     for (index, line) in body.iter().enumerate() {
         if Some(index) == source_index {
             source = source_line(line);
+            previous_blank = line.trim().is_empty();
             continue;
         }
-        // 围栏内的内容原样保留，`<!-- 来源：… -->` 只是正文
+        // 围栏内的内容原样保留，`<!-- 来源：… -->` 只是正文。
+        // Markdown 正文里写入时加的保护空格在这里去掉。
+        let line = if !compact && !fenced[index] {
+            strip_protection(line, previous_blank)
+        } else {
+            line.as_str()
+        };
         content.push(content_line(line, compact));
+        previous_blank = line.trim().is_empty();
     }
 
     let content = content.join("\n").trim_matches('\n').trim_end().to_string();
@@ -345,6 +378,21 @@ fn list_time(line: &str) -> Option<(String, String)> {
     let rest = line.strip_prefix("- ")?;
     let (time, first) = rest.split_once(' ').unwrap_or((rest, ""));
     is_hhmm(time).then(|| (time.to_string(), first.to_string()))
+}
+
+/// 这行在 Markdown 正文里会不会被当成条目头。写入时加一个前导空格保护。
+/// 直接复用 `entry_header`，保证写入与解析永远用同一套判定。
+fn needs_protection(line: &str, previous_blank: bool) -> bool {
+    entry_header(line, true, previous_blank).is_some()
+}
+
+/// 去掉写入时加的保护空格；只有去掉后确实像条目头才去。
+/// 用户自己写的一个前导空格也会被归一化，但 Markdown 渲染效果不变。
+fn strip_protection(line: &str, previous_blank: bool) -> &str {
+    match line.strip_prefix(' ') {
+        Some(rest) if needs_protection(rest, previous_blank) => rest,
+        _ => line,
+    }
 }
 
 fn source_line(line: &str) -> Option<String> {
@@ -1036,6 +1084,36 @@ mod tests {
         assert_eq!(entries[0].1, "正文");
         assert_eq!(entries[1].0, "14:00");
         assert_eq!(entries[1].1, "新条目");
+    }
+
+    #[test]
+    fn markdown_time_like_body_lines_round_trip_as_one_entry() {
+        let content = "会议安排\n\n- 10:00 开场\n- 11:00 讨论\n\n### 12:00";
+        let formatted = format_entry_markdown("09:00", content, None);
+        let entries = parse_entries(&format!("# 2026-10-21\n\n{formatted}\n"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "09:00");
+        assert_eq!(entries[0].1, content);
+    }
+
+    #[test]
+    fn markdown_body_heading_like_first_line_round_trips() {
+        let content = "### 12:00\n正文";
+        let formatted = format_entry_markdown("09:00", content, None);
+        let entries = parse_entries(&format!("# 2026-10-21\n\n{formatted}\n"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, content);
+    }
+
+    #[test]
+    fn markdown_fence_content_is_not_protected() {
+        let content = "```\n\n- 10:00 代码\n### 11:00 代码\n```";
+        let formatted = format_entry_markdown("09:00", content, None);
+        assert!(formatted.contains("\n- 10:00 代码"), "{formatted}");
+        assert!(formatted.contains("\n### 11:00 代码"), "{formatted}");
+        let entries = parse_entries(&format!("# 2026-10-21\n\n{formatted}\n"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, content);
     }
 
     #[test]
