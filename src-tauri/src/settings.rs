@@ -266,8 +266,7 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     settings.background_opacity = clamp_opacity(settings.background_opacity);
     settings.sync.interval_minutes =
         SyncSettings::normalize_interval(settings.sync.interval_minutes);
-    settings.lock.unlock_minutes =
-        LockSettings::normalize_minutes(settings.lock.unlock_minutes);
+    settings.lock.unlock_minutes = LockSettings::normalize_minutes(settings.lock.unlock_minutes);
     settings
 }
 
