@@ -2,7 +2,7 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.7.0] - 2026-11-08
 
 ### 新增
 
@@ -21,6 +21,7 @@
 - WebDAV 回读校验不再无条件重写；Hash 版本复核后用 GET 的强 ETag 做条件删除/写入，降低覆盖并发编辑的风险。
 - 条目编辑保存期间的新输入不再丢失；重开设置面板不再清空未保存的同步表单；跨 DPI 多屏恢复使用保存位置所在显示器的缩放。
 - 清除同步密码时一并删除 0.5.x 旧凭据，避免迁移回退把已清除的密码重新搬回来。
+- NSIS 安装包与卸载程序改用应用图标，不再显示 NSIS 默认图标。
 
 ## [0.6.1] - 2026-11-04
 
@@ -243,7 +244,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.7.0
 [0.6.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.6.1
 [0.6.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.6.0
 [0.5.2]: https://github.com/ranger1112/flashnote/releases/tag/v0.5.2
