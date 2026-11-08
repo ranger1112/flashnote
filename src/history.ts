@@ -221,17 +221,30 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
   cancel.className = "btn tiny";
   cancel.textContent = "取消";
 
+  let savedWhileEditing = false;
   const close = (): void => {
     wrap.replaceWith(contentEl);
     contentEl.dataset.editing = "";
+    if (savedWhileEditing) {
+      // 保存成功但编辑器里还有新输入，用户最终选择取消：按已保存的内容
+      // 重渲列表，否则会一直显示保存前的旧文本。
+      savedWhileEditing = false;
+      renderNotes();
+      document.querySelector<HTMLButtonElement>(".entry-action")?.focus();
+      return;
+    }
     editButton.focus();
   };
 
-  cancel.addEventListener("click", close);
+  cancel.addEventListener("click", () => {
+    // 保存请求还在飞：等它回来再关，避免把等待期间输入的文字一起丢掉。
+    if (save.disabled) return;
+    close();
+  });
 
-  let saving = false;
   const commit = async (): Promise<void> => {
-    if (saving) return;
+    // 用按钮的禁用态作为唯一的「保存中」标记，避免两个状态不一致。
+    if (save.disabled) return;
     const value = editor.value.trim();
     if (!value) {
       toast("内容不能为空", true);
@@ -241,7 +254,6 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       close();
       return;
     }
-    saving = true;
     save.disabled = true;
     try {
       const tags = await invoke<string[]>("update_note_entry", {
@@ -258,18 +270,18 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       note.tags = tags;
       // 保存期间又输入了内容：保持编辑器打开，别把新输入一起关掉。
       if (editor.value.trim() !== value) {
+        savedWhileEditing = true;
         toast("已保存；还有新输入未保存", true);
         save.disabled = false;
         return;
       }
+      savedWhileEditing = false;
       close();
       toast("已更新");
       renderNotes();
     } catch (error) {
       save.disabled = false;
       toast(String(error), true);
-    } finally {
-      saving = false;
     }
   };
 
@@ -280,7 +292,8 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
-      close();
+      // 保存中不关闭：请求回来时编辑器还在，等待期间输入的文字才不会丢。
+      if (!save.disabled) close();
       return;
     }
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {

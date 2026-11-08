@@ -118,6 +118,13 @@ function paintSyncIndicator(status: SyncStatus): void {
   }
 }
 
+/** 上一轮明细/警告是否应该显示：未配置、关闭、同步中或有错误时都不显示。 */
+function summaryVisible(status: SyncStatus): boolean {
+  return Boolean(
+    status.summary && status.configured && status.enabled && !status.running && !status.lastError,
+  );
+}
+
 /** 一句话状态：设置区显示完整版，历史面板只显示第一段。 */
 export function describeStatus(status: SyncStatus): string[] {
   const parts: string[] = [];
@@ -139,7 +146,7 @@ export function describeStatus(status: SyncStatus): string[] {
 
   // 只有启用中的配置才展示上一轮明细，否则「未配置」旁边挂一串数字很误导
   const summary = status.summary;
-  if (summary && status.configured && status.enabled && !status.running && !status.lastError) {
+  if (summary && summaryVisible(status)) {
     const changed =
       summary.uploaded + summary.downloaded + summary.merged + summary.deleted;
     if (changed > 0) {
@@ -170,13 +177,7 @@ export function paintSyncStatus(status: SyncStatus): void {
     ui.syncError.textContent = "";
   }
 
-  const hasWarnings = Boolean(
-    status.summary?.warnings.length &&
-      status.configured &&
-      status.enabled &&
-      !status.running &&
-      !status.lastError,
-  );
+  const hasWarnings = Boolean(status.summary?.warnings.length && summaryVisible(status));
   ui.syncStatusText.textContent = describeStatus(status).join(" · ");
   ui.syncStatusText.classList.toggle("warn", Boolean(status.degraded) || hasWarnings);
   ui.syncStatusText.classList.toggle("bad", Boolean(status.lastError));

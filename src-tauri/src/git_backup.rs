@@ -58,15 +58,39 @@ pub(crate) fn status(dir: &Path, last: &GitCommitState) -> GitStatus {
     }
 }
 
-/// 笔记目录本身是一个普通仓库：`.git` 必须是真实目录。
+/// 笔记目录本身是一个普通仓库：`.git` 必须是真实目录，且不能是 linked worktree
+/// 的 gitdir（带 `commondir`）。
 ///
-/// `.git` 也可以是 gitfile（内容 `gitdir: …`），但那会把提交引到另一个仓库。
-/// 共享/网络笔记目录里被放入这样一个文件时，自动提交就变成了对目录外仓库的写入。
+/// `.git` 是 gitfile（内容 `gitdir: …`）或带 `commondir` 的目录时，提交会被引到
+/// 另一个仓库；共享/网络笔记目录里被放入这样的结构，自动提交就成了对目录外仓库
+/// 的写入。worktree/submodule 因此不被支持——笔记目录应当是一个独立仓库。
 pub(crate) fn is_repo(dir: &Path) -> bool {
     let git = dir.join(".git");
     fs::symlink_metadata(&git)
-        .map(|meta| meta.is_dir() && !crate::files::is_reparse_point(&git))
+        .map(|meta| {
+            meta.is_dir()
+                && !crate::files::is_reparse_point(&git)
+                && !git.join("commondir").exists()
+        })
         .unwrap_or(false)
+}
+
+/// 用 git 自己解析仓库根目录，确认就是笔记目录。
+///
+/// `is_repo` 只挡住了 gitfile/commondir；`.git/config` 里的 `core.worktree`
+/// 仍可能把工作区指到别处。提交前做一次正向校验。
+fn repo_root_matches(dir: &Path) -> bool {
+    let Ok(out) = run(Some(dir), &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (Ok(root), Ok(dir)) = (fs::canonicalize(root), fs::canonicalize(dir)) else {
+        return false;
+    };
+    root == dir
 }
 
 /// 系统里有没有 git。找不到时设置项直接禁用，而不是等保存后才报错。
@@ -103,6 +127,9 @@ pub(crate) fn init(dir: &Path) -> Result<(), String> {
 pub(crate) fn commit(dir: &Path) -> Result<bool, String> {
     if !is_repo(dir) {
         return Err("笔记目录还不是 Git 仓库".to_string());
+    }
+    if !repo_root_matches(dir) {
+        return Err("笔记目录不是该 Git 仓库的工作区，已跳过自动提交".to_string());
     }
     let _guard = GIT_LOCK
         .lock()
@@ -460,6 +487,9 @@ fn run_with_env(
 }
 
 /// 从标准输入喂路径，避开命令行长度上限。
+///
+/// 必须在写 stdin 的同时读 stdout：`check-attr` 会边读边输出，输出管道填满后
+/// git 停止读 stdin，而调用方还在写，双方互相等待，大笔记库会直接死锁。
 fn run_with_stdin(dir: Option<&Path>, args: &[&str], input: &[u8]) -> Result<Output, String> {
     let mut child = git_command(dir, &[])
         .args(args)
@@ -468,14 +498,32 @@ fn run_with_stdin(dir: Option<&Path>, args: &[&str], input: &[u8]) -> Result<Out
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("无法运行 git：{error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input)
-            .map_err(|error| format!("向 git 写入路径失败：{error}"))?;
+    let mut stdin = child.stdin.take();
+    let (write_result, output) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> Result<(), String> {
+            if let Some(stdin) = stdin.as_mut() {
+                stdin
+                    .write_all(input)
+                    .map_err(|error| format!("向 git 写入路径失败：{error}"))?;
+            }
+            Ok(())
+        });
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("等待 git 失败：{error}"));
+        let write_result = writer
+            .join()
+            .unwrap_or_else(|_| Err("向 git 写入路径的线程异常退出".to_string()));
+        (write_result, output)
+    });
+    if let Err(err) = write_result {
+        // git 提前失败时 stdin 会断开，真正的错误在 stderr 里，交给调用方；
+        // 但如果 git 报成功、路径却没写完，这个成功不能信。
+        if output.as_ref().is_ok_and(|out| out.status.success()) {
+            return Err(err);
+        }
     }
-    child
-        .wait_with_output()
-        .map_err(|error| format!("等待 git 失败：{error}"))
+    output
 }
 
 /// git 的报错主要在 stderr；有些版本也会写 stdout。
@@ -505,6 +553,15 @@ mod tests {
     fn gitfile_is_not_treated_as_a_repository() {
         let dir = temp_dir("gitfile");
         fs::write(dir.join(".git"), "gitdir: C:/elsewhere/.git\n").unwrap();
+        assert!(!is_repo(&dir));
+        assert!(init(&dir).is_err());
+    }
+
+    #[test]
+    fn commondir_git_directory_is_not_treated_as_a_repository() {
+        let dir = temp_dir("commondir");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git").join("commondir"), "../elsewhere").unwrap();
         assert!(!is_repo(&dir));
         assert!(init(&dir).is_err());
     }

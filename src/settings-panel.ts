@@ -109,7 +109,9 @@ export function showSettingsPanel(): void {
     !ui.settingsPanel.classList.contains("hidden") &&
     !ui.settingsPanel.classList.contains("panel-leave")
   ) {
-    ui.settingsClose.focus();
+    // 只刷新状态，不重填表单，也不抢焦点（用户可能正在输入）。
+    void refreshSyncStatus();
+    void paintGitStatus();
     return;
   }
   paintSettings();

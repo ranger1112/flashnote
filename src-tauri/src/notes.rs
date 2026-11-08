@@ -380,11 +380,10 @@ fn list_time(line: &str) -> Option<(String, String)> {
     is_hhmm(time).then(|| (time.to_string(), first.to_string()))
 }
 
-/// 这行在 Markdown 正文里会不会被当成条目头。写入时加一个前导空格保护：
-/// `### HH:MM` 任何时候都算条目头；`- HH:MM` 只在空行之后算。
+/// 这行在 Markdown 正文里会不会被当成条目头。写入时加一个前导空格保护。
+/// 直接复用 `entry_header`，保证写入与解析永远用同一套判定。
 fn needs_protection(line: &str, previous_blank: bool) -> bool {
-    (!line.starts_with(char::is_whitespace) && markdown_time(line).is_some())
-        || (previous_blank && list_time(line).is_some())
+    entry_header(line, true, previous_blank).is_some()
 }
 
 /// 去掉写入时加的保护空格；只有去掉后确实像条目头才去。
@@ -1089,7 +1088,7 @@ mod tests {
 
     #[test]
     fn markdown_time_like_body_lines_round_trip_as_one_entry() {
-        let content = "会议安排\n\n- 10:00 开场\n- 11:00 讨论\n\n### 12:00 午餐";
+        let content = "会议安排\n\n- 10:00 开场\n- 11:00 讨论\n\n### 12:00";
         let formatted = format_entry_markdown("09:00", content, None);
         let entries = parse_entries(&format!("# 2026-10-21\n\n{formatted}\n"));
         assert_eq!(entries.len(), 1);
@@ -1099,7 +1098,7 @@ mod tests {
 
     #[test]
     fn markdown_body_heading_like_first_line_round_trips() {
-        let content = "### 12:00 午餐\n正文";
+        let content = "### 12:00\n正文";
         let formatted = format_entry_markdown("09:00", content, None);
         let entries = parse_entries(&format!("# 2026-10-21\n\n{formatted}\n"));
         assert_eq!(entries.len(), 1);

@@ -164,6 +164,9 @@ fn open_with_default_app(path: &Path) -> Result<(), String> {
 fn ensure_note_file(dir: &Path, date: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     let path = dir.join(format!("{date}.md"));
+    // 必须先检查再 create_new：Windows 上 create_new 会跟随悬空的符号链接，
+    // 在链接目标处创建文件；等写完再拒绝，目录外已经被写入了。
+    reject_reparse(&path).map_err(|err| format!("今日笔记不可用：{err}"))?;
     // create_new 而不是 exists + write：文件已存在时保持原样，不会截断当天笔记
     match std::fs::OpenOptions::new()
         .write(true)
@@ -178,8 +181,7 @@ fn ensure_note_file(dir: &Path, date: &str) -> Result<PathBuf, String> {
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(format!("创建今日笔记失败：{err}")),
     }
-    // 已存在时也要确认不是符号链接：托盘「打开今日笔记」会把它交给系统，
-    // 共享目录里预先放好的链接可能把 ShellExecuteW 引到目录外。
+    // 创建后再检查一次，缩小检查与打开之间的竞态窗口。
     reject_reparse(&path).map_err(|err| format!("今日笔记不可用：{err}"))?;
     Ok(path)
 }

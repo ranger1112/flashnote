@@ -208,7 +208,7 @@ impl WebDavBackend {
 
         let readback_ok = matches!(
             self.read_bytes(probe_url.clone()).await,
-            Ok((bytes, _)) if bytes == body
+            Ok((bytes, _, _)) if bytes == body
         );
 
         // 探测文件尽力清理，失败不影响能力判断。
@@ -286,8 +286,8 @@ impl WebDavBackend {
         Ok((text, final_url))
     }
 
-    async fn read_bytes(&self, url: Url) -> Result<(Vec<u8>, RemoteVersion), SyncError> {
-        let (mut response, _) = self
+    async fn read_bytes(&self, url: Url) -> Result<(Vec<u8>, RemoteVersion, Url), SyncError> {
+        let (mut response, final_url) = self
             .request(Method::GET, url, Vec::new(), None, TRANSFER_TIMEOUT)
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -317,7 +317,7 @@ impl WebDavBackend {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok((bytes, version))
+        Ok((bytes, version, final_url))
     }
 
     /// Depth: 0 读单个文件的版本；服务器不支持时返回 None。
@@ -342,13 +342,14 @@ impl WebDavBackend {
         sha256: Option<&str>,
     ) -> Result<Option<RemoteVersion>, SyncError> {
         if let Some(expected) = sha256 {
-            let (bytes, observed) = self.read_bytes(url.clone()).await?;
+            let (bytes, observed, final_url) = self.read_bytes(url.clone()).await?;
             if sha256_base64(&bytes) != expected {
                 return Err(SyncError::VersionMismatch);
             }
-            // 回读顺带拿到的 ETag 可以用于接下来的 If-Match，把复核与写入
-            // 之间的窗口关掉。
-            return Ok(Some(observed));
+            // 只有 GET 没有被重定向时，响应里的 ETag 才属于这个 URL；
+            // 重定向到 CDN/预签名地址时，ETag 可能对应另一份表示，不能
+            // 拿来当 If-Match。
+            return Ok((final_url == *url).then_some(observed));
         }
         match self.stat_version(url).await {
             Some(current) if &current == version => Ok(Some(current)),
@@ -371,7 +372,7 @@ impl WebDavBackend {
     ) -> Result<(), SyncError> {
         for attempt in 0..2 {
             match self.read_bytes(url.clone()).await {
-                Ok((bytes, _)) if bytes == data => return Ok(()),
+                Ok((bytes, _, _)) if bytes == data => return Ok(()),
                 Ok(_) if attempt == 0 => {
                     let Some(RemoteVersion::Etag(tag)) = written else {
                         return Err(SyncError::VersionMismatch);
@@ -379,25 +380,32 @@ impl WebDavBackend {
                     if !(self.caps.strong_etag && self.caps.honors_if_match) {
                         return Err(SyncError::VersionMismatch);
                     }
-                    self.request(
-                        Method::PUT,
-                        url.clone(),
-                        vec![
-                            (
-                                CONTENT_TYPE,
-                                HeaderValue::from_static("text/markdown; charset=utf-8"),
-                            ),
-                            (
-                                IF_MATCH,
-                                HeaderValue::from_str(tag).map_err(|error| {
-                                    SyncError::Other(format!("ETag 不合法：{error}"))
-                                })?,
-                            ),
-                        ],
-                        Some(data.to_vec()),
-                        TRANSFER_TIMEOUT,
-                    )
-                    .await?;
+                    let response = self
+                        .request(
+                            Method::PUT,
+                            url.clone(),
+                            vec![
+                                (
+                                    CONTENT_TYPE,
+                                    HeaderValue::from_static("text/markdown; charset=utf-8"),
+                                ),
+                                (
+                                    IF_MATCH,
+                                    HeaderValue::from_str(tag).map_err(|error| {
+                                        SyncError::Other(format!("ETag 不合法：{error}"))
+                                    })?,
+                                ),
+                            ],
+                            Some(data.to_vec()),
+                            TRANSFER_TIMEOUT,
+                        )
+                        .await?
+                        .0;
+                    // 补写也可能是 412（另一台设备抢先写入）、401 或 507：
+                    // 不能吞掉状态，否则会把版本冲突误报成「服务器改写内容」。
+                    if !response.status().is_success() {
+                        return Err(map_status("上传", &response));
+                    }
                 }
                 Ok(_) => {}
                 Err(SyncError::NotFound) => {}
@@ -593,7 +601,7 @@ impl SyncBackend for WebDavBackend {
     async fn get(&self, name: &str) -> Result<Option<(Vec<u8>, RemoteVersion)>, SyncError> {
         let url = self.file_url(name)?;
         match self.read_bytes(url).await {
-            Ok(value) => Ok(Some(value)),
+            Ok((bytes, version, _)) => Ok(Some((bytes, version))),
             Err(SyncError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }

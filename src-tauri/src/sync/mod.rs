@@ -331,7 +331,21 @@ pub(crate) fn is_sync_name(name: &str) -> bool {
     is_valid_note_name(name)
 }
 
-fn scan_local(dir: &Path, io: &Mutex<()>) -> Result<LocalScan, SyncError> {
+/// 读一份稳定的快照：读前读后比对大小与 mtime，避免把追加中的半截文件
+/// 当成完整内容上传。两次都不稳定就返回 None（本轮跳过）。
+fn read_stable(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    for _ in 0..2 {
+        let before = fs::metadata(path)?;
+        let bytes = fs::read(path)?;
+        let after = fs::metadata(path)?;
+        if before.len() == after.len() && before.modified().ok() == after.modified().ok() {
+            return Ok(Some(bytes));
+        }
+    }
+    Ok(None)
+}
+
+fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
     let entries = fs::read_dir(dir)
         .map_err(|error| SyncError::Aborted(format!("无法读取笔记目录：{error}")))?;
     let mut scan = LocalScan::default();
@@ -378,20 +392,22 @@ fn scan_local(dir: &Path, io: &Mutex<()>) -> Result<LocalScan, SyncError> {
             scan.skipped.insert(name);
             continue;
         }
-        // 与追加/改写共用一把锁：append_note 是多次 write，不锁的话可能
-        // 读到半截文件并把它当成完整内容上传。
-        let bytes = {
-            let _guard = io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            fs::read(&path)
-        };
-        let bytes = match bytes {
+        // 不持 io 锁：锁会跨过 fs::read，OneDrive 水合或网络盘掉线时
+        // 会把所有保存都堵住。改用读前读后比对，半截文件直接跳过。
+        let bytes = match read_stable(&path) {
             // 元数据检查之后文件可能又被追加过，读完再确认一次大小。
-            Ok(bytes) if bytes.len() as u64 > MAX_FILE_BYTES => {
+            Ok(Some(bytes)) if bytes.len() as u64 > MAX_FILE_BYTES => {
                 scan.warnings.push(format!("{name}：超过 2 MiB，已跳过"));
                 scan.skipped.insert(name);
                 continue;
             }
-            Ok(bytes) => bytes,
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                scan.warnings
+                    .push(format!("{name}：文件在扫描期间被修改，已跳过"));
+                scan.skipped.insert(name);
+                continue;
+            }
             Err(error) => {
                 scan.warnings.push(format!("{name}：读取失败（{error}）"));
                 scan.skipped.insert(name);
@@ -478,8 +494,7 @@ impl<B: SyncBackend> SyncEngine<B> {
         }
 
         let notes_dir = self.notes_dir.clone();
-        let io = self.io.clone();
-        let scan = match blocking(move || scan_local(&notes_dir, &io)).await {
+        let scan = match blocking(move || scan_local(&notes_dir)).await {
             Ok(Ok(scan)) => scan,
             Ok(Err(error)) => {
                 summary.aborted = true;
@@ -595,10 +610,14 @@ impl<B: SyncBackend> SyncEngine<B> {
                 "安全阀",
                 format!("本轮拟删除 {deletions} 个文件（共 {tracked} 个已同步），已跳过删除"),
             );
+            // 「本地全没了」时连 RestoreLocal 也跳过：否则恢复回来的几篇会让
+            // 下一轮不再满足 all_missing，剩下的远端文件照样被删。目录保持为空，
+            // 安全阀会一直生效，直到用户把目录恢复。
             plans = plans
                 .into_iter()
                 .map(|(name, action)| match action {
                     Action::DeleteRemote | Action::TrashLocal => (name, Action::Skip),
+                    Action::RestoreLocal if all_missing => (name, Action::Skip),
                     other => (name, other),
                 })
                 .collect();
@@ -761,12 +780,11 @@ impl<B: SyncBackend> SyncEngine<B> {
                     }
                     // 版本令牌可能来自 GET 与 PROPFIND 两个来源。内容与我们上次
                     // 同步的完全一致时，只把列表版本补进记录，避免反复下载。
-                    // 仅限 Download：RestoreLocal 表示本地文件已经不存在，必须
-                    // 先把内容写回去，否则下一轮会把它当成用户删除而删掉远端。
-                    if matches!(action, Action::Download)
-                        && record
-                            .as_ref()
-                            .is_some_and(|record| sha256_base64(&bytes) == record.remote_sha256)
+                    // 内容没变而本地文件不存在，按「用户删除」处理：下一轮会
+                    // 正常传播删除（删除前远端副本会先备份进 trash）。
+                    if record
+                        .as_ref()
+                        .is_some_and(|record| sha256_base64(&bytes) == record.remote_sha256)
                     {
                         let version = remote.map(|meta| meta.version.clone()).unwrap_or(version);
                         self.commit(name, &bytes, version, summary).await;
@@ -1419,6 +1437,16 @@ mod tests {
                                 return Err(SyncError::VersionMismatch);
                             }
                         }
+                        // 列表版本是 Hash 时，真实后端会先 GET 比对摘要；这里同样
+                        // 按 sha256 校验，模拟弱服务器。
+                        Some((bytes, _)) if matches!(version, RemoteVersion::Hash(_)) => {
+                            if sha256
+                                .as_deref()
+                                .is_some_and(|expected| sha256_base64(bytes) != expected)
+                            {
+                                return Err(SyncError::VersionMismatch);
+                            }
+                        }
                         _ => return Err(SyncError::VersionMismatch),
                     },
                     _ => {}
@@ -1435,6 +1463,15 @@ mod tests {
                 if let Expect::Version { version, sha256 } = &expect {
                     match files.get(name) {
                         Some((bytes, current)) if current == version => {
+                            if sha256
+                                .as_deref()
+                                .is_some_and(|expected| sha256_base64(bytes) != expected)
+                            {
+                                return Err(SyncError::VersionMismatch);
+                            }
+                        }
+                        // Hash 版本按内容摘要校验，和真实 WebDAV 后端的弱服务器路径一致。
+                        Some((bytes, _)) if matches!(version, RemoteVersion::Hash(_)) => {
                             if sha256
                                 .as_deref()
                                 .is_some_and(|expected| sha256_base64(bytes) != expected)
@@ -1709,25 +1746,26 @@ mod tests {
     }
 
     #[test]
-    fn restore_local_writes_the_file_instead_of_recording_a_missing_one() {
+    fn restore_local_with_identical_content_still_propagates_deletion() {
         let backend = FakeBackend::strong();
         let harness = Harness::with_backend("restore-local-dedupe", backend.clone());
         let text = "# 2026-10-23\n\n- 10:00 a\n";
         harness.write("2026-10-23.md", text);
         assert_eq!(harness.run().uploaded, 1);
 
-        // 本地文件意外消失，同时远端版本令牌漂移但内容没变。
+        // 本地删除，同时远端版本令牌漂移但内容没变：内容没变就不算远端修改，
+        // 本地缺失按用户删除处理。
         fs::remove_file(harness.notes.join("2026-10-23.md")).unwrap();
         backend.diverge_list_versions();
 
         let summary = harness.run();
-        assert_eq!(summary.downloaded, 1, "{summary:?}");
-        assert_eq!(harness.read("2026-10-23.md"), text);
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+        assert!(!harness.notes.join("2026-10-23.md").exists());
 
-        // 下一轮不能把远端唯一副本当成用户删除。
+        // 下一轮把删除传播到远端（删除前会备份到 trash）。
         let summary = harness.run();
-        assert_eq!(summary.deleted, 0, "{summary:?}");
-        assert!(backend.content("2026-10-23.md").is_some());
+        assert_eq!(summary.deleted, 1, "{summary:?}");
+        assert!(backend.content("2026-10-23.md").is_none());
     }
 
     #[test]
@@ -1917,9 +1955,22 @@ mod tests {
             "{summary:?}"
         );
         assert_eq!(summary.deleted, 0, "{summary:?}");
+        // RestoreLocal 也被拦住：目录保持为空，安全阀下一轮仍然生效。
+        assert!(!harness.notes.join("2026-10-01.md").exists());
+        assert!(!harness.notes.join("2026-10-02.md").exists());
         // 未变的远端文件不能被删。
         assert!(backend.content("2026-10-03.md").is_some());
         assert!(backend.content("2026-10-04.md").is_some());
+
+        let summary = harness.run();
+        assert!(
+            summary.errors.iter().any(|error| error.contains("安全阀")),
+            "{summary:?}"
+        );
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        for day in 1..=4 {
+            assert!(backend.content(&format!("2026-10-{day:02}.md")).is_some());
+        }
     }
 
     #[test]
@@ -2354,7 +2405,7 @@ mod tests {
         let harness = Harness::new("scan-nonfile");
         fs::create_dir_all(harness.notes.join("2026-10-23.md")).unwrap();
 
-        let scan = scan_local(&harness.notes, &Mutex::new(())).unwrap();
+        let scan = scan_local(&harness.notes).unwrap();
         assert!(scan.skipped.contains("2026-10-23.md"));
         assert!(!scan.files.contains_key("2026-10-23.md"));
     }
