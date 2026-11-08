@@ -103,10 +103,21 @@ mod imp {
     }
 
     pub(super) fn clear(kind: SyncKind, url: &str, username: &str) -> Result<(), String> {
-        match entry(kind, url, username)?.delete_credential() {
+        let result = match entry(kind, url, username)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(format!("删除密码失败：{error}")),
+        };
+        // 0.5.x 的旧账号名也要清掉，否则 load() 的迁移回退会把刚删掉的
+        // 密码重新搬回来。
+        if kind == SyncKind::Webdav {
+            let legacy_id = legacy_account(url, username);
+            if legacy_id != account(kind, url, username) {
+                if let Ok(legacy) = keyring::Entry::new(SERVICE, &legacy_id) {
+                    let _ = legacy.delete_credential();
+                }
+            }
         }
+        result
     }
 }
 

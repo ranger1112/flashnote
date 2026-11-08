@@ -229,7 +229,9 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
 
   cancel.addEventListener("click", close);
 
+  let saving = false;
   const commit = async (): Promise<void> => {
+    if (saving) return;
     const value = editor.value.trim();
     if (!value) {
       toast("内容不能为空", true);
@@ -239,6 +241,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       close();
       return;
     }
+    saving = true;
     save.disabled = true;
     try {
       const tags = await invoke<string[]>("update_note_entry", {
@@ -253,12 +256,20 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       note.content = value;
       // 标签由后端重新解析：正文改了标签就会变，不能用旧的
       note.tags = tags;
+      // 保存期间又输入了内容：保持编辑器打开，别把新输入一起关掉。
+      if (editor.value.trim() !== value) {
+        toast("已保存；还有新输入未保存", true);
+        save.disabled = false;
+        return;
+      }
       close();
       toast("已更新");
       renderNotes();
     } catch (error) {
       save.disabled = false;
       toast(String(error), true);
+    } finally {
+      saving = false;
     }
   };
 

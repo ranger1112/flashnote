@@ -340,16 +340,18 @@ impl WebDavBackend {
         url: &Url,
         version: &RemoteVersion,
         sha256: Option<&str>,
-    ) -> Result<(), SyncError> {
+    ) -> Result<Option<RemoteVersion>, SyncError> {
         if let Some(expected) = sha256 {
-            let (bytes, _) = self.read_bytes(url.clone()).await?;
+            let (bytes, observed) = self.read_bytes(url.clone()).await?;
             if sha256_base64(&bytes) != expected {
                 return Err(SyncError::VersionMismatch);
             }
-            return Ok(());
+            // 回读顺带拿到的 ETag 可以用于接下来的 If-Match，把复核与写入
+            // 之间的窗口关掉。
+            return Ok(Some(observed));
         }
         match self.stat_version(url).await {
-            Some(current) if &current == version => Ok(()),
+            Some(current) if &current == version => Ok(Some(current)),
             Some(_) => Err(SyncError::VersionMismatch),
             None => Err(SyncError::Unsupported(
                 "服务器不支持条件写入，无法安全覆盖".into(),
@@ -357,19 +359,41 @@ impl WebDavBackend {
         }
     }
 
-    /// 弱服务器写入后回读比对：内容被改写时重写一次，仍不一致就报错。
-    async fn verify_write(&self, url: &Url, data: &[u8]) -> Result<(), SyncError> {
+    /// 弱服务器写入后回读比对。
+    ///
+    /// 回读不一致时只有拿到这次写入的强 ETag 才敢补写；否则可能是另一台设备
+    /// 在窗口期写了新版本，无条件重写会把它覆盖掉，宁可报版本冲突。
+    async fn verify_write(
+        &self,
+        url: &Url,
+        data: &[u8],
+        written: Option<&RemoteVersion>,
+    ) -> Result<(), SyncError> {
         for attempt in 0..2 {
             match self.read_bytes(url.clone()).await {
                 Ok((bytes, _)) if bytes == data => return Ok(()),
                 Ok(_) if attempt == 0 => {
+                    let Some(RemoteVersion::Etag(tag)) = written else {
+                        return Err(SyncError::VersionMismatch);
+                    };
+                    if !(self.caps.strong_etag && self.caps.honors_if_match) {
+                        return Err(SyncError::VersionMismatch);
+                    }
                     self.request(
                         Method::PUT,
                         url.clone(),
-                        vec![(
-                            CONTENT_TYPE,
-                            HeaderValue::from_static("text/markdown; charset=utf-8"),
-                        )],
+                        vec![
+                            (
+                                CONTENT_TYPE,
+                                HeaderValue::from_static("text/markdown; charset=utf-8"),
+                            ),
+                            (
+                                IF_MATCH,
+                                HeaderValue::from_str(tag).map_err(|error| {
+                                    SyncError::Other(format!("ETag 不合法：{error}"))
+                                })?,
+                            ),
+                        ],
                         Some(data.to_vec()),
                         TRANSFER_TIMEOUT,
                     )
@@ -632,8 +656,20 @@ impl SyncBackend for WebDavBackend {
                 conditional = true;
             }
             Expect::Version { version, sha256 } => {
-                // 没有可用的 If-Match：先确认远端仍是预期内容，避免无条件覆盖。
-                self.check_version(&url, version, sha256.as_deref()).await?;
+                // 记录里的版本是 Hash（PROPFIND 没给 ETag）时，先 GET 复核内容；
+                // 回读响应里的强 ETag 仍然可以用于接下来的 If-Match。
+                let observed = self.check_version(&url, version, sha256.as_deref()).await?;
+                if self.caps.strong_etag && self.caps.honors_if_match {
+                    if let Some(RemoteVersion::Etag(tag)) = observed {
+                        headers.push((
+                            IF_MATCH,
+                            HeaderValue::from_str(&tag).map_err(|error| {
+                                SyncError::Other(format!("ETag 不合法：{error}"))
+                            })?,
+                        ));
+                        conditional = true;
+                    }
+                }
             }
         }
 
@@ -680,7 +716,7 @@ impl SyncBackend for WebDavBackend {
             .map(RemoteVersion::Etag);
 
         if !conditional {
-            self.verify_write(&url, data).await?;
+            self.verify_write(&url, data, version.as_ref()).await?;
         }
 
         if let Some(version) = version {
@@ -712,10 +748,21 @@ impl SyncBackend for WebDavBackend {
         }
         if !conditional {
             if let Expect::Version { version, sha256 } = &expect {
-                self.check_version(&url, version, sha256.as_deref()).await?;
+                let observed = self.check_version(&url, version, sha256.as_deref()).await?;
+                // 复核用的 GET 如果带回强 ETag，就把它升级成条件删除。
+                if self.caps.strong_etag && self.caps.honors_if_match {
+                    if let Some(RemoteVersion::Etag(tag)) = observed {
+                        headers.push((
+                            IF_MATCH,
+                            HeaderValue::from_str(&tag).map_err(|error| {
+                                SyncError::Other(format!("ETag 不合法：{error}"))
+                            })?,
+                        ));
+                    }
+                }
             }
         }
-        // 无论条件与否，这里都只剩 DELETE 本身（非条件路径的 GET 复核已经执行过）。
+        // 条件路径只剩 DELETE 本身；非条件路径的 GET 复核已经执行过。
         self.reserve_budget(1)?;
         let (response, _) = self
             .request(Method::DELETE, url, headers, None, REQUEST_TIMEOUT)
@@ -1618,7 +1665,9 @@ mod tests {
             .put("2026-10-23.md", b"- 10:00 hi\n", Expect::Absent)
             .await
             .unwrap_err();
-        assert!(matches!(error, SyncError::Unsupported(_)));
+        // 没有 ETag 就无法证明远端还是我们刚写的那一版，不能盲目重写；
+        // 报版本冲突，让引擎按合并/冲突路径处理。
+        assert!(matches!(error, SyncError::VersionMismatch));
     }
 
     #[tokio::test]

@@ -47,6 +47,23 @@ fn overlap_area(a: Rect, b: Rect) -> i64 {
     }
 }
 
+/// 保存位置所在显示器当前的缩放。窗口刚创建时在主屏上，
+/// `window.scale_factor()` 拿到的是主屏的，不能代表保存时那块屏。
+fn monitor_scale_at(window: &WebviewWindow, x: i32, y: i32) -> Option<f64> {
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .find(|monitor| {
+            let area = monitor.work_area();
+            x >= area.position.x
+                && x < area.position.x.saturating_add(area.size.width as i32)
+                && y >= area.position.y
+                && y < area.position.y.saturating_add(area.size.height as i32)
+        })
+        .map(|monitor| monitor.scale_factor())
+}
+
 fn monitor_rects(window: &WebviewWindow) -> Vec<Rect> {
     window
         .available_monitors()
@@ -208,8 +225,12 @@ pub fn apply_initial_geometry(app: &AppHandle) {
     match saved {
         Some(geometry) => {
             let monitors = monitor_rects(&window);
-            // 物理像素会随 DPI 缩放变化，按保存时的缩放换算回同样的逻辑位置/尺寸
+            // 物理像素会随 DPI 缩放变化，按保存时的缩放换算回同样的逻辑位置/尺寸。
+            // 窗口启动时在主屏，scale_factor() 是主屏的；保存的几何可能在另一块屏，
+            // 必须用保存位置那块屏的当前缩放。
             let current_scale = window.scale_factor().unwrap_or(1.0);
+            let target_scale =
+                monitor_scale_at(&window, geometry.x, geometry.y).unwrap_or(current_scale);
             let scaled = scale_geometry(
                 Rect {
                     x: geometry.x,
@@ -218,7 +239,7 @@ pub fn apply_initial_geometry(app: &AppHandle) {
                     h: geometry.h,
                 },
                 geometry.scale,
-                current_scale,
+                target_scale,
             );
             let (x, y) = clamp_rect(scaled, &monitors);
             let (w, h) = clamp_size(scaled.w, scaled.h, x, y, &monitors);

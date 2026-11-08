@@ -103,6 +103,11 @@ export function handleRecordingKey(event: KeyboardEvent): void {
 }
 
 export function showSettingsPanel(): void {
+  // 面板已经打开时不要重填表单：用户可能刚输入了还没保存的地址、账号或密码。
+  if (!ui.settingsPanel.classList.contains("hidden")) {
+    ui.settingsClose.focus();
+    return;
+  }
   paintSettings();
   paintSyncForm();
   void refreshSyncStatus();

@@ -331,7 +331,7 @@ pub(crate) fn is_sync_name(name: &str) -> bool {
     is_valid_note_name(name)
 }
 
-fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
+fn scan_local(dir: &Path, io: &Mutex<()>) -> Result<LocalScan, SyncError> {
     let entries = fs::read_dir(dir)
         .map_err(|error| SyncError::Aborted(format!("无法读取笔记目录：{error}")))?;
     let mut scan = LocalScan::default();
@@ -378,7 +378,19 @@ fn scan_local(dir: &Path) -> Result<LocalScan, SyncError> {
             scan.skipped.insert(name);
             continue;
         }
-        let bytes = match fs::read(&path) {
+        // 与追加/改写共用一把锁：append_note 是多次 write，不锁的话可能
+        // 读到半截文件并把它当成完整内容上传。
+        let bytes = {
+            let _guard = io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            fs::read(&path)
+        };
+        let bytes = match bytes {
+            // 元数据检查之后文件可能又被追加过，读完再确认一次大小。
+            Ok(bytes) if bytes.len() as u64 > MAX_FILE_BYTES => {
+                scan.warnings.push(format!("{name}：超过 2 MiB，已跳过"));
+                scan.skipped.insert(name);
+                continue;
+            }
             Ok(bytes) => bytes,
             Err(error) => {
                 scan.warnings.push(format!("{name}：读取失败（{error}）"));
@@ -466,7 +478,8 @@ impl<B: SyncBackend> SyncEngine<B> {
         }
 
         let notes_dir = self.notes_dir.clone();
-        let scan = match blocking(move || scan_local(&notes_dir)).await {
+        let io = self.io.clone();
+        let scan = match blocking(move || scan_local(&notes_dir, &io)).await {
             Ok(Ok(scan)) => scan,
             Ok(Err(error)) => {
                 summary.aborted = true;
@@ -2341,7 +2354,7 @@ mod tests {
         let harness = Harness::new("scan-nonfile");
         fs::create_dir_all(harness.notes.join("2026-10-23.md")).unwrap();
 
-        let scan = scan_local(&harness.notes).unwrap();
+        let scan = scan_local(&harness.notes, &Mutex::new(())).unwrap();
         assert!(scan.skipped.contains("2026-10-23.md"));
         assert!(!scan.files.contains_key("2026-10-23.md"));
     }
