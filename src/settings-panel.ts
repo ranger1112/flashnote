@@ -104,7 +104,11 @@ export function handleRecordingKey(event: KeyboardEvent): void {
 
 export function showSettingsPanel(): void {
   // 面板已经打开时不要重填表单：用户可能刚输入了还没保存的地址、账号或密码。
-  if (!ui.settingsPanel.classList.contains("hidden")) {
+  // 正在播关闭动画（panel-leave）时不算，交给 showPanel 取消动画并重新打开。
+  if (
+    !ui.settingsPanel.classList.contains("hidden") &&
+    !ui.settingsPanel.classList.contains("panel-leave")
+  ) {
     ui.settingsClose.focus();
     return;
   }
