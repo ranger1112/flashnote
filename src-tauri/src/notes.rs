@@ -387,8 +387,8 @@ fn needs_protection(line: &str, previous_blank: bool) -> bool {
         || (previous_blank && list_time(line).is_some())
 }
 
-/// 去掉写入时加的保护空格；只有去掉后确实像条目头才去，避免改动用户
-/// 自己缩进的内容。
+/// 去掉写入时加的保护空格；只有去掉后确实像条目头才去。
+/// 用户自己写的一个前导空格也会被归一化，但 Markdown 渲染效果不变。
 fn strip_protection(line: &str, previous_blank: bool) -> &str {
     match line.strip_prefix(' ') {
         Some(rest) if needs_protection(rest, previous_blank) => rest,
