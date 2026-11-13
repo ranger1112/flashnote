@@ -9,7 +9,11 @@ export function el<T extends HTMLElement>(id: string): T {
 }
 
 export const ui = {
-  textarea: el<HTMLTextAreaElement>("note"),
+  editorMount: el<HTMLDivElement>("note-editor"),
+  continuationBar: el<HTMLDivElement>("continuation-bar"),
+  continuationLabel: el<HTMLSpanElement>("continuation-label"),
+  continuationExit: el<HTMLButtonElement>("continuation-exit"),
+  sourceToggle: el<HTMLButtonElement>("source-toggle"),
   pinButton: el<HTMLButtonElement>("pin"),
   settingsButton: el<HTMLButtonElement>("settings-btn"),
   closeButton: el<HTMLButtonElement>("close-btn"),

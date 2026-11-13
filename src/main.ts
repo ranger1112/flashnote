@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { externalLinkTarget } from "./lib";
+import { externalLinkTarget, type NoteEntry } from "./lib";
 import { ui } from "./dom";
 import { toast } from "./toast";
 import { anyPanelOpen, setBackgroundInert, trapFocus } from "./panels";
@@ -9,10 +9,17 @@ import { refreshSettings, settings } from "./settings-store";
 import {
   clearStoredDraft,
   flushDraft,
-  initDraft,
   restoreDraft,
   scheduleDraftSave,
 } from "./draft";
+import { focusEditor, getText, initEditor, setText, toggleSourceMode } from "./editor";
+import {
+  activeContinuation,
+  endContinuation,
+  initContinuation,
+  startContinuation,
+  updateContinuationContent,
+} from "./continuation";
 import { initSync, markSyncPending, refreshSyncStatus } from "./sync";
 import { initUpdater, startAutoUpdateChecks } from "./updater";
 import {
@@ -116,39 +123,155 @@ async function hideWindow(): Promise<void> {
   await invoke("hide_window");
 }
 
-async function saveNote(): Promise<void> {
-  if (saving || isAppLocked()) return;
+interface SaveOptions {
+  /** 忽略续写目标，强制作为新记录追加（用于「续写」前保存当前草稿） */
+  forceAppend?: boolean;
+  /** 成功后是否自动收起窗口，默认跟随常驻模式 */
+  hideOnSuccess?: boolean;
+  /** 不弹成功提示（调用方会给出合并后的提示） */
+  quiet?: boolean;
+}
 
-  const content = ui.textarea.value.trim();
+interface SaveResult {
+  ok: boolean;
+  /** 保存期间编辑器里又出现新输入：调用方不要覆盖当前内容 */
+  editorChanged: boolean;
+}
+
+async function saveNote(options: SaveOptions = {}): Promise<SaveResult> {
+  if (saving || isAppLocked()) return { ok: false, editorChanged: false };
+
+  const content = getText().trim();
   if (!content) {
+    endContinuation();
     await hideWindow();
-    return;
+    return { ok: false, editorChanged: false };
   }
 
   saving = true;
+  const target = options.forceAppend ? null : activeContinuation();
   try {
+    if (target) {
+      // 正文没有变化：不写盘，直接结束续写
+      if (content === target.content) {
+        const unchanged = getText().trim() === content;
+        if (unchanged) {
+          setText("");
+          clearStoredDraft();
+          endContinuation();
+          if (!options.quiet) toast(`未修改 · ${target.time}`);
+          if (options.hideOnSuccess !== false && !pinned) {
+            window.setTimeout(() => {
+              void invoke("hide_window");
+            }, 380);
+          }
+        } else {
+          scheduleDraftSave();
+          if (!options.quiet) toast(`未修改 · ${target.time}（新输入尚未保存）`, true);
+        }
+        return { ok: true, editorChanged: !unchanged };
+      }
+
+      await invoke<string[]>("update_note_entry", {
+        path: target.path,
+        date: target.date,
+        time: target.time,
+        content: target.content,
+        newContent: content,
+      });
+      // 已经在磁盘上产生变更，先标记待同步；真正的同步结果由 sync-status 广播回来。
+      markSyncPending();
+      // 下一次保存必须用新正文定位原记录
+      updateContinuationContent(content);
+
+      if (getText().trim() === content) {
+        setText("");
+        clearStoredDraft();
+        endContinuation();
+        if (!options.quiet) toast(`已更新 · ${target.time}`);
+        if (options.hideOnSuccess !== false && !pinned) {
+          window.setTimeout(() => {
+            void invoke("hide_window");
+          }, 380);
+        }
+        return { ok: true, editorChanged: false };
+      }
+
+      scheduleDraftSave();
+      if (!options.quiet) toast(`已更新 · ${target.time}（新输入尚未保存）`, true);
+      return { ok: true, editorChanged: true };
+    }
+
     const saved = await invoke<SavedNote>("save_note", { content });
     // 已经在磁盘上产生变更，先标记待同步；真正的同步结果由 sync-status 广播回来。
     markSyncPending();
+    // 当前内容已作为新记录落盘，之前可能存在的续写目标随之作废
+    endContinuation();
+
     // 保存期间用户可能继续输入：只有内容没变时才清空，否则保留新内容并补一次草稿
-    if (ui.textarea.value.trim() === content) {
-      ui.textarea.value = "";
+    if (getText().trim() === content) {
+      setText("");
       clearStoredDraft();
-      toast(`已保存 · ${saved.time}`);
-      if (!pinned) {
+      if (!options.quiet) toast(`已保存 · ${saved.time}`);
+      if (options.hideOnSuccess !== false && !pinned) {
         window.setTimeout(() => {
           void invoke("hide_window");
         }, 380);
       }
-    } else {
-      scheduleDraftSave();
-      toast(`已保存 · ${saved.time}（新输入尚未保存）`);
+      return { ok: true, editorChanged: false };
     }
+
+    scheduleDraftSave();
+    if (!options.quiet) toast(`已保存 · ${saved.time}（新输入尚未保存）`);
+    return { ok: true, editorChanged: true };
   } catch (error) {
     toast(String(error), true);
+    return { ok: false, editorChanged: false };
   } finally {
     saving = false;
   }
+}
+
+/** 历史条目「续写」：必要时先保存当前草稿，再载入目标并进入续写模式。 */
+async function handleContinueEntry(note: NoteEntry): Promise<void> {
+  if (isAppLocked()) return;
+  if (saving) {
+    toast("正在保存，请稍候", true);
+    return;
+  }
+  if (hasOpenEditor()) {
+    toast("请先保存或取消正在编辑的笔记", true);
+    return;
+  }
+
+  const currentText = getText().trim();
+  const currentTarget = activeContinuation();
+  if (currentTarget && currentText === currentTarget.content) {
+    // 只是切换到另一条续写且当前记录没有改动：不写盘，避免生成重复记录
+    endContinuation();
+  } else if (currentText) {
+    const result = await saveNote({ forceAppend: true, hideOnSuccess: false, quiet: true });
+    if (!result.ok) return;
+    if (result.editorChanged) {
+      toast("编辑器里有新输入，未切换到续写", true);
+      // 当前内容已经作为新记录落盘，刷新列表让用户看到它
+      void refreshNotes();
+      return;
+    }
+  }
+
+  // 预保存是异步的：期间用户可能打开了行内编辑或上锁，不能再切换
+  if (isAppLocked()) return;
+  if (hasOpenEditor()) {
+    toast("请先保存或取消正在编辑的笔记", true);
+    return;
+  }
+
+  startContinuation(note);
+  setText(note.content, { caret: "end" });
+  closeHistory(false);
+  focusEditor();
+  toast(`续写 ${note.time} 的记录`, false, 1600);
 }
 
 function openSettings(): void {
@@ -179,7 +302,7 @@ let hydrateStarted = false;
 /** 解锁后（或本来就没锁）才加载设置、草稿与同步状态。 */
 async function hydrate(): Promise<void> {
   if (hydrateStarted) {
-    ui.textarea.focus();
+    focusEditor();
     return;
   }
   hydrateStarted = true;
@@ -210,7 +333,7 @@ async function hydrate(): Promise<void> {
       if (await handleFirstShow()) return;
     }
 
-    ui.textarea.focus();
+    focusEditor();
   } catch (error) {
     // 失败后允许下一次解锁重新 hydrate；否则整个进程都不会再加载草稿/设置。
     hydrateStarted = false;
@@ -261,12 +384,18 @@ async function showStartupNotice(): Promise<boolean> {
   return true;
 }
 
-initDraft();
-initHistory();
+const captureEditor = initEditor({ mount: ui.editorMount, onChange: scheduleDraftSave });
+ui.sourceToggle.hidden = captureEditor.kind !== "codemirror";
+initHistory({
+  onContinue: (note) => {
+    void handleContinueEntry(note).catch((error) => toast(String(error), true));
+  },
+});
 initSettingsPanel();
 initLockSettings();
 initSync();
 initUpdater();
+initContinuation();
 
 initAppLock({
   onLocked: () => {
@@ -279,7 +408,7 @@ initAppLock({
     if (!appReady) {
       await hydrate();
     } else if (!anyPanelOpen()) {
-      ui.textarea.focus();
+      focusEditor();
     }
   },
 });
@@ -318,6 +447,13 @@ ui.pinButton.addEventListener("click", async () => {
 ui.settingsButton.addEventListener("click", openSettings);
 ui.notesButton.addEventListener("click", openHistory);
 ui.closeButton.addEventListener("click", () => void hideWindow());
+ui.sourceToggle.addEventListener("click", () => {
+  const sourceMode = toggleSourceMode();
+  ui.sourceToggle.setAttribute("aria-pressed", String(sourceMode));
+  ui.sourceToggle.textContent = sourceMode ? "预览" : "源码";
+  ui.sourceToggle.title = sourceMode ? "切换回实时渲染" : "查看 Markdown 源码";
+  focusEditor();
+});
 
 /**
  * window/document 上的监听在开发热更新与测试里会跨「安装」累积：旧实例仍会
@@ -476,7 +612,7 @@ void listen<ShowPayload>("window-shown", async (event) => {
   if (!ui.settingsPanel.classList.contains("hidden")) return;
   void handleFirstShow()
     .then((handled) => {
-      if (!handled) ui.textarea.focus();
+      if (!handled) focusEditor();
     })
     .catch((error) => toast(String(error), true));
 }).catch(reportListenerError);

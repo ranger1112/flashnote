@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { ui } from "./dom";
+import { getText, setText } from "./editor";
 
 export const DRAFT_KEY = "flashnote.draft";
 
@@ -15,7 +15,7 @@ export function scheduleDraftSave(): void {
 
 export async function persistDraft(): Promise<void> {
   try {
-    await invoke("save_draft", { content: ui.textarea.value });
+    await invoke("save_draft", { content: getText() });
   } catch {
     // 草稿写入失败不打断输入，下一次输入会重试
   }
@@ -39,21 +39,16 @@ export function clearStoredDraft(): void {
   void invoke("clear_draft").catch(() => {});
 }
 
-/** 模块加载时绑定输入事件，保证任何输入都能排入草稿保存。 */
-export function initDraft(): void {
-  ui.textarea.addEventListener("input", scheduleDraftSave);
-}
-
 /** 启动时读取磁盘草稿；首次升级时把 localStorage 中的旧草稿迁移过来。 */
 export async function restoreDraft(): Promise<void> {
   const legacyDraft = localStorage.getItem(DRAFT_KEY);
   const draft = await invoke<string>("load_draft");
   // 读取期间用户可能已经开始输入，不要用磁盘内容把它盖掉
-  if (ui.textarea.value === "") {
+  if (getText() === "") {
     if (draft) {
-      ui.textarea.value = draft;
+      setText(draft, { caret: "end" });
     } else if (legacyDraft) {
-      ui.textarea.value = legacyDraft;
+      setText(legacyDraft, { caret: "end" });
     }
   }
 

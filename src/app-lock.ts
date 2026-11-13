@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { applyTheme } from "./appearance";
 import { ui } from "./dom";
+import { focusEditor } from "./editor";
 import { normalizeTheme } from "./lib";
 import { anyPanelOpen, setBackgroundInert } from "./panels";
 
@@ -178,7 +179,7 @@ export async function enterUnlockedMode(status: LockStatus): Promise<void> {
   // 锁屏关闭时如果也没有其他面板，顺手清掉 panel-open，并把焦点还给输入框。
   if (!anyPanelOpen()) {
     ui.card.classList.remove("panel-open");
-    ui.textarea.focus();
+    focusEditor();
   }
   paintLockButton(status);
   scheduleExpiry(status);

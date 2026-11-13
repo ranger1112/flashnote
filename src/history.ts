@@ -17,6 +17,12 @@ import { markSyncPending, subscribeSyncStatus } from "./sync";
 const PAGE_SIZE = 100;
 const SEARCH_LIMIT = 200;
 
+export interface HistoryHooks {
+  onContinue: (note: NoteEntry) => void;
+}
+
+let historyHooks: HistoryHooks = { onContinue: () => {} };
+
 let searchTimer: number | undefined;
 let notes: NoteEntry[] = [];
 let noteOffset = 0;
@@ -249,7 +255,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
       // 重渲列表，否则会一直显示保存前的旧文本。
       savedWhileEditing = false;
       renderNotes();
-      document.querySelector<HTMLButtonElement>(".entry-action")?.focus();
+      document.querySelector<HTMLButtonElement>(".entry-action.edit")?.focus();
       return;
     }
     editButton.focus();
@@ -411,9 +417,22 @@ function renderNotes(): void {
       const actions = document.createElement("div");
       actions.className = "entry-actions";
 
+      const continueButton = document.createElement("button");
+      continueButton.type = "button";
+      continueButton.className = "entry-action continue";
+      continueButton.textContent = "续写";
+      continueButton.title = "载入主编辑区续写，保存时更新原记录";
+      continueButton.addEventListener("click", () => {
+        if (hasOpenEditor()) {
+          toast("请先保存或取消正在编辑的笔记", true);
+          return;
+        }
+        historyHooks.onContinue(note);
+      });
+
       const editButton = document.createElement("button");
       editButton.type = "button";
-      editButton.className = "entry-action";
+      editButton.className = "entry-action edit";
       editButton.textContent = "编辑";
       editButton.title = "编辑这条笔记";
 
@@ -423,7 +442,7 @@ function renderNotes(): void {
       deleteButton.textContent = "删除";
       deleteButton.title = "删除这条笔记";
 
-      actions.append(editButton, deleteButton);
+      actions.append(continueButton, editButton, deleteButton);
 
       const openButton = document.createElement("button");
       openButton.type = "button";
@@ -631,7 +650,8 @@ export function showHistoryPanel(): void {
 }
 
 /** 模块加载时绑定历史面板内部控件（顶栏 notes-btn 由 main 绑定）。 */
-export function initHistory(): void {
+export function initHistory(hooks: HistoryHooks): void {
+  historyHooks = hooks;
   ui.historyClose.addEventListener("click", () => closeHistory());
   ui.historyPreview.addEventListener("click", () => void toggleHistoryPreview());
   ui.historySearch.addEventListener("input", () => {
