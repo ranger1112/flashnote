@@ -897,6 +897,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
+                || v4.is_multicast()
                 // 100.64.0.0/10：运营商级 NAT，同样不是公网。
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         }
@@ -907,6 +908,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             let segments = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 唯一本地地址
                 || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
         }
@@ -1880,8 +1882,12 @@ mod tests {
         let public: IpAddr = "93.184.216.34".parse().unwrap();
         let private: IpAddr = "10.0.0.5".parse().unwrap();
         let cgnat: IpAddr = "100.64.0.1".parse().unwrap();
+        let multicast_v4: IpAddr = "224.0.0.1".parse().unwrap();
+        let multicast_v6: IpAddr = "ff02::1".parse().unwrap();
         assert!(ips_are_private([private, public]));
         assert!(ips_are_private([cgnat]));
+        assert!(ips_are_private([multicast_v4]));
+        assert!(ips_are_private([multicast_v6]));
         assert!(!ips_are_private([public]));
     }
 

@@ -850,10 +850,20 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
                 if tag_hits.len() >= limit {
                     return Ok(tag_hits);
                 }
-            } else if text_hits.len() < limit && contains_literal_tag(&content, needle) {
-                // 没有同名标签时退回字面量匹配：只找「不是更长标签前缀」的那些。
+            } else if text_hits.len() < limit {
+                // 没有同名标签时退回字面量匹配：正文按标签边界匹配，
+                // 来源/日期/时间仍按普通子串匹配（来源里的 #1234 要能搜到）。
                 // 只保留前 limit 条，避免把整库命中都克隆进内存。
-                text_hits.push(entry_with_tags(&path, &date, time, content, source, tags));
+                let source_hit = source
+                    .as_deref()
+                    .is_some_and(|value| contains_fold(value, needle));
+                if contains_literal_tag(&content, needle)
+                    || source_hit
+                    || contains_fold(&date, needle)
+                    || contains_fold(&time, needle)
+                {
+                    text_hits.push(entry_with_tags(&path, &date, time, content, source, tags));
+                }
             }
         }
     }
@@ -904,7 +914,8 @@ pub fn append_note(dir: &Path, date: &str, entry: &str) -> std::io::Result<PathB
     let crlf = existing.contains("\r\n");
     let eol = if crlf { "\r\n" } else { "\n" };
     let body = if crlf {
-        entry.replace('\n', "\r\n")
+        // 正文里如果已经带了 CRLF，先归一成 LF 再转 CRLF，避免写出 \r\r\n。
+        entry.replace("\r\n", "\n").replace('\n', "\r\n")
     } else {
         entry.to_string()
     };
@@ -1356,6 +1367,23 @@ mod tests {
     }
 
     #[test]
+    fn appending_a_crlf_body_does_not_double_the_cr() {
+        let dir =
+            std::env::temp_dir().join(format!("flashnote-test-crlf-body-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-20.md");
+        fs::write(&path, "# 2026-10-20\r\n\r\n- 10:00 旧\r\n").unwrap();
+
+        append_note(&dir, "2026-10-20", "- 11:00 新\r\n  第二行").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\r\r\n"), "不应叠加出 \\r\\r\\n：{text:?}");
+        assert!(text.contains("- 11:00 新\r\n  第二行\r\n"), "{text:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn normalizes_source_whitespace() {
         assert_eq!(
             format_entry("09:05", "x", Some("  A \n  B  ")),
@@ -1527,6 +1555,24 @@ mod tests {
 
         let hits = search_entries(&dir, "#项目A", 10).unwrap();
         assert_eq!(hits.len(), 1, "没有同名标签时应退回子串匹配");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tag_literal_fallback_searches_the_source_too() {
+        let dir = std::env::temp_dir().join(format!("flashnote-tag-source-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("2026-10-21.md"),
+            "# 2026-10-21\n\n- 10:00 正文里没有标签\n  _来源：#1234_\n",
+        )
+        .unwrap();
+
+        let hits = search_entries(&dir, "#1234", 10).unwrap();
+        assert_eq!(hits.len(), 1, "来源里的 #1234 应能通过字面量回退搜到");
+        assert_eq!(hits[0].source.as_deref(), Some("#1234"));
 
         let _ = fs::remove_dir_all(&dir);
     }

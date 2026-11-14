@@ -23,6 +23,15 @@ export function anyPanelOpen(): boolean {
   );
 }
 
+/** 元素当前是否真的可以接收焦点：过滤 disabled、hidden 属性和 display:none。 */
+function isFocusable(node: HTMLElement): boolean {
+  if (node.hasAttribute("disabled") || node.hidden || node.closest("[hidden]")) {
+    return false;
+  }
+  const style = getComputedStyle(node);
+  return style.display !== "none" && style.visibility !== "hidden";
+}
+
 /** 把 Tab 焦点限制在当前打开的面板内。 */
 export function trapFocus(event: KeyboardEvent): void {
   if (event.key !== "Tab") return;
@@ -35,7 +44,7 @@ export function trapFocus(event: KeyboardEvent): void {
     panel.querySelectorAll<HTMLElement>(
       'button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])',
     ),
-  ).filter((node) => !node.hasAttribute("disabled"));
+  ).filter(isFocusable);
   if (focusables.length === 0) return;
 
   const first = focusables[0];
