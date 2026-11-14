@@ -903,6 +903,103 @@ describe("更新", () => {
 
     expect(downloadAndInstall).toHaveBeenCalledTimes(2);
   });
+
+  it("检查未返回时开始安装，旧检查结果不会覆盖重启按钮", async () => {
+    await boot();
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    const downloadAndInstall = vi.fn(async () => {});
+    mocks.check.mockResolvedValueOnce({ version: "0.6.0", downloadAndInstall });
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+
+    const inline = node<HTMLButtonElement>("#update-now");
+    expect(inline.textContent).toBe("立即更新");
+
+    // 第二次检查挂起，随后点击「立即更新」开始安装
+    let finishCheck!: (value: unknown) => void;
+    mocks.check.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishCheck = resolve;
+        }),
+    );
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+
+    inline.click();
+    await flush();
+    expect(inline.textContent).toBe("重启");
+
+    // 旧检查这时才返回：不能把「重启」改回「立即更新」
+    finishCheck({ version: "0.6.0", downloadAndInstall: vi.fn(async () => {}) });
+    await flush();
+
+    expect(inline.textContent).toBe("重启");
+    expect(node<HTMLElement>("#update-status").textContent).toContain("已安装 0.6.0");
+  });
+
+  it("连点重启只触发一次落盘与 relaunch", async () => {
+    await boot({ flush_sync_state: () => null });
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    mocks.check.mockResolvedValueOnce({
+      version: "0.6.0",
+      downloadAndInstall: vi.fn(async () => {}),
+    });
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+    const inline = node<HTMLButtonElement>("#update-now");
+    inline.click();
+    await flush();
+    expect(inline.textContent).toBe("重启");
+
+    let finishRelaunch!: () => void;
+    mocks.relaunch.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishRelaunch = resolve;
+        }),
+    );
+    inline.click();
+    await flush();
+    // 即使绕过 disabled 再派发一次点击，也不能重复落盘或重启
+    inline.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flush();
+
+    expect(
+      mocks.invoke.mock.calls.filter(([cmd]) => cmd === "flush_sync_state"),
+    ).toHaveLength(1);
+    expect(mocks.relaunch).toHaveBeenCalledTimes(1);
+    finishRelaunch();
+    await flush();
+  });
+
+  it("重启失败时恢复按钮并提示", async () => {
+    await boot({ flush_sync_state: () => null });
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    mocks.check.mockResolvedValueOnce({
+      version: "0.6.0",
+      downloadAndInstall: vi.fn(async () => {}),
+    });
+    node<HTMLButtonElement>("#check-update").click();
+    await flush();
+    const inline = node<HTMLButtonElement>("#update-now");
+    inline.click();
+    await flush();
+
+    mocks.relaunch.mockRejectedValueOnce(new Error("无法重启"));
+    inline.click();
+    await flush();
+
+    expect(inline.disabled).toBe(false);
+    expect(inline.textContent).toBe("重启");
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("无法重启");
+  });
 });
 
 describe("Git 自动提交", () => {
@@ -1381,6 +1478,56 @@ describe("云同步", () => {
       kind: "github",
       url: "https://github.com/alice/notes",
     });
+  });
+
+  it("切换同步方式后恢复已保存的 GitHub 分支", async () => {
+    await boot({
+      get_settings: () => ({
+        ...baseSettings,
+        sync: {
+          ...baseSettings.sync,
+          kind: "github",
+          url: "https://github.com/alice/notes",
+          username: "dev",
+        },
+      }),
+    });
+    await openSettings();
+
+    const kind = node<HTMLSelectElement>("#sync-kind");
+    const url = node<HTMLInputElement>("#sync-url");
+    const username = node<HTMLInputElement>("#sync-username");
+    expect(username.value).toBe("dev");
+
+    // 切到 WebDAV 再切回来：已保存的分支与仓库地址不能丢
+    kind.value = "webdav";
+    kind.dispatchEvent(new Event("change"));
+    expect(username.value).toBe("");
+    kind.value = "github";
+    kind.dispatchEvent(new Event("change"));
+    expect(username.value).toBe("dev");
+    expect(url.value).toBe("https://github.com/alice/notes");
+
+    // 未保存的编辑也按方式保留
+    username.value = "feature/x";
+    kind.value = "webdav";
+    kind.dispatchEvent(new Event("change"));
+    kind.value = "github";
+    kind.dispatchEvent(new Event("change"));
+    expect(username.value).toBe("feature/x");
+  });
+
+  it("有未保存的同步设置时不会直接触发同步", async () => {
+    await boot();
+    await openSettings();
+
+    node<HTMLInputElement>("#sync-enabled").checked = true;
+    node<HTMLButtonElement>("#sync-now").click();
+    await flush();
+
+    expect(mocks.invoke).not.toHaveBeenCalledWith("sync_now");
+    expect(node<HTMLElement>("#sync-error").textContent).toContain("请先点「保存」");
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("请先点「保存」");
   });
 
   it("保存失败时保留输入并显示后端错误", async () => {

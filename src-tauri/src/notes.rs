@@ -544,6 +544,17 @@ pub(crate) fn entry_for(
     source: Option<String>,
 ) -> NoteEntry {
     let tags = extract_tags(&content);
+    entry_with_tags(path, date, time, content, source, tags)
+}
+
+fn entry_with_tags(
+    path: &Path,
+    date: &str,
+    time: String,
+    content: String,
+    source: Option<String>,
+    tags: Vec<String>,
+) -> NoteEntry {
     NoteEntry {
         date: date.to_string(),
         time,
@@ -819,33 +830,30 @@ pub fn search_entries(dir: &Path, query: &str, limit: usize) -> std::io::Result<
         };
         parsed.reverse();
         for (time, content, source) in parsed {
-            let tag_hit = tag_query.is_some_and(|tag| {
-                extract_tags(&content)
-                    .iter()
-                    .any(|value| value.eq_ignore_ascii_case(tag))
-            });
-            if tag_hit {
-                tag_hits.push(entry_for(
-                    &path,
-                    &date,
-                    time.clone(),
-                    content.clone(),
-                    source.clone(),
-                ));
-            } else if tag_query.is_some() {
-                // 没有同名标签时退回字面量匹配：只找「不是更长标签前缀」的那些。
-                if contains_literal_tag(&content, needle) {
+            let Some(tag) = tag_query else {
+                if matches_query(&date, &time, &content, source.as_deref(), needle, &folded) {
                     text_hits.push(entry_for(&path, &date, time, content, source));
+                    // 普通关键词：凑够条数立刻返回，不把整库都扫一遍再截断
+                    if text_hits.len() >= limit {
+                        return Ok(text_hits);
+                    }
                 }
-            } else if matches_query(&date, &time, &content, source.as_deref(), needle, &folded) {
-                text_hits.push(entry_for(&path, &date, time, content, source));
-                // 普通关键词：凑够条数立刻返回，不把整库都扫一遍再截断
-                if text_hits.len() >= limit {
-                    return Ok(text_hits);
+                continue;
+            };
+
+            // 标签即结果：一次解析同时用于判断命中与构造条目，避免 entry_for 再算一遍。
+            let tags = extract_tags(&content);
+            if tags.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+                tag_hits.push(entry_with_tags(&path, &date, time, content, source, tags));
+                // 标签命中优先于字面量回退：凑够条数就可以直接返回。
+                // 纯 `#标签` 查询通常没有回退命中，不能等 text_hits 也满才退出。
+                if tag_hits.len() >= limit {
+                    return Ok(tag_hits);
                 }
-            }
-            if tag_query.is_some() && tag_hits.len() >= limit && text_hits.len() >= limit {
-                break;
+            } else if text_hits.len() < limit && contains_literal_tag(&content, needle) {
+                // 没有同名标签时退回字面量匹配：只找「不是更长标签前缀」的那些。
+                // 只保留前 limit 条，避免把整库命中都克隆进内存。
+                text_hits.push(entry_with_tags(&path, &date, time, content, source, tags));
             }
         }
     }
@@ -1561,6 +1569,32 @@ mod tests {
 
         // 普通搜索仍然是子串匹配
         assert_eq!(search_entries(&dir, "工作", 10).unwrap().len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tag_search_stops_at_the_limit_and_returns_newest_hits() {
+        let dir = std::env::temp_dir().join(format!("flashnote-tag-limit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("2026-10-21.md"),
+            "# 2026-10-21\n\n- 09:00 旧记录 #工作\n\n- 10:00 较新记录 #工作\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("2026-10-22.md"),
+            "# 2026-10-22\n\n- 08:00 最新记录 #工作\n",
+        )
+        .unwrap();
+
+        // 纯标签查询在凑够 limit 后直接返回，不会等 text_hits 也满；
+        // 结果按日期倒序、文件内倒序，取最新的命中。
+        let hits = search_entries(&dir, "#工作", 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("最新记录"));
+        assert_eq!(hits[0].date, "2026-10-22");
 
         let _ = fs::remove_dir_all(&dir);
     }
