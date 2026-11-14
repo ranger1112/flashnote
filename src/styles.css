@@ -688,6 +688,10 @@ kbd {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 触摸屏纵向滑动时，负外边距 + 小数 DPI 会让容器出现极小的横向滚动范围，
+     表现为列表左右漂移；横向滚动直接禁掉，宽表格在自己的容器里滚动。 */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   margin: 0 -4px;
   padding: 0 4px;
 }
@@ -973,6 +977,11 @@ kbd {
 }
 
 .entry-content.markdown table {
+  /* 宽表格在自身内部横向滚动，不再把整个历史列表撑出横向滚动条 */
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
 }
 
