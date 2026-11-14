@@ -290,6 +290,7 @@ fn main() {
             commands::search_notes,
             commands::delete_note_entry,
             commands::update_note_entry,
+            commands::get_note_entries,
             commands::open_note_file,
             commands::open_today_note,
             commands::open_notes_dir,

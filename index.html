@@ -48,18 +48,32 @@
       </header>
 
       <main>
-        <textarea
-          id="note"
-          aria-label="速记内容"
-          placeholder="想到什么就写什么…"
-          spellcheck="false"
-          autofocus
-        ></textarea>
+        <div
+          id="continuation-bar"
+          class="continuation-bar"
+          role="status"
+          aria-live="polite"
+          hidden
+        >
+          <span id="continuation-label"></span>
+          <button id="continuation-exit" class="btn tiny" type="button">退出续写</button>
+        </div>
+        <div id="note-editor" class="note-editor"></div>
       </main>
 
       <footer>
         <span id="source" class="source"></span>
         <span id="sync-indicator" class="sync-indicator" aria-live="polite"></span>
+        <button
+          id="source-toggle"
+          class="btn tiny"
+          type="button"
+          aria-pressed="false"
+          title="查看 Markdown 源码"
+          hidden
+        >
+          源码
+        </button>
         <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 收起</span>
       </footer>
 

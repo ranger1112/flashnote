@@ -1,4 +1,5 @@
 import { ui } from "./dom";
+import { focusEditor } from "./editor";
 
 export const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 // 与 styles.css 里的动画时长保持一致
@@ -105,6 +106,6 @@ export function afterPanelClosed(): void {
   // 锁屏还开着时保持背景 inert，也不要把焦点还给正文。
   if (ui.lockPanel.classList.contains("hidden")) {
     setBackgroundInert(false);
-    ui.textarea.focus();
+    focusEditor();
   }
 }

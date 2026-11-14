@@ -536,7 +536,7 @@ fn note_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn entry_for(
+pub(crate) fn entry_for(
     path: &Path,
     date: &str,
     time: String,

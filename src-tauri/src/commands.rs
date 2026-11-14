@@ -828,6 +828,40 @@ pub async fn update_note_entry(
     .await
 }
 
+/// 读取某个日期文件里的全部条目；续写定位失败时用来刷新原记录内容。
+#[tauri::command]
+pub async fn get_note_entries(
+    app: AppHandle,
+    path: String,
+) -> Result<Vec<notes::NoteEntry>, String> {
+    require_unlocked_app(&app)?;
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let notes_dir = PathBuf::from(
+            &state
+                .settings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .notes_dir,
+        );
+        let dir = notes_dir
+            .canonicalize()
+            .map_err(|err| format!("笔记目录不可用：{err}"))?;
+        let target = files::resolve_within(&dir, &path)?;
+        let text = std::fs::read_to_string(&target).map_err(|err| format!("读取失败：{err}"))?;
+        let date = target
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(notes::parse_entries(&text)
+            .into_iter()
+            .map(|(time, content, source)| notes::entry_for(&target, &date, time, content, source))
+            .collect())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn open_note_file(app: AppHandle, path: String) -> Result<(), String> {
     require_unlocked_app(&app)?;

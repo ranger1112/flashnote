@@ -13,6 +13,7 @@
   /* 文字用的强调色：深色背景上与 --accent 相同 */
   --accent-text: #f5a524;
   --danger: #f87171;
+  --selection: rgba(245, 165, 36, 0.24);
   --shadow: 0 10px 26px rgba(0, 0, 0, 0.26), 0 2px 8px rgba(0, 0, 0, 0.16);
   --scrollbar-thumb: rgba(255, 255, 255, 0.18);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.34);
@@ -31,6 +32,7 @@
   --accent-text: #b45309;
   /* #f87171 在浅色背景上约 2.7:1，文字改用 red-600（约 4.7:1） */
   --danger: #dc2626;
+  --selection: rgba(217, 119, 6, 0.2);
   --shadow: 0 10px 24px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.07);
   --scrollbar-thumb: rgba(0, 0, 0, 0.16);
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.3);
@@ -202,7 +204,23 @@ main {
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: column;
   padding: 2px 6px 0;
+}
+
+.note-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.note-editor .cm-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+.note-editor .cm-scroller {
+  overflow: auto;
 }
 
 textarea {
@@ -221,6 +239,115 @@ textarea {
 textarea::placeholder {
   color: var(--muted);
   opacity: 0.7;
+}
+
+/* Live Preview：源码标记只在光标附近显示，其余时间按渲染样式呈现 */
+.cm-md-marker {
+  color: var(--muted);
+  opacity: 0.72;
+}
+
+.cm-md-h1 {
+  font-size: 1.5em;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.cm-md-h2 {
+  font-size: 1.35em;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.cm-md-h3 {
+  font-size: 1.2em;
+  font-weight: 650;
+}
+
+.cm-md-h4 {
+  font-size: 1.1em;
+  font-weight: 650;
+}
+
+.cm-md-h5 {
+  font-size: 1.04em;
+  font-weight: 600;
+}
+
+.cm-md-h6 {
+  font-size: 1em;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.cm-md-strong {
+  font-weight: 700;
+}
+
+.cm-md-em {
+  font-style: italic;
+}
+
+.cm-md-strike {
+  text-decoration: line-through;
+}
+
+.cm-md-code-inline {
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--hover);
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 0.92em;
+}
+
+.cm-md-code {
+  background: var(--hover);
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 0.92em;
+}
+
+.cm-md-quote {
+  padding-left: 9px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+
+.cm-md-hr {
+  border-top: 1px solid var(--border);
+}
+
+.cm-md-list-item {
+  padding-left: 2px;
+}
+
+.cm-md-bullet {
+  padding-right: 2px;
+  color: var(--accent);
+}
+
+.cm-md-link {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* 续写模式提示条 */
+.continuation-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 4px 2px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--hover);
+  color: var(--accent-text);
+  font-size: 11px;
+}
+
+.continuation-bar .btn {
+  margin-left: auto;
 }
 
 footer {
@@ -561,6 +688,10 @@ kbd {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 触摸屏纵向滑动时，负外边距 + 小数 DPI 会让容器出现极小的横向滚动范围，
+     表现为列表左右漂移；横向滚动直接禁掉，宽表格在自己的容器里滚动。 */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   margin: 0 -4px;
   padding: 0 4px;
 }
@@ -846,6 +977,11 @@ kbd {
 }
 
 .entry-content.markdown table {
+  /* 宽表格在自身内部横向滚动，不再把整个历史列表撑出横向滚动条 */
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
 }
 
