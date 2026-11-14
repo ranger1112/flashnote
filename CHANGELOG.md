@@ -2,7 +2,7 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.8.0] - 2026-11-14
 
 ### 新增
 
@@ -257,7 +257,8 @@
 - 设置：快捷键录制、笔记目录选择、来源抓取、Markdown 模式、开机自启。
 - 系统托盘菜单、单实例运行、跟随系统深浅色主题、多显示器边界校正。
 
-[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ranger1112/flashnote/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.8.0
 [0.7.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.7.0
 [0.6.1]: https://github.com/ranger1112/flashnote/releases/tag/v0.6.1
 [0.6.0]: https://github.com/ranger1112/flashnote/releases/tag/v0.6.0
