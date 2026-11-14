@@ -88,6 +88,12 @@ describe("列表内 Tab 缩进", () => {
     expect(result.state.doc.toString()).toBe("- 项目");
   });
 
+  it("顶层列表项 Shift+Tab 返回 false，保留焦点切换", () => {
+    const result = run(indentListLess, makeState("- 项目"));
+    expect(result.ok).toBe(false);
+    expect(result.state.doc.toString()).toBe("- 项目");
+  });
+
   it("普通段落里 Tab 返回 false，保留焦点切换", () => {
     const state = makeState("普通段落");
     const result = run(indentListMore, state);

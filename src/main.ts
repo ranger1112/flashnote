@@ -17,6 +17,7 @@ import {
   activeContinuation,
   endContinuation,
   initContinuation,
+  refreshContinuationContent,
   startContinuation,
   updateContinuationContent,
 } from "./continuation";
@@ -138,10 +139,37 @@ interface SaveResult {
   editorChanged: boolean;
 }
 
+/**
+ * 保存成功后的统一收尾：编辑器内容没变就清空并结束续写，否则保留新输入。
+ * 三条保存路径共用，避免提示与收起逻辑各写一份后逐渐漂移。
+ */
+function settleSave(raw: string, message: string, options: SaveOptions): SaveResult {
+  // 保存期间用户可能继续输入：只有内容没变时才清空，否则保留新内容并补一次草稿
+  if (getText() === raw) {
+    setText("");
+    clearStoredDraft();
+    endContinuation();
+    if (!options.quiet) toast(message);
+    if (options.hideOnSuccess !== false && !pinned) {
+      window.setTimeout(() => {
+        void invoke("hide_window");
+      }, 380);
+    }
+    return { ok: true, editorChanged: false };
+  }
+
+  scheduleDraftSave();
+  if (!options.quiet) toast(`${message}（新输入尚未保存）`, true);
+  return { ok: true, editorChanged: true };
+}
+
 async function saveNote(options: SaveOptions = {}): Promise<SaveResult> {
   if (saving || isAppLocked()) return { ok: false, editorChanged: false };
 
-  const content = getText().trim();
+  // 与 target.content 比较用原始文本：正文本身可能以空白开头（外部编辑/同步写入），
+  // trim 后比较会把「未修改」误判成修改并静默改写原记录。
+  const raw = getText();
+  const content = raw.trim();
   if (!content) {
     endContinuation();
     await hideWindow();
@@ -153,53 +181,30 @@ async function saveNote(options: SaveOptions = {}): Promise<SaveResult> {
   try {
     if (target) {
       // 正文没有变化：不写盘，直接结束续写
-      if (content === target.content) {
-        const unchanged = getText().trim() === content;
-        if (unchanged) {
-          setText("");
-          clearStoredDraft();
-          endContinuation();
-          if (!options.quiet) toast(`未修改 · ${target.time}`);
-          if (options.hideOnSuccess !== false && !pinned) {
-            window.setTimeout(() => {
-              void invoke("hide_window");
-            }, 380);
-          }
-        } else {
-          scheduleDraftSave();
-          if (!options.quiet) toast(`未修改 · ${target.time}（新输入尚未保存）`, true);
-        }
-        return { ok: true, editorChanged: !unchanged };
+      if (raw === target.content) {
+        return settleSave(raw, `未修改 · ${target.time}`, options);
       }
 
-      await invoke<string[]>("update_note_entry", {
-        path: target.path,
-        date: target.date,
-        time: target.time,
-        content: target.content,
-        newContent: content,
-      });
+      const update = () =>
+        invoke<string[]>("update_note_entry", {
+          path: target.path,
+          date: target.date,
+          time: target.time,
+          content: target.content,
+          newContent: content,
+        });
+      try {
+        await update();
+      } catch (error) {
+        // 原记录可能已被历史面板、外部编辑器或同步改写：刷新定位依据后重试一次
+        if (!(await refreshContinuationContent(target))) throw error;
+        await update();
+      }
       // 已经在磁盘上产生变更，先标记待同步；真正的同步结果由 sync-status 广播回来。
       markSyncPending();
       // 下一次保存必须用新正文定位原记录
       updateContinuationContent(content);
-
-      if (getText().trim() === content) {
-        setText("");
-        clearStoredDraft();
-        endContinuation();
-        if (!options.quiet) toast(`已更新 · ${target.time}`);
-        if (options.hideOnSuccess !== false && !pinned) {
-          window.setTimeout(() => {
-            void invoke("hide_window");
-          }, 380);
-        }
-        return { ok: true, editorChanged: false };
-      }
-
-      scheduleDraftSave();
-      if (!options.quiet) toast(`已更新 · ${target.time}（新输入尚未保存）`, true);
-      return { ok: true, editorChanged: true };
+      return settleSave(raw, `已更新 · ${target.time}`, options);
     }
 
     const saved = await invoke<SavedNote>("save_note", { content });
@@ -207,23 +212,7 @@ async function saveNote(options: SaveOptions = {}): Promise<SaveResult> {
     markSyncPending();
     // 当前内容已作为新记录落盘，之前可能存在的续写目标随之作废
     endContinuation();
-
-    // 保存期间用户可能继续输入：只有内容没变时才清空，否则保留新内容并补一次草稿
-    if (getText().trim() === content) {
-      setText("");
-      clearStoredDraft();
-      if (!options.quiet) toast(`已保存 · ${saved.time}`);
-      if (options.hideOnSuccess !== false && !pinned) {
-        window.setTimeout(() => {
-          void invoke("hide_window");
-        }, 380);
-      }
-      return { ok: true, editorChanged: false };
-    }
-
-    scheduleDraftSave();
-    if (!options.quiet) toast(`已保存 · ${saved.time}（新输入尚未保存）`);
-    return { ok: true, editorChanged: true };
+    return settleSave(raw, `已保存 · ${saved.time}`, options);
   } catch (error) {
     toast(String(error), true);
     return { ok: false, editorChanged: false };
@@ -244,12 +233,14 @@ async function handleContinueEntry(note: NoteEntry): Promise<void> {
     return;
   }
 
-  const currentText = getText().trim();
+  const currentRaw = getText();
   const currentTarget = activeContinuation();
-  if (currentTarget && currentText === currentTarget.content) {
-    // 只是切换到另一条续写且当前记录没有改动：不写盘，避免生成重复记录
+  // 当前正文就是某条记录本身（未改动的续写，或退出续写后又点同一条）：
+  // 直接丢弃不会丢内容，不写盘，避免生成重复记录。
+  const unchangedCurrent = currentTarget !== null && currentRaw === currentTarget.content;
+  if (unchangedCurrent || currentRaw === note.content) {
     endContinuation();
-  } else if (currentText) {
+  } else if (currentRaw.trim()) {
     const result = await saveNote({ forceAppend: true, hideOnSuccess: false, quiet: true });
     if (!result.ok) return;
     if (result.editorChanged) {

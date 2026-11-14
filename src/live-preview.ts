@@ -45,6 +45,11 @@ function touches(state: EditorState, from: number, to: number): boolean {
   return state.selection.ranges.some((range) => range.from <= to && range.to >= from);
 }
 
+/** 插件装饰不能替换换行：跨行节点（如跨行链接标题）必须保持原样。 */
+function isSingleLine(state: EditorState, from: number, to: number): boolean {
+  return state.doc.lineAt(from).number === state.doc.lineAt(to).number;
+}
+
 interface LineContext {
   heading: SyntaxNode | null;
   blockquote: SyntaxNode | null;
@@ -52,6 +57,8 @@ interface LineContext {
   codeBlock: SyntaxNode | null;
   rule: SyntaxNode | null;
   item: SyntaxNode | null;
+  quoteMarks: SyntaxNode[];
+  codeMarks: SyntaxNode[];
 }
 
 const LINE_BLOCK_NAMES = new Set<string>([
@@ -79,11 +86,22 @@ function lineContext(
     codeBlock: null,
     rule: null,
     item: null,
+    quoteMarks: [],
+    codeMarks: [],
   };
   tree.iterate({
     from: lineFrom,
     to: lineTo,
     enter: (ref) => {
+      // 行内标记和块上下文在同一次遍历里收集，避免每行再单独扫一遍
+      if (ref.name === "QuoteMark") {
+        context.quoteMarks.push(ref.node);
+        return undefined;
+      }
+      if (ref.name === "CodeMark" || ref.name === "CodeInfo") {
+        context.codeMarks.push(ref.node);
+        return undefined;
+      }
       if (!LINE_BLOCK_NAMES.has(ref.name)) return undefined;
       switch (ref.name) {
         case "Blockquote":
@@ -142,9 +160,14 @@ function addLineDecorations(
 
   const heading = context.heading;
   if (heading) {
-    // Setext 标题的正文行才放大，下划线行保持原样
-    const textLine = state.doc.lineAt(heading.from);
-    if (!heading.name.startsWith("Setext") || line.number === textLine.number) {
+    if (heading.name.startsWith("Setext")) {
+      // Setext 标题可以有多行正文，每一行都要放大；只有下划线行保持原样
+      const underline = heading.getChild("HeaderMark");
+      const underlineLine = underline ? state.doc.lineAt(underline.from).number : -1;
+      if (line.number !== underlineLine) {
+        classes.push(`cm-md-h${headingLevel(heading.name)}`);
+      }
+    } else {
       classes.push(`cm-md-h${headingLevel(heading.name)}`);
     }
   }
@@ -204,32 +227,28 @@ function addLineDecorations(
     }
   }
 
-  const inFence = context.fence !== null;
-  tree.iterate({
-    from: lineFrom,
-    to: lineTo,
-    enter: (ref) => {
-      if (ref.name === "QuoteMark") {
-        if (revealed) {
-          decorations.push(Decoration.mark({ class: MARKER_CLASS }).range(ref.from, ref.to));
-        } else {
-          let end = ref.to;
-          while (
-            end < lineTo &&
-            (state.doc.sliceString(end, end + 1) === " " ||
-              state.doc.sliceString(end, end + 1) === "\t")
-          ) {
-            end += 1;
-          }
-          decorations.push(Decoration.replace({}).range(ref.from, end));
-        }
-      } else if (inFence && (ref.name === "CodeMark" || ref.name === "CodeInfo")) {
-        // 围栏标记不加入 atomicRanges：否则方向键无法进入隐藏行触发揭示
-        hideOrMark(ref.node, revealed, decorations, atomic, false);
+  for (const mark of context.quoteMarks) {
+    if (revealed) {
+      decorations.push(Decoration.mark({ class: MARKER_CLASS }).range(mark.from, mark.to));
+    } else {
+      let end = mark.to;
+      while (
+        end < lineTo &&
+        (state.doc.sliceString(end, end + 1) === " " ||
+          state.doc.sliceString(end, end + 1) === "\t")
+      ) {
+        end += 1;
       }
-      return undefined;
-    },
-  });
+      decorations.push(Decoration.replace({}).range(mark.from, end));
+    }
+  }
+
+  if (context.fence) {
+    for (const mark of context.codeMarks) {
+      // 围栏标记不加入 atomicRanges：否则方向键无法进入隐藏行触发揭示
+      hideOrMark(mark, revealed, decorations, atomic, false);
+    }
+  }
 }
 
 function addInlineDecorations(
@@ -240,10 +259,20 @@ function addInlineDecorations(
   decorations: Range<Decoration>[],
   atomic: Range<Decoration>[],
 ): void {
+  // 链接目标地址被替换后，遍历仍会进入这些节点：记下区间并跳过，
+  // 否则 URL 分支会在被隐藏的地址上再叠一层装饰。
+  const hidden: { from: number; to: number }[] = [];
   tree.iterate({
     from,
     to,
     enter: (ref) => {
+      if (
+        ref.name !== "Link" &&
+        hidden.some((range) => ref.from >= range.from && ref.to <= range.to)
+      ) {
+        return false;
+      }
+
       const markerNames = INLINE_MARKERS[ref.name];
       if (markerNames) {
         const node = ref.node;
@@ -276,17 +305,26 @@ function addInlineDecorations(
         const first = node.firstChild;
         const autolink =
           first?.name === "LinkMark" && state.doc.sliceString(first.from, first.to) === "<";
+        // `]` 之前是链接可见文字（可能本身就是一个 URL），之后才是目标地址。
+        let bracketClosed = false;
         for (let child = node.firstChild; child; child = child.nextSibling) {
           if (child.name === "LinkMark") {
+            if (state.doc.sliceString(child.from, child.to) === "]") bracketClosed = true;
             hideOrMark(child, revealed, decorations, atomic);
           } else if (
+            bracketClosed &&
             !autolink &&
             (child.name === "URL" || child.name === "LinkTitle" || child.name === "LinkLabel")
           ) {
-            hideOrMark(child, revealed, decorations, atomic);
+            // 跨行标题/标签不能生成 replace 装饰，CodeMirror 会抛 RangeError
+            if (isSingleLine(state, child.from, child.to)) {
+              hideOrMark(child, revealed, decorations, atomic);
+              hidden.push({ from: child.from, to: child.to });
+            }
           }
         }
-        return false;
+        // 不停止遍历：链接文字里的粗体、斜体等仍要按行内语法渲染
+        return undefined;
       }
 
       if (ref.name === "Autolink") {
@@ -324,9 +362,12 @@ interface PreviewBuild {
 function buildPreview(
   state: EditorState,
   ranges: readonly { from: number; to: number }[],
+  allowParse = true,
 ): PreviewBuild {
   const end = ranges.length > 0 ? ranges[ranges.length - 1].to : state.doc.length;
-  const tree = ensureSyntaxTree(state, end, 50) ?? syntaxTree(state);
+  // 纯选区移动不触发同步解析：大文档上 50ms 的预算会让每次方向键都卡一下。
+  // 异步解析推进后插件会因 treeChanged 再次重建。
+  const tree = (allowParse ? ensureSyntaxTree(state, end, 20) : null) ?? syntaxTree(state);
   const decorations: Range<Decoration>[] = [];
   const atomic: Range<Decoration>[] = [];
   const seenLines = new Set<number>();
@@ -400,7 +441,7 @@ class LivePreviewPlugin {
 
   constructor(view: EditorView) {
     this.view = view;
-    this.rebuild();
+    this.rebuild(true);
     const { signal } = this.abort;
     // 捕获阶段先于 CodeMirror 自己的 mousedown 选区更新
     view.dom.addEventListener("pointerdown", () => this.freeze(), { capture: true, signal });
@@ -409,6 +450,16 @@ class LivePreviewPlugin {
       capture: true,
       signal,
     });
+    // 拖拽途中窗口被收起时收不到 pointerup/pointercancel：失焦或页面隐藏时
+    // 必须解冻，否则重新唤起后滚轮滚动不再重建装饰。
+    window.addEventListener("blur", () => this.release(false), { capture: true, signal });
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (document.hidden) this.release(false);
+      },
+      { signal },
+    );
     view.contentDOM.addEventListener("keydown", () => this.release(true), {
       capture: true,
       signal,
@@ -441,7 +492,8 @@ class LivePreviewPlugin {
       forced ||
       treeChanged
     ) {
-      this.rebuild();
+      // 只有内容或视口变化才值得同步解析；纯选区移动用现有语法树即可
+      this.rebuild(update.docChanged || update.viewportChanged || forced);
     }
   }
 
@@ -451,9 +503,9 @@ class LivePreviewPlugin {
     this.abort.abort();
   }
 
-  private rebuild(): void {
+  private rebuild(allowParse = false): void {
     if (this.destroyed) return;
-    const result = buildPreview(this.view.state, this.view.visibleRanges);
+    const result = buildPreview(this.view.state, this.view.visibleRanges, allowParse);
     this.decorations = result.decorations;
     this.atomicRanges = result.atomicRanges;
   }

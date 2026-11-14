@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { restoreContinuation, syncContinuationDraft } from "./continuation";
 import { getText, setText } from "./editor";
 
 export const DRAFT_KEY = "flashnote.draft";
@@ -14,8 +15,11 @@ export function scheduleDraftSave(): void {
 }
 
 export async function persistDraft(): Promise<void> {
+  const content = getText();
+  // 草稿与续写目标要一起落盘，重启后才能确认这份正文属于哪个续写目标
+  syncContinuationDraft(content);
   try {
-    await invoke("save_draft", { content: getText() });
+    await invoke("save_draft", { content });
   } catch {
     // 草稿写入失败不打断输入，下一次输入会重试
   }
@@ -47,8 +51,10 @@ export async function restoreDraft(): Promise<void> {
   if (getText() === "") {
     if (draft) {
       setText(draft, { caret: "end" });
+      restoreContinuation(draft);
     } else if (legacyDraft) {
       setText(legacyDraft, { caret: "end" });
+      restoreContinuation(legacyDraft);
     }
   }
 

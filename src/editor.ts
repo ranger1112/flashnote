@@ -103,13 +103,15 @@ class TextareaEditor implements CaptureEditor {
   }
 }
 
-class CodeMirrorEditor implements CaptureEditor {
+export class CodeMirrorEditor implements CaptureEditor {
   readonly kind = "codemirror" as const;
-  private readonly view: EditorView;
+  /** 暴露给测试与调试；生产代码通过下面的门面函数访问。 */
+  readonly view: EditorView;
   private readonly onChange: () => void;
   private readonly sourceCompartment = new Compartment();
   private sourceEnabled = false;
   private programmatic = false;
+  private destroyed = false;
 
   constructor(mount: HTMLElement, onChange: () => void) {
     this.onChange = onChange;
@@ -165,6 +167,9 @@ class CodeMirrorEditor implements CaptureEditor {
         changes: { from: 0, to: this.view.state.doc.length, insert: text },
         selection: EditorSelection.cursor(position),
         annotations: Transaction.addToHistory.of(false),
+        // 长记录续写/草稿恢复后光标在末尾：没有这一步视口会停在顶部，
+        // focus() 又用了 preventScroll，用户看不到光标。
+        scrollIntoView: caret !== "preserve",
       });
     } finally {
       this.programmatic = false;
@@ -186,6 +191,8 @@ class CodeMirrorEditor implements CaptureEditor {
   }
 
   destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
     this.view.destroy();
   }
 }

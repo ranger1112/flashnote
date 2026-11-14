@@ -155,6 +155,7 @@ function defaultHandlers(): Handlers {
     hide_window: () => null,
     delete_note_entry: () => null,
     update_note_entry: () => [],
+    get_note_entries: () => notes,
     open_note_file: () => null,
     open_notes_dir: () => null,
     complete_onboarding: () => null,
@@ -186,6 +187,7 @@ async function flush(times = 20): Promise<void> {
 async function boot(
   handlers: Handlers = {},
   prepare?: () => void,
+  options: { keepStorage?: boolean } = {},
 ): Promise<void> {
   // 上一轮注册在 window/document 上的监听必须先摘掉，否则旧实例会响应新用例的事件。
   (
@@ -193,7 +195,7 @@ async function boot(
   ).__flashnoteTeardown?.();
   vi.resetModules();
   document.documentElement.innerHTML = `<head></head><body>${BODY_HTML}</body>`;
-  window.localStorage.clear();
+  if (!options.keepStorage) window.localStorage.clear();
   prepare?.();
 
   const routes = { ...defaultHandlers(), ...handlers };
@@ -612,6 +614,131 @@ describe("续写", () => {
     expect(node<HTMLElement>("#history").classList.contains("hidden")).toBe(false);
     expect(mocks.invoke).not.toHaveBeenCalledWith("update_note_entry", expect.anything());
     expect(node<HTMLTextAreaElement>("#note").value).toBe("");
+  });
+
+  it("续写状态随草稿跨重启恢复，保存仍更新原记录", async () => {
+    await boot();
+    await openHistory();
+    continueButton().click();
+    await flush();
+
+    const first = node<HTMLTextAreaElement>("#note");
+    first.value = "续写草稿";
+    first.dispatchEvent(new Event("input"));
+    await flush();
+
+    // 收起窗口会把正文写入草稿，同时记录续写目标的草稿快照
+    node<HTMLButtonElement>("#close-btn").click();
+    await flush();
+
+    // 模拟重启：草稿与续写目标都要恢复
+    await boot({ load_draft: () => "续写草稿" }, undefined, { keepStorage: true });
+    const note = node<HTMLTextAreaElement>("#note");
+    expect(note.value).toBe("续写草稿");
+    expect(node<HTMLElement>("#continuation-bar").hidden).toBe(false);
+    expect(node<HTMLElement>("#continuation-label").textContent).toContain("09:00");
+
+    note.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("update_note_entry", {
+      path: "D:\\Notes\\2026-10-21.md",
+      date: "2026-10-21",
+      time: "09:00",
+      content: "第一条",
+      newContent: "续写草稿",
+    });
+    expect(mocks.invoke).not.toHaveBeenCalledWith("save_note", expect.anything());
+  });
+
+  it("草稿被其他来源改写后不会恢复过期的续写目标", async () => {
+    await boot();
+    await openHistory();
+    continueButton().click();
+    await flush();
+
+    const first = node<HTMLTextAreaElement>("#note");
+    first.value = "续写草稿";
+    first.dispatchEvent(new Event("input"));
+    await flush();
+    node<HTMLButtonElement>("#close-btn").click();
+    await flush();
+
+    // 磁盘草稿已不是快照里的正文：不能再把新草稿写进旧目标
+    await boot({ load_draft: () => "另一段草稿" }, undefined, { keepStorage: true });
+    expect(node<HTMLTextAreaElement>("#note").value).toBe("另一段草稿");
+    expect(node<HTMLElement>("#continuation-bar").hidden).toBe(true);
+  });
+
+  it("原记录被外部改写后续写保存会刷新定位并重试", async () => {
+    let attempts = 0;
+    await boot({
+      update_note_entry: () => {
+        attempts += 1;
+        return attempts === 1
+          ? Promise.reject("没有找到这条笔记，可能已被其他程序修改")
+          : Promise.resolve([]);
+      },
+      get_note_entries: () => [entry("09:00", "外部修改后的正文")],
+    });
+    await openHistory();
+    continueButton().click();
+    await flush();
+
+    const note = node<HTMLTextAreaElement>("#note");
+    note.value = "续写内容";
+    note.dispatchEvent(new Event("input"));
+    note.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+
+    const updates = mocks.invoke.mock.calls.filter(([cmd]) => cmd === "update_note_entry");
+    expect(updates).toHaveLength(2);
+    expect(updates[1][1]).toMatchObject({
+      content: "外部修改后的正文",
+      newContent: "续写内容",
+    });
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("已更新");
+  });
+
+  it("退出续写后再次续写同一条不会追加重复记录", async () => {
+    await boot();
+    await openHistory();
+    continueButton(0).click();
+    await flush();
+
+    node<HTMLButtonElement>("#continuation-exit").click();
+    await flush();
+    expect(node<HTMLTextAreaElement>("#note").value).toBe("第一条");
+
+    await openHistory();
+    continueButton(0).click();
+    await flush();
+
+    expect(mocks.invoke).not.toHaveBeenCalledWith("save_note", expect.anything());
+    expect(node<HTMLTextAreaElement>("#note").value).toBe("第一条");
+    expect(node<HTMLElement>("#continuation-bar").hidden).toBe(false);
+  });
+
+  it("正文带前导空白时未修改的续写不会写盘", async () => {
+    notes = [entry("09:00", "  缩进正文")];
+    await boot();
+    await openHistory();
+    continueButton().click();
+    await flush();
+
+    const note = node<HTMLTextAreaElement>("#note");
+    expect(note.value).toBe("  缩进正文");
+    note.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await flush();
+
+    expect(mocks.invoke).not.toHaveBeenCalledWith("update_note_entry", expect.anything());
+    expect(node<HTMLElement>("#toast-message").textContent).toContain("未修改");
   });
 });
 

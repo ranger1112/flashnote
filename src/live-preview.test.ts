@@ -79,6 +79,19 @@ describe("Live Preview 块级渲染", () => {
     expect(isHidden(items, 0, 2)).toBe(false);
   });
 
+  it("多行 Setext 标题每一行都放大", () => {
+    const items = decorations("标题一\n标题二\n===\n正文");
+    const isHeadingLine = (from: number) =>
+      items.some(
+        (item) =>
+          item.from === from &&
+          typeof item.spec.class === "string" &&
+          (item.spec.class as string).includes("cm-md-h1"),
+      );
+    expect(isHeadingLine(0)).toBe(true);
+    expect(isHeadingLine(4)).toBe(true);
+  });
+
   it("闭合式标题同时隐藏首尾 # 标记", () => {
     const items = decorations("# 标题 #\n正文");
     expect(hasClass(items, "cm-md-h1")).toBe(true);
@@ -206,6 +219,33 @@ describe("Live Preview 行内渲染", () => {
   it("任务列表标记保持原文", () => {
     const items = decorations("- [ ] 任务\n正文");
     expect(isHidden(items, 2, 5)).toBe(false);
+  });
+
+  it("链接文字本身是 URL 时保持可见", () => {
+    const doc = "[https://example.com](https://dest.com)\n正文";
+    const items = decorations(doc);
+    expect(isHidden(items, 1, 20)).toBe(false);
+    expect(isHidden(items, 22, 38)).toBe(true);
+  });
+
+  it("链接文字里的加粗仍然渲染", () => {
+    const doc = "[**重要**](https://x)\n正文";
+    const items = decorations(doc);
+    expect(hasClass(items, "cm-md-strong")).toBe(true);
+    expect(isHidden(items, 1, 3)).toBe(true);
+    expect(isHidden(items, 5, 7)).toBe(true);
+  });
+
+  it("跨行链接标题不会生成替换换行的装饰", () => {
+    const doc = "[文字](https://x '标题\n第二行')\n正文";
+    const items = decorations(doc);
+    const replacesLineBreak = items.some(
+      (item) =>
+        item.spec.class === undefined &&
+        item.spec.widget === undefined &&
+        doc.slice(item.from, item.to).includes("\n"),
+    );
+    expect(replacesLineBreak).toBe(false);
   });
 });
 

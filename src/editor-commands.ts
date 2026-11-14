@@ -34,8 +34,24 @@ function lineInListItem(state: EditorState, pos: number): boolean {
   return false;
 }
 
+/** 选区里至少有一行带缩进，indentLess 才会真正改动内容。 */
+function selectionHasIndent(state: EditorState): boolean {
+  for (const range of state.selection.ranges) {
+    const first = state.doc.lineAt(range.from).number;
+    const last = state.doc.lineAt(range.to).number;
+    for (let number = first; number <= last; number++) {
+      if (/^[ \t]/.test(state.doc.line(number).text)) return true;
+    }
+  }
+  return false;
+}
+
 export const indentListMore: StateCommand = (target) =>
   selectionAllInListItems(target.state) ? indentMore(target) : false;
 
 export const indentListLess: StateCommand = (target) =>
-  selectionAllInListItems(target.state) ? indentLess(target) : false;
+  // indentLess 即使没有缩进也返回 true 并 preventDefault，顶层列表项上会把
+  // Shift+Tab 吞掉，键盘用户因此无法离开编辑器。
+  selectionAllInListItems(target.state) && selectionHasIndent(target.state)
+    ? indentLess(target)
+    : false;
