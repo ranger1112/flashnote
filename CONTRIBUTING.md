@@ -79,4 +79,4 @@ npx tauri signer generate -w ~/.tauri/flashnote.key
 
 ## 数据与隐私
 
-笔记、设置、日志都在本机。唯一的网络请求是检查更新时下载 GitHub Release 上的 `latest.json` 与安装包；关闭「自动检查更新」后只在手动点「检查更新」时访问。提交 Issue 或截图时请自行打码笔记正文和窗口标题。
+笔记、设置、日志都在本机。不开启云同步时，唯一的网络请求是检查更新时下载 GitHub Release 上的 `latest.json` 与安装包；开启 WebDAV 或 GitHub 仓库同步后，才会访问用户自己填写的地址或仓库。关闭「自动检查更新」后只在手动点「检查更新」时访问 Releases。提交 Issue 或截图时请自行打码笔记正文和窗口标题。
