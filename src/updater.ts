@@ -29,6 +29,11 @@ function setInlineUpdateAction(label: string | null, disabled = false): void {
 let pendingUpdate: Update | null = null;
 let updateReady = false;
 let updating = false;
+let restarting = false;
+/** 检查请求进行中：自动检查与手动检查共用，避免互相把对方的结果作废。 */
+let checking = false;
+/** 检查请求的单调序号：安装/重启开始后，旧检查结果必须丢弃。 */
+let checkSeq = 0;
 
 let autoCheckTimeout: number | undefined;
 let autoCheckInterval: number | undefined;
@@ -55,7 +60,7 @@ export function startAutoUpdateChecks(): void {
 }
 
 async function checkForUpdate(manual: boolean): Promise<void> {
-  if (updating) return;
+  if (updating || restarting || checking) return;
   // 已下载安装但尚未重启时，再查一次仍会返回同一版本，直接提示重启即可
   if (updateReady) {
     if (manual) {
@@ -65,6 +70,8 @@ async function checkForUpdate(manual: boolean): Promise<void> {
     }
     return;
   }
+  checking = true;
+  const seq = ++checkSeq;
   if (manual) {
     ui.checkUpdateButton.disabled = true;
     ui.updateStatus.textContent = "正在检查更新…";
@@ -72,6 +79,9 @@ async function checkForUpdate(manual: boolean): Promise<void> {
 
   try {
     const update = await check();
+    // 请求返回时可能已经开始安装/重启，或又发起了新一轮检查：丢弃这份旧结果，
+    // 否则会把「立即更新」写回「重启」按钮，或覆盖安装进度。
+    if (seq !== checkSeq || updating || restarting) return;
     if (!update) {
       pendingUpdate = null;
       setInlineUpdateAction(null);
@@ -87,21 +97,27 @@ async function checkForUpdate(manual: boolean): Promise<void> {
     showUpdateBanner(`发现新版本 ${update.version}`, "更新");
     setInlineUpdateAction("立即更新");
   } catch (error) {
+    if (seq !== checkSeq || updating || restarting) return;
     // 启动时的静默检查失败不打扰用户；手动检查才提示
     if (manual) {
       ui.updateStatus.textContent = "检查更新失败，请稍后再试";
       toast(String(error), true);
     }
   } finally {
-    if (manual) ui.checkUpdateButton.disabled = false;
+    checking = false;
+    if (manual && seq === checkSeq && !updating && !restarting) {
+      ui.checkUpdateButton.disabled = false;
+    }
   }
 }
 
 async function installUpdate(): Promise<void> {
   const update = pendingUpdate;
-  if (!update || updating) return;
+  if (!update || updating || restarting) return;
 
   updating = true;
+  // 在途的检查请求已经过时，避免它返回后把按钮改回「立即更新」
+  checkSeq += 1;
   ui.checkUpdateButton.disabled = true;
   ui.updateBannerAction.disabled = true;
   setInlineUpdateAction("正在更新…", true);
@@ -143,6 +159,16 @@ async function installUpdate(): Promise<void> {
 
 /** 重启前把设置与同步状态落盘，避免更新后重复合并或重复上传。 */
 function restartToApplyUpdate(): void {
+  if (restarting) return;
+  restarting = true;
+  checkSeq += 1;
+  ui.checkUpdateButton.disabled = true;
+  ui.updateNowButton.disabled = true;
+  ui.updateBannerAction.disabled = true;
+  ui.updateStatus.textContent = "正在重启…";
+  if (!ui.updateNowButton.hidden) ui.updateNowButton.textContent = "正在重启…";
+  showUpdateBanner("正在重启…", null);
+
   // 落盘失败也要重启，但必须告诉用户这次「尽力了」。
   void invoke("flush_sync_state")
     .catch(async (error) => {
@@ -151,7 +177,18 @@ function restartToApplyUpdate(): void {
       // 留一点时间让提示画出来，否则立刻重启等于没提示。
       await new Promise((resolve) => window.setTimeout(resolve, 1500));
     })
-    .finally(() => void relaunch());
+    .finally(() => {
+      void relaunch().catch((error) => {
+        // relaunch 失败时不能一直停在「正在重启…」：恢复按钮并明确提示。
+        restarting = false;
+        ui.checkUpdateButton.disabled = false;
+        ui.updateStatus.textContent = "重启失败，请手动退出后重新打开";
+        setInlineUpdateAction("重启");
+        showUpdateBanner("重启失败，请手动退出后重新打开", "重启");
+        ui.updateBannerAction.disabled = false;
+        toast(String(error), true);
+      });
+    });
 }
 
 /** 模块加载时绑定更新相关按钮。 */
@@ -161,12 +198,13 @@ export function initUpdater(): void {
   });
 
   ui.updateNowButton.addEventListener("click", () => {
-    if (updating) return;
+    if (updating || restarting) return;
     if (updateReady) restartToApplyUpdate();
     else void installUpdate();
   });
 
   ui.updateBannerAction.addEventListener("click", () => {
+    if (restarting) return;
     if (updateReady) restartToApplyUpdate();
     else void installUpdate();
   });

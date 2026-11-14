@@ -59,6 +59,16 @@ let lastStatus: SyncStatus | null = null;
 let statusSeq = 0;
 let savingConfig = false;
 
+type SyncKindValue = "webdav" | "github";
+interface SyncFormDraft {
+  url: string;
+  username: string;
+}
+
+/** 当前表单对应的同步方式；切换方式时用它保存/恢复各自的表单草稿。 */
+let formKind: SyncKindValue = "webdav";
+const formDrafts = new Map<SyncKindValue, SyncFormDraft>();
+
 type StatusListener = (status: SyncStatus) => void;
 const statusListeners: StatusListener[] = [];
 
@@ -210,6 +220,8 @@ function paintSyncKind(): void {
 /** 用已保存的设置回填表单；密码框始终留空，避免把密码画到界面上。 */
 export function paintSyncForm(): void {
   const sync = settings.sync;
+  formKind = sync.kind;
+  formDrafts.clear();
   ui.syncEnabled.checked = sync.enabled;
   ui.syncKind.value = sync.kind;
   ui.syncUrl.value = sync.url;
@@ -373,8 +385,38 @@ async function testConnection(): Promise<void> {
   }
 }
 
+/** 表单与已保存配置是否有差异（地址按同步方式的规范化口径比较）。 */
+function formDiffersFromSaved(): boolean {
+  // 密码框里有内容说明用户刚输入但还没保存，同样算未保存的改动
+  if (ui.syncPassword.value) return true;
+  const form = readSyncForm();
+  const saved = settings.sync;
+  if (form.kind !== saved.kind) return true;
+  const sameUrl =
+    form.kind === "github"
+      ? normalizeRepoUrl(form.url) === normalizeRepoUrl(saved.url)
+      : normalizeSyncUrl(form.url) === normalizeSyncUrl(saved.url);
+  return (
+    !sameUrl ||
+    form.enabled !== saved.enabled ||
+    form.username !== saved.username ||
+    form.intervalMinutes !== saved.intervalMinutes ||
+    form.allowInsecureHttp !== saved.allowInsecureHttp ||
+    form.deviceName !== saved.deviceName
+  );
+}
+
 async function syncNow(): Promise<void> {
+  // 「立即同步」读的是已保存配置：表单里刚勾上启用但还没保存时，直接同步
+  // 只会收到「云同步已关闭」，和界面上的勾选状态互相矛盾。
+  if (formDiffersFromSaved()) {
+    const message = "有未保存的同步设置，请先点「保存」后再同步";
+    ui.syncError.textContent = message;
+    toast(message, true, 3000);
+    return;
+  }
   try {
+    ui.syncError.textContent = "";
     await invoke("sync_now");
     toast("已开始同步");
   } catch (error) {
@@ -399,11 +441,20 @@ export async function refreshSyncStatus(): Promise<void> {
 /** 模块加载时绑定同步相关控件与事件（由 main.ts 调用一次）。 */
 export function initSync(): void {
   ui.syncKind.addEventListener("change", () => {
-    // 两种方式下这一栏的含义不同（账号 vs 分支），切换时清空，避免 WebDAV
-    // 的用户名被当成 GitHub 的分支提交上去。
-    ui.syncUsername.value = "";
-    ui.syncUsername.placeholder = "";
-    // 密码栏也要清：WebDAV 的应用密码不能被当成 GitHub 的令牌存下去
+    const next: SyncKindValue = ui.syncKind.value === "github" ? "github" : "webdav";
+    if (next === formKind) return;
+    // 两种方式下地址与这一栏的含义不同（账号 vs 分支），按方式分别保留表单草稿；
+    // 切回已保存的方式时优先恢复已保存的值，避免 GitHub 分支被静默清空。
+    formDrafts.set(formKind, { url: ui.syncUrl.value, username: ui.syncUsername.value });
+    formKind = next;
+    const saved =
+      next === settings.sync.kind
+        ? { url: settings.sync.url, username: settings.sync.username }
+        : null;
+    const draft = formDrafts.get(next) ?? saved ?? { url: "", username: "" };
+    ui.syncUrl.value = draft.url;
+    ui.syncUsername.value = draft.username;
+    // 密码栏始终清空：WebDAV 的应用密码不能被当成 GitHub 的令牌存下去
     ui.syncPassword.value = "";
     paintSyncKind();
   });
