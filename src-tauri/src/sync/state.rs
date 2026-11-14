@@ -238,7 +238,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn stamp(now: chrono::DateTime<Local>) -> String {
-    now.format("%Y%m%d-%H%M%S").to_string()
+    // 精确到毫秒：同一秒内连续两次备份/建 trash 目录时不会互相覆盖。
+    now.format("%Y%m%d-%H%M%S-%3f").to_string()
 }
 
 #[cfg(test)]

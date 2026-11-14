@@ -822,6 +822,38 @@ describe("设置", () => {
 
     expect(banner.inert).toBe(true);
   });
+
+  it("焦点陷阱跳过 hidden 元素，Tab 不会从最后一个可见控件逃出", async () => {
+    await boot();
+    node<HTMLButtonElement>("#settings-btn").click();
+    await flush();
+
+    const panel = node<HTMLElement>("#settings");
+    const focusables = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => {
+      if (el.hasAttribute("disabled") || el.hidden || el.closest("[hidden]")) return false;
+      const style = getComputedStyle(el);
+      return style.display !== "none" && style.visibility !== "hidden";
+    });
+    expect(focusables.length).toBeGreaterThan(1);
+    // #update-now 初始是 hidden，不能被当成最后一个可聚焦元素
+    expect(focusables.includes(node<HTMLButtonElement>("#update-now"))).toBe(false);
+
+    const lastVisible = focusables[focusables.length - 1];
+    lastVisible.focus();
+    const event = new KeyboardEvent("keydown", {
+      key: "Tab",
+      bubbles: true,
+      cancelable: true,
+    });
+    lastVisible.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(focusables[0]);
+  });
 });
 
 describe("更新", () => {
@@ -1786,6 +1818,24 @@ describe("历史面板的文件同步状态", () => {
     expect(entries()).toHaveLength(2);
     expect(document.querySelector(".entry-date .date-sync")?.textContent).toBe("");
   });
+
+  it("同一批日期重复渲染不会重复请求文件状态", async () => {
+    await boot({ get_sync_file_states: () => [] });
+    await openHistory();
+    const calls = () =>
+      mocks.invoke.mock.calls.filter(([cmd]) => cmd === "get_sync_file_states").length;
+    expect(calls()).toBe(1);
+
+    // 搜索后列表仍是同一天：直接复用缓存，不再读取并哈希磁盘文件
+    vi.useFakeTimers();
+    const input = node<HTMLInputElement>("#history-search");
+    input.value = "第一条";
+    input.dispatchEvent(new Event("input"));
+    await vi.advanceTimersByTimeAsync(250);
+    await flush();
+    expect(calls()).toBe(1);
+    vi.useRealTimers();
+  });
 });
 
 describe("草稿", () => {
@@ -1859,6 +1909,34 @@ describe("预览安全", () => {
     expect(event.defaultPrevented).toBe(true);
     expect(mocks.invoke).toHaveBeenCalledWith("open_external_url", {
       url: "https://evil.example/area",
+    });
+  });
+
+  it("只有 xlink:href 的 SVG 链接也会被拦截", async () => {
+    await boot();
+    await openHistory();
+
+    const content = node<HTMLElement>("#entry-list .entry-content");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const anchor = document.createElementNS("http://www.w3.org/2000/svg", "a");
+    anchor.setAttributeNS(
+      "http://www.w3.org/1999/xlink",
+      "xlink:href",
+      "https://evil.example/svg",
+    );
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.textContent = "svg link";
+    anchor.append(text);
+    svg.append(anchor);
+    content.append(svg);
+
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    text.dispatchEvent(event);
+    await flush();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(mocks.invoke).toHaveBeenCalledWith("open_external_url", {
+      url: "https://evil.example/svg",
     });
   });
 });

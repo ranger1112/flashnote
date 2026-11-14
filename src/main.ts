@@ -535,15 +535,17 @@ window.addEventListener(
 function handleLinkActivation(event: MouseEvent): void {
   const target = event.target;
   if (!(target instanceof Element)) return;
-  // 不能只认 HTMLAnchorElement：<area> 与 SVG <a> 都不是它，
-  // 漏掉任何一个都会让 WebView 自己导航到远程页面。
-  const anchor = target.closest("a[href], area[href]");
+  // 不能只认 HTMLAnchorElement：<area> 与 SVG <a> 都不是它，漏掉任何一个
+  // 都会让 WebView 自己导航到远程页面。SVG 链接可能只有 xlink:href，所以
+  // 选择器不能带 [href]，否则下面的 xlink 回退永远走不到。
+  const anchor = target.closest("a, area");
   if (!(anchor instanceof Element)) return;
 
   const href =
     anchor.getAttribute("href") ??
     anchor.getAttributeNS("http://www.w3.org/1999/xlink", "href") ??
     "";
+  if (!href.trim()) return;
   // 页内锚点保持默认行为，其余一律不让 WebView 自己跳
   if (href.trim().startsWith("#")) return;
   event.preventDefault();

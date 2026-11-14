@@ -412,6 +412,15 @@ fn prune_invalid_sync(object: &mut serde_json::Map<String, serde_json::Value>) {
     else {
         return;
     };
+    // 非法 kind 只丢掉这个字段（回落到默认 WebDAV），不要让整份 sync
+    // 配置因为枚举反序列化失败而被一起重置。
+    if sync.get("kind").is_some_and(|value| {
+        value
+            .as_str()
+            .map_or(true, |kind| kind != "webdav" && kind != "github")
+    }) {
+        sync.remove("kind");
+    }
     if sync
         .get("intervalMinutes")
         .is_some_and(|value| value.as_u64().map_or(true, |minutes| minutes == 0))
@@ -520,6 +529,33 @@ mod tests {
         assert_eq!(loaded.settings.sync.url, "https://dav.example.com/");
         assert!(!loaded.settings.sync.enabled, "类型不符的字段回退默认值");
         assert_eq!(loaded.settings.sync.interval_minutes, 5);
+        assert!(loaded.warning.is_none(), "不应整份当成损坏");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_sync_kind_only_falls_back_that_field() {
+        let dir = temp_dir("invalid-kind");
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"notesDir":"D:\\Notes","sync":{"kind":"gitlab","enabled":true,"url":"https://dav.example.com/","username":"alice"}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_from_path(&path);
+        assert_eq!(
+            loaded.settings.sync.kind,
+            SyncKind::Webdav,
+            "非法 kind 回落到默认值"
+        );
+        assert_eq!(
+            loaded.settings.sync.url, "https://dav.example.com/",
+            "其余 sync 字段应保留"
+        );
+        assert_eq!(loaded.settings.sync.username, "alice");
+        assert!(loaded.settings.sync.enabled);
         assert!(loaded.warning.is_none(), "不应整份当成损坏");
 
         let _ = fs::remove_dir_all(&dir);

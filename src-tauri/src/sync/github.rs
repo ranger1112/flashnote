@@ -120,6 +120,31 @@ fn is_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
 
+/// 校验 Git 分支名（git-check-ref-format 的主要规则）。
+///
+/// 不校验的话，带空格、`..` 或前导 `-` 的值会先进入远端身份，直到 API 报错
+/// 才暴露出来；保存时就给出明确错误更早、也更好排查。
+pub(crate) fn valid_branch(name: &str) -> bool {
+    if name.is_empty() || name == "@" {
+        return false;
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') || name.ends_with('.')
+    {
+        return false;
+    }
+    if name.contains("..") || name.contains("@{") || name.contains("//") {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return false;
+    }
+    name.split('/')
+        .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
 #[derive(Deserialize)]
 struct RepoPermissions {
     #[serde(default)]
@@ -132,6 +157,7 @@ struct RepoPermissions {
 
 #[derive(Deserialize)]
 struct RepoInfo {
+    private: Option<bool>,
     permissions: Option<RepoPermissions>,
 }
 
@@ -216,6 +242,11 @@ impl GitHubBackend {
             .json()
             .await
             .map_err(|error| SyncError::Other(format!("解析仓库信息失败：{error}")))?;
+        if info.private == Some(false) {
+            return Err(SyncError::Auth(
+                "该仓库是公开的，笔记会以明文公开；请改用私有仓库".to_string(),
+            ));
+        }
         if info.can_write() == Some(false) {
             return Err(SyncError::Auth(
                 "令牌缺少该仓库的 Contents: write 权限".to_string(),
@@ -260,6 +291,20 @@ impl GitHubBackend {
         loop {
             self.spend()?;
             match build().send().await {
+                // 502/503/504 是网关/服务端瞬时错误，和连接失败一样值得重试；
+                // 响应体在 check() 里才会读取，这里丢掉响应不会浪费解析。
+                Ok(response)
+                    if matches!(
+                        response.status(),
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    ) && attempt < MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    let delay = Duration::from_secs(attempt as u64);
+                    tokio::time::sleep(delay).await;
+                }
                 Ok(response) => return Ok(response),
                 Err(error)
                     if (error.is_connect() || error.is_timeout()) && attempt < MAX_RETRIES =>
@@ -752,6 +797,16 @@ mod tests {
     }
 
     #[test]
+    fn repo_visibility_is_parsed() {
+        let public: RepoInfo = serde_json::from_value(json!({"private": false})).unwrap();
+        assert_eq!(public.private, Some(false));
+        let private: RepoInfo = serde_json::from_value(json!({"private": true})).unwrap();
+        assert_eq!(private.private, Some(true));
+        let unknown: RepoInfo = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(unknown.private, None, "没有 private 字段时不能误判");
+    }
+
+    #[test]
     fn capabilities_allow_deletion() {
         let backend = GitHubBackend::build(
             GitHubConfig {
@@ -1054,5 +1109,35 @@ mod tests {
             backend.list().await.unwrap_err(),
             SyncError::Budget
         ));
+    }
+
+    #[test]
+    fn branch_names_follow_git_ref_rules() {
+        for good in ["main", "dev", "feature/x", "release-1.0", "fix_123"] {
+            assert!(valid_branch(good), "{good} 应合法");
+        }
+        for bad in [
+            "",
+            "has space",
+            "a..b",
+            "-leading",
+            "trailing.",
+            "trailing/",
+            "/leading",
+            "a//b",
+            "a@{b",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            ".hidden",
+            "x.lock",
+            "@",
+        ] {
+            assert!(!valid_branch(bad), "{bad} 应不合法");
+        }
     }
 }

@@ -1082,6 +1082,18 @@ impl SyncConfigInput {
                 if self.enabled && github::parse_repo(&url).is_none() {
                     return Err("启用前请填写 GitHub 仓库地址".to_string());
                 }
+                if !username.is_empty() && !github::valid_branch(&username) {
+                    return Err("分支名不合法：不能包含空格、..、~、^、:、?、*、[、\\，\
+                         不能以 - 或 / 开头，不能以 . 或 / 结尾"
+                        .to_string());
+                }
+                if let Some((_, _, Some(branch))) = github::parse_repo(&url) {
+                    if !github::valid_branch(&branch) {
+                        return Err(
+                            "仓库地址中的分支名不合法，请改用「分支」输入框填写".to_string()
+                        );
+                    }
+                }
             }
             SyncKind::Webdav => {
                 if !url.is_empty() {
@@ -1342,7 +1354,10 @@ pub fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .sync
         .clone();
     if !sync.is_configured() {
-        return Err("请先在设置里填写 WebDAV 地址和用户名".to_string());
+        return Err(match sync.kind {
+            SyncKind::Github => "请先在设置里填写 GitHub 仓库地址".to_string(),
+            SyncKind::Webdav => "请先在设置里填写 WebDAV 地址和用户名".to_string(),
+        });
     }
     if !sync.enabled {
         return Err("云同步已关闭".to_string());

@@ -65,20 +65,36 @@ function paintFileStates(): void {
   });
 }
 
-/** 只刷新当前列表涉及的日期，避免每次打开面板都哈希整个笔记目录。 */
+/** 本地写入或同步结束后调用：清掉缓存，下一次渲染重新取状态。 */
+function invalidateFileStates(): void {
+  fileStates.clear();
+  // 让在途请求的结果作废，避免旧状态写回刚清空的缓存
+  fileStatesSeq += 1;
+}
+
+/** 只刷新当前列表涉及、且缓存里还没有的日期。 */
 async function refreshFileStates(): Promise<void> {
   const dates = visibleDates();
   if (dates.length === 0) {
     fileStates.clear();
     return;
   }
+  const missing = dates.filter((date) => !fileStates.has(date));
+  if (missing.length === 0) {
+    // 同一批日期已经算过：搜索/重渲不必反复读取并哈希磁盘文件
+    paintFileStates();
+    return;
+  }
   const seq = ++fileStatesSeq;
   try {
     const states = await invoke<{ date: string; state: string }[]>("get_sync_file_states", {
-      dates,
+      dates: missing,
     });
     if (seq !== fileStatesSeq) return;
-    fileStates = new Map(states.map((item) => [item.date, item.state]));
+    // 先标记这些日期已经查过：同步未启用时后端不会返回任何状态，
+    // 但缓存仍要记住，避免每次渲染都重复请求。
+    for (const date of missing) fileStates.set(date, "");
+    for (const item of states) fileStates.set(item.date, item.state);
     paintFileStates();
   } catch (error) {
     // 同步状态只是辅助信息，读不到不影响历史列表本身
@@ -196,6 +212,7 @@ async function commitPendingDelete(): Promise<void> {
     markSyncPending();
     // 删除完成前发出的列表请求，返回结果里还带着这条笔记，直接作废
     searchSeq += 1;
+    invalidateFileStates();
     // 服务端少了一条，后续分页偏移要跟着回退，否则「加载更多」会跳过一条
     if (!serverFiltered) noteOffset = Math.max(0, noteOffset - 1);
     // 兜底：期间若有陈旧结果把它塞回列表，这里再剔一次
@@ -289,6 +306,7 @@ function startEdit(note: NoteEntry, contentEl: HTMLElement, editButton: HTMLButt
         newContent: value,
       });
       markSyncPending();
+      invalidateFileStates();
       // 只更新内存里的这条并局部重渲，保留分页 offset 与滚动位置
       note.content = value;
       // 标签由后端重新解析：正文改了标签就会变，不能用旧的
@@ -641,7 +659,7 @@ export function showHistoryPanel(): void {
   noteOffset = 0;
   hasMoreNotes = false;
   historyError = null;
-  fileStates = new Map();
+  invalidateFileStates();
   paintPreviewButton();
   ui.entryList.replaceChildren();
   ui.historyCount.textContent = "";
@@ -668,6 +686,7 @@ export function initHistory(hooks: HistoryHooks): void {
   // 一轮同步结束后，日期行的状态要跟着变（待同步 → 已同步）
   subscribeSyncStatus(() => {
     if (ui.historyPanel.classList.contains("hidden")) return;
+    invalidateFileStates();
     void refreshFileStates();
   });
 }
