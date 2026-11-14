@@ -22,7 +22,7 @@ Press the global hotkey and a small window floats above the current window; jot 
 - **Drafts never lost**: unsaved content is preserved when you dismiss with `Esc` and survives an app restart; drafts live in the app's config directory, so clearing browser data won't lose them.
 - **Local-first**: Markdown split into files by day, readable directly with Obsidian, VS Code, and similar tools.
 - **App lock**: optional password lock with a fixed unlock validity of 30 minutes, 2, 4, 8, or 24 hours; lock instantly from the title bar or tray. It gates the UI and app commands only — notes on disk stay plaintext.
-- **Optional cloud sync**: sync your notes directory to your own WebDAV storage (Jianguoyun, Nextcloud, NAS, …); off by default, no network traffic until configured. Concurrent edits are merged entry by entry, with conflict copies when a merge is unsafe.
+- **Optional cloud sync**: sync your notes directory to your own WebDAV storage (Jianguoyun, Nextcloud, NAS, …) or a private GitHub repository; off by default, no network traffic until configured. Concurrent edits are merged entry by entry, with conflict copies when a merge is unsafe.
 - **Markdown mode**: optional block-based writing so code blocks, tables, and headings render correctly from the very first line.
 - **Note history**: the note button in the title bar opens a history panel with reverse-chronological browsing, full-text search (across all date files), and loading of older entries; you can toggle a rendered Markdown preview and edit or delete individual entries directly.
 - **Tags**: write `#work` in the body and it becomes a tag — one click filters the history panel. The format stays plain Markdown.
@@ -74,7 +74,7 @@ Left-clicking the tray icon summons the popover directly; the right-click menu c
 | Hide when focus is lost | Tucks the window away when you click another application; off by default. Ignored in pin mode and while a panel is open. |
 | Theme | System, light, or dark; system mode follows Windows light/dark changes live. |
 | Background opacity | 60%–100%, applied to the window and its panels alike; 100% (opaque) by default. |
-| Cloud sync (WebDAV) | Enable switch, URL, account, password, sync interval, and device name; off by default. See "Cloud sync (WebDAV)" below. |
+| Cloud sync (WebDAV / GitHub repository) | Enable switch, sync method, URL, account or branch, password or token, sync interval, and device name; off by default. See "Cloud sync" below. |
 
 Settings are stored at:
 
@@ -147,24 +147,45 @@ const a = 1;
 
 This mode is off by default and can be toggled in settings. When off, the compact list format above is used; the two formats can coexist, and older entries are never rewritten.
 
-## Cloud sync (WebDAV)
+## Cloud sync
 
-Off by default. Sync uses only your own WebDAV storage; notes are written as **plain-text Markdown** under:
+Off by default. Two methods share the same engine (per-day files, entry-level merge, conflict copies): your own WebDAV storage and a private GitHub repository. Notes are written as **plain-text Markdown** under:
 
 ```
-<your URL>/flashnote/notes/YYYY-MM-DD.md
+<your URL or repository>/flashnote/notes/YYYY-MM-DD.md
 ```
 
 Nothing outside that prefix is touched, and settings, drafts, and `.bak-*` files are never uploaded.
 
-### Setup (Jianguoyun example)
+### Setup (WebDAV, Jianguoyun example)
 
 1. Sign in to Jianguoyun on the web → "Account info" → "Security" → "Add app password" to get a dedicated password;
-2. Open FlashNote settings → "Cloud sync (WebDAV)";
+2. Open FlashNote settings → "Cloud sync", then choose the "WebDAV" method;
 3. Use `https://dav.jianguoyun.com/dav/` as the URL, your Jianguoyun login email as the username, and the **app password** (not your login password);
 4. Click "Test connection", then "Save" and enable "Cloud sync".
 
 Nextcloud, NAS WebDAV, [dufs](https://github.com/sigoden/dufs), and `rclone serve webdav` work the same way — enter the DAV root URL (the directory, not a file).
+
+### Setup (GitHub repository)
+
+Select "GitHub repository" as the sync method; notes are committed to `flashnote/notes/YYYY-MM-DD.md` in the repository:
+
+1. Create a **private** repository on GitHub (a public repository exposes your notes).
+2. Create a **Fine-grained token** (recommended): Settings → Developer settings → Personal access tokens → Fine-grained tokens:
+   - Repository access: **Only select repositories**, pick just the notes repository;
+   - Permissions → Repository permissions → **Contents: Read and write** (Metadata is added read-only automatically);
+   - Set an expiry (up to one year) and replace the token here when it expires.
+   Classic tokens also work, but the `repo` scope covers all private repositories.
+3. Select "GitHub repository" as the sync method, enter `https://github.com/<owner>/<repo>` and the token from the previous step.
+4. The branch field may be left empty (default branch) or set to `main` / `flashnote`; `https://github.com/<owner>/<repo>/tree/<branch>` is also accepted.
+5. Click "Test connection", then save and enable.
+
+Behavior matches WebDAV: per-day files, entry-level merge, conflict copies. Differences:
+
+- Versions use Git blob SHAs, equivalent to strong ETags, so deletions propagate;
+- **One commit per changed file**, with messages like `flashnote: 2026-10-31.md`;
+- GitHub rate limits apply (5,000 authenticated requests per hour); leftover files wait for the next round;
+- No `PROPFIND`-style directory cache, so request counts are slightly higher than WebDAV on large libraries.
 
 ### Behavior
 
@@ -180,7 +201,7 @@ Nextcloud, NAS WebDAV, [dufs](https://github.com/sigoden/dufs), and `rclone serv
 
 - The password lives only in Windows Credential Manager (service `flashnote-sync`); `settings.json` contains just the URL, username, and non-sensitive options, and the UI never displays a saved password.
 - If Credential Manager is disabled by group policy you get a clear error; sync still works for the current session but the password must be re-entered after restart.
-- **Synced content is plain text**: your WebDAV provider can read the notes. End-to-end encryption is planned for "FlashNote Cloud" in 0.6.0.
+- **Synced content is plain text**: your WebDAV provider or GitHub can read the notes; there is no end-to-end encryption. A GitHub token lives only in Windows Credential Manager.
 - Changing the URL or username removes the old password automatically, so credentials are never sent to a different server.
 
 ### Troubleshooting
@@ -379,7 +400,7 @@ Currently verified only on **Windows 10/11**. Source-window capture relies on th
 ## Known limitations
 
 - No export yet; search scans files one by one, so it gets slower with very large note collections.
-- Cloud sync supports WebDAV only, and content is stored as plain text in your own storage; there is no end-to-end encryption or real-time push.
+- Cloud sync supports WebDAV and private GitHub repositories; content is stored as plain text in your own storage, with no end-to-end encryption or real-time push.
 - If another application has claimed the global hotkey, you need to change it in settings.
 - Note files are append-only and never rotated, so a single day's file grows gradually over long-term use.
 - The installers are not code-signed, so the first install triggers a SmartScreen warning; see [docs/code-signing.md](docs/code-signing.md) for the research and the adoption path.
@@ -412,7 +433,7 @@ No proactive network access. Once disabled, it only contacts GitHub Releases whe
 
 **Where does cloud sync send my notes?**
 
-Only to the `flashnote/notes/` directory under the WebDAV URL you enter, as plain-text Markdown. FlashNote has no cloud server of its own. To use a second computer, enter the same URL and account there and the notes are pulled down.
+Only to the `flashnote/notes/` directory under the WebDAV URL you enter, or to the private GitHub repository you configure, as plain-text Markdown. FlashNote has no cloud server of its own. To use a second computer, enter the same URL and account (or the same repository and token) there and the notes are pulled down.
 
 **Can two computers editing the same day lose notes?**
 
