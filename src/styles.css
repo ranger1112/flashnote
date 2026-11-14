@@ -83,11 +83,13 @@ body {
 }
 
 /*
- * 面板是全屏覆盖层：卡片自身让出底色，避免两层半透明叠加显得更不透明；
+ * 面板是全屏覆盖层：卡片保留底色作为背板，面板自身透明，避免两层半透明叠加；
  * 同时隐藏底下的小窗内容，防止半透明时正文透过面板形成重影。
+ * 底色必须留在卡片上：如果卡片跟着变透明，面板淡入/位移的那一百多毫秒里
+ * 整个窗口会没有不透明层，切换页面时就会闪出桌面。
  */
 #card.panel-open {
-  background: transparent;
+  background: var(--bg);
 }
 
 #card.panel-open > header,
@@ -516,7 +518,8 @@ kbd {
   flex-direction: column;
   padding: 12px 16px 4px;
   overflow: hidden;
-  background: var(--bg-solid);
+  /* 底色由 #card 提供，面板只做内容层：淡入时不会露出透明窗口 */
+  background: transparent;
   /* 低不透明度时面板后面可能是桌面，模糊一层保证文字可读 */
   backdrop-filter: blur(18px);
 }
@@ -545,7 +548,7 @@ kbd {
   flex-direction: column;
   gap: 8px;
   padding: 12px 16px 12px;
-  background: var(--bg-solid);
+  background: transparent;
   backdrop-filter: blur(18px);
 }
 
@@ -562,7 +565,7 @@ kbd {
   gap: 12px;
   padding: 16px 20px 18px;
   overflow: hidden;
-  background: var(--bg-solid);
+  background: transparent;
   backdrop-filter: blur(18px);
 }
 
@@ -1326,7 +1329,7 @@ input[type="range"] {
 }
 
 #card.locked {
-  background: transparent;
+  background: var(--bg);
 }
 
 .app-lock {
@@ -1337,7 +1340,8 @@ input[type="range"] {
   align-items: center;
   justify-content: center;
   padding: 18px 22px;
-  background: var(--bg-solid);
+  /* 与面板一致：底色由卡片提供，锁屏只做内容层 */
+  background: transparent;
   backdrop-filter: blur(18px);
 }
 
