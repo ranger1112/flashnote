@@ -6,9 +6,8 @@
 pub(crate) mod runtime;
 pub(crate) mod secrets;
 
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
 
 pub(crate) const LOCKED_ERROR: &str = "应用已锁定，请先解锁";
@@ -37,9 +36,9 @@ pub(crate) fn validate_new_password(password: &str) -> Result<(), String> {
 
 pub(crate) fn hash_password(password: &str) -> Result<String, String> {
     validate_new_password(password)?;
-    let salt = SaltString::generate(&mut OsRng);
+    // argon2 0.6 起由 PasswordHasher 自己生成随机盐。
     hasher()?
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|error| format!("生成应用锁密码失败：{error}"))
 }
@@ -62,6 +61,15 @@ mod tests {
         assert!(phc.starts_with("$argon2id$"), "{phc}");
         assert!(verify_password("correct horse battery", &phc).unwrap());
         assert!(!verify_password("wrong password", &phc).unwrap());
+    }
+
+    /// 这个校验器由 argon2 0.5.3（升级前版本）生成，用户机器上已保存的
+    /// 应用锁密码必须能跨版本继续验证。
+    #[test]
+    fn verifies_a_phc_string_produced_by_argon2_0_5() {
+        const PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$MDEyMzQ1Njc4OWFiY2RlZg$69I7qCjDTsQwhQqFvpQJiqEI0lGQvxC84fXE0Ktxca4";
+        assert!(verify_password("correct horse battery", PHC).unwrap());
+        assert!(!verify_password("wrong password", PHC).unwrap());
     }
 
     #[test]

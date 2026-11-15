@@ -417,13 +417,13 @@ fn prune_invalid_sync(object: &mut serde_json::Map<String, serde_json::Value>) {
     if sync.get("kind").is_some_and(|value| {
         value
             .as_str()
-            .map_or(true, |kind| kind != "webdav" && kind != "github")
+            .is_none_or(|kind| kind != "webdav" && kind != "github")
     }) {
         sync.remove("kind");
     }
     if sync
         .get("intervalMinutes")
-        .is_some_and(|value| value.as_u64().map_or(true, |minutes| minutes == 0))
+        .is_some_and(|value| value.as_u64().is_none_or(|minutes| minutes == 0))
     {
         sync.remove("intervalMinutes");
     }

@@ -5,7 +5,7 @@ description = "不打断阅读的速记小窗"
 authors = ["ranger"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.85"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -24,8 +24,7 @@ chrono = "0.4"
 async-trait = "0.1"
 base64 = "0.23"
 sha2 = "0.11"
-argon2 = "0.5"
-rand_core = { version = "0.6", features = ["getrandom"] }
+argon2 = "0.6"
 tauri-plugin-log = "2"
 log = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy", "charset", "json"] }
