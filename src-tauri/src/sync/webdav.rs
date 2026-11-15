@@ -858,7 +858,7 @@ fn is_private_host(url: &Url) -> bool {
 }
 
 /// 跨源目标是否指向内网。字面量 IP 直接判断；域名解析一次（3 秒超时），
-/// 解析失败时不阻止——能阻止的部分已经挡住了，DNS 重绑定不在本层解决。
+/// 解析失败或超时按内网处理（fail-closed）：证明不了目标是公网就不跟随。
 async fn is_private_target(url: &Url) -> bool {
     if is_private_host(url) {
         return true;
@@ -875,12 +875,13 @@ async fn is_private_target(url: &Url) -> bool {
         use std::net::ToSocketAddrs;
         (host.as_str(), port)
             .to_socket_addrs()
+            .ok()
             .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
-            .unwrap_or_default()
     });
     match tokio::time::timeout(Duration::from_secs(3), lookup).await {
-        Ok(Ok(ips)) => ips_are_private(ips),
-        _ => false,
+        Ok(Ok(Some(ips))) if !ips.is_empty() => ips_are_private(ips),
+        // 解析失败、超时或没有解析出地址：证明不了目标是公网，按内网处理。
+        _ => true,
     }
 }
 
@@ -1896,6 +1897,12 @@ mod tests {
         assert!(is_private_target(&Url::parse("https://10.0.0.5/").unwrap()).await);
         assert!(is_private_target(&Url::parse("https://localhost/").unwrap()).await);
         assert!(!is_private_target(&Url::parse("https://93.184.216.34/").unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn unresolvable_redirect_targets_are_rejected() {
+        // RFC 6761 保留 .invalid：解析必然失败；证明不了目标是公网就不跟随。
+        assert!(is_private_target(&Url::parse("https://blocked.invalid/").unwrap()).await);
     }
 
     #[test]
