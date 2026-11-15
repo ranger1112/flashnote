@@ -28,6 +28,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 /// 错误响应只保留前 8 KiB，避免被异常/恶意响应撑爆内存。
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+/// 只读 JSON 响应（仓库信息、目录列表、单文件内容）的内存上限。
+/// GitHub 的目录列表最多 10 万项（约十几 MB），32 MiB 留足余量。
+const MAX_JSON_BYTES: usize = 32 * 1024 * 1024;
 const UNLIMITED: usize = usize::MAX;
 /// 只读请求遇到网络抖动时的轮内重试次数；与 WebDAV 后端保持一致的口径。
 const MAX_RETRIES: u32 = 2;
@@ -48,6 +51,20 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
 /// 查询串里还要转义 `+`、`&`、`=`：它们都是合法的分支名字符，
 /// 不转义会被服务器当成空格或额外的参数。
 const QUERY_ENCODE: &AsciiSet = &PATH_ENCODE.add(b'+').add(b'&').add(b'=').add(b';');
+
+/// 已完整读完响应体的只读响应。把「发送 + 读到 EOF」放进同一个重试循环，
+/// 连接在响应体中途断开时才能整请求重发。
+struct Fetched {
+    status: StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+}
+
+/// 重试需要区分「传输层失败，值得重发」和「再试也不会变的错误」。
+enum FetchError {
+    Retry(SyncError),
+    Fatal(SyncError),
+}
 
 fn base64_engine() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -228,19 +245,23 @@ impl GitHubBackend {
     /// 「远端一个文件都没有」，进而把本地笔记全部当成已删除。
     async fn probe(&self) -> Result<(), SyncError> {
         let url = format!("{}/repos/{}/{}", self.api, self.owner, self.repo);
-        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
+        let fetched = self
+            .get_fetched(
+                || self.request(Method::GET, &url),
+                MAX_JSON_BYTES,
+                SyncError::Other("仓库信息响应过大，本轮已中止".to_string()),
+            )
+            .await?;
         // 仓库不存在时 GitHub 用 404 而不是 403，避免泄露私有仓库是否存在。
-        if response.status() == StatusCode::NOT_FOUND {
+        if fetched.status == StatusCode::NOT_FOUND {
             return Err(SyncError::Auth(
                 "令牌无权访问该仓库，或仓库地址不正确".to_string(),
             ));
         }
-        let response = self.check(response).await?;
+        let fetched = self.check_fetched(fetched)?;
         // 只有 Contents: Read 的令牌能通过上面的 GET，但无法写入。仓库响应里的
         // permissions 能提前暴露这一点，避免每轮同步都逐文件 403。
-        let info: RepoInfo = response
-            .json()
-            .await
+        let info: RepoInfo = serde_json::from_slice(&fetched.body)
             .map_err(|error| SyncError::Other(format!("解析仓库信息失败：{error}")))?;
         if info.private == Some(false) {
             return Err(SyncError::Auth(
@@ -318,6 +339,104 @@ impl GitHubBackend {
         }
     }
 
+    /// 只读 GET：把「发送 + 读完响应体」放进同一个重试循环。
+    ///
+    /// 连接失败、超时、响应体读到一半断开，以及网关 502/503/504 都会整请求
+    /// 重发；`limit` 是成功响应体的内存上限，超限按 `too_large` 返回。
+    async fn get_fetched<F>(
+        &self,
+        build: F,
+        limit: usize,
+        too_large: SyncError,
+    ) -> Result<Fetched, SyncError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut attempt = 0;
+        loop {
+            self.spend()?;
+            match self.fetch_once(&build, limit, &too_large).await {
+                Ok(fetched)
+                    if matches!(
+                        fetched.status,
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    ) && attempt < MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    let delay = Duration::from_secs(attempt as u64);
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(fetched) => return Ok(fetched),
+                Err(FetchError::Retry(_)) if attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    let delay = Duration::from_secs(attempt as u64);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(FetchError::Retry(error) | FetchError::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+
+    async fn fetch_once<F>(
+        &self,
+        build: &F,
+        limit: usize,
+        too_large: &SyncError,
+    ) -> Result<Fetched, FetchError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let response = build().send().await.map_err(|error| {
+            if error.is_connect() || error.is_timeout() {
+                FetchError::Retry(network(error))
+            } else {
+                FetchError::Fatal(network(error))
+            }
+        })?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut response = response;
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if status.is_success() {
+                        if body.len().saturating_add(chunk.len()) > limit {
+                            return Err(FetchError::Fatal(too_large.clone()));
+                        }
+                        body.extend_from_slice(&chunk);
+                    } else {
+                        // 非 2xx 只需要一小段错误正文，超长直接截断。
+                        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                        if body.len() >= MAX_ERROR_BODY_BYTES {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                // 响应体读到一半断开/超时：整个请求重发。
+                // reqwest 0.13 把这类错误归到 is_decode()，两个标志都认。
+                Err(error) if error.is_body() || error.is_decode() || error.is_timeout() => {
+                    return Err(FetchError::Retry(SyncError::Network(format!(
+                        "读取响应失败：{error}"
+                    ))));
+                }
+                Err(error) => return Err(FetchError::Fatal(network(error))),
+            }
+        }
+        Ok(Fetched {
+            status,
+            headers,
+            body,
+        })
+    }
+
     /// GitHub 对空仓库的 `/commits` 返回 409，用它判断比看仓库大小可靠。
     async fn repo_is_empty(&self) -> Result<bool, SyncError> {
         let url = format!(
@@ -387,59 +506,59 @@ impl GitHubBackend {
         if status.is_success() {
             return Ok(response);
         }
-        match status {
-            StatusCode::UNAUTHORIZED => Err(SyncError::Auth("GitHub 令牌无效或已过期".to_string())),
-            StatusCode::NOT_FOUND => Err(SyncError::NotFound),
-            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
-                Err(SyncError::VersionMismatch)
-            }
-            StatusCode::TOO_MANY_REQUESTS => Err(SyncError::RateLimited {
-                retry_after_secs: retry_after(&response),
-            }),
-            StatusCode::FORBIDDEN => {
-                // 403 既可能是限流也可能是权限不足。主限流看 remaining=0；
-                // 次级限流（并发/单位时间请求过多）remaining 仍是正数，只会带
-                // retry-after 或在正文里说明，漏判会让整轮对着被限流的服务器硬打。
-                let remaining_zero = response
-                    .headers()
-                    .get("x-ratelimit-remaining")
-                    .and_then(|value| value.to_str().ok())
-                    == Some("0");
-                let has_retry_after = response
-                    .headers()
-                    .contains_key(reqwest::header::RETRY_AFTER);
-                let wait = retry_after(&response);
-                let body = error_body(response).await;
-                let mentions_limit = body.to_ascii_lowercase().contains("rate limit");
-                if remaining_zero || has_retry_after || mentions_limit {
-                    Err(SyncError::RateLimited {
-                        // 次级限流的窗口通常是 1 分钟
-                        retry_after_secs: wait.or(Some(60)),
-                    })
-                } else {
-                    Err(SyncError::Forbidden(short(&body)))
+        let headers = response.headers().clone();
+        let body = error_body(response).await;
+        Err(status_error(status, &headers, &body))
+    }
+
+    /// 与 [`check`] 相同，但作用在已经读完响应体的只读响应上。
+    fn check_fetched(&self, fetched: Fetched) -> Result<Fetched, SyncError> {
+        if fetched.status.is_success() {
+            return Ok(fetched);
+        }
+        let body = String::from_utf8_lossy(&fetched.body);
+        Err(status_error(fetched.status, &fetched.headers, &body))
+    }
+}
+
+/// 非 2xx 的统一翻译；只读与写入路径共用。
+fn status_error(status: StatusCode, headers: &reqwest::header::HeaderMap, body: &str) -> SyncError {
+    match status {
+        StatusCode::UNAUTHORIZED => SyncError::Auth("GitHub 令牌无效或已过期".to_string()),
+        StatusCode::NOT_FOUND => SyncError::NotFound,
+        StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => SyncError::VersionMismatch,
+        StatusCode::TOO_MANY_REQUESTS => SyncError::RateLimited {
+            retry_after_secs: retry_after(headers),
+        },
+        StatusCode::FORBIDDEN => {
+            // 403 既可能是限流也可能是权限不足。主限流看 remaining=0；
+            // 次级限流（并发/单位时间请求过多）remaining 仍是正数，只会带
+            // retry-after 或在正文里说明，漏判会让整轮对着被限流的服务器硬打。
+            let remaining_zero = headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                == Some("0");
+            let has_retry_after = headers.contains_key(reqwest::header::RETRY_AFTER);
+            let wait = retry_after(headers);
+            let mentions_limit = body.to_ascii_lowercase().contains("rate limit");
+            if remaining_zero || has_retry_after || mentions_limit {
+                SyncError::RateLimited {
+                    // 次级限流的窗口通常是 1 分钟
+                    retry_after_secs: wait.or(Some(60)),
                 }
-            }
-            StatusCode::UNPROCESSABLE_ENTITY => {
-                let body = error_body(response).await;
-                // 带 sha 的写入在版本不匹配时是 409；422 一般意味着「没带 sha 但文件已存在」
-                if body.contains("sha") {
-                    Err(SyncError::VersionMismatch)
-                } else {
-                    Err(SyncError::Other(format!(
-                        "GitHub 拒绝了写入：{}",
-                        short(&body)
-                    )))
-                }
-            }
-            other => {
-                let body = error_body(response).await;
-                Err(SyncError::Network(format!(
-                    "GitHub 返回 {other}：{}",
-                    short(&body)
-                )))
+            } else {
+                SyncError::Forbidden(short(body))
             }
         }
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            // 带 sha 的写入在版本不匹配时是 409；422 一般意味着「没带 sha 但文件已存在」
+            if body.contains("sha") {
+                SyncError::VersionMismatch
+            } else {
+                SyncError::Other(format!("GitHub 拒绝了写入：{}", short(body)))
+            }
+        }
+        other => SyncError::Network(format!("GitHub 返回 {other}：{}", short(body))),
     }
 }
 
@@ -463,9 +582,8 @@ fn network(error: reqwest::Error) -> SyncError {
     SyncError::Network(error.to_string())
 }
 
-fn retry_after(response: &reqwest::Response) -> Option<u64> {
-    response
-        .headers()
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse().ok())
@@ -548,12 +666,15 @@ impl SyncBackend for GitHubBackend {
             self.repo,
             utf8_percent_encode(ref_name, PATH_ENCODE)
         );
-        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
+        let fetched = self
+            .get_fetched(
+                || self.request(Method::GET, &url),
+                MAX_JSON_BYTES,
+                SyncError::Other("目录列表响应过大，本轮已中止".to_string()),
+            )
+            .await?;
 
-        if matches!(
-            response.status(),
-            StatusCode::NOT_FOUND | StatusCode::CONFLICT
-        ) {
+        if matches!(fetched.status, StatusCode::NOT_FOUND | StatusCode::CONFLICT) {
             // 空仓库还没有任何提交，等同于「远端一个文件都没有」。
             if self.repo_is_empty().await? {
                 return Ok(Vec::new());
@@ -563,10 +684,8 @@ impl SyncBackend for GitHubBackend {
             ));
         }
 
-        let response = self.check(response).await?;
-        let tree: TreeResponse = response
-            .json()
-            .await
+        let fetched = self.check_fetched(fetched)?;
+        let tree: TreeResponse = serde_json::from_slice(&fetched.body)
             .map_err(|error| SyncError::Other(format!("解析目录列表失败：{error}")))?;
         // 截断的列表会被引擎当成「其余文件都删了」，必须整轮中止。
         if tree.truncated {
@@ -596,14 +715,18 @@ impl SyncBackend for GitHubBackend {
 
     async fn get(&self, name: &str) -> Result<Option<(Vec<u8>, RemoteVersion)>, SyncError> {
         let url = self.with_ref(&self.file_url(name));
-        let response = self.send_retry(|| self.request(Method::GET, &url)).await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let fetched = self
+            .get_fetched(
+                || self.request(Method::GET, &url),
+                MAX_JSON_BYTES,
+                SyncError::Other("文件内容响应过大，本轮已中止".to_string()),
+            )
+            .await?;
+        if fetched.status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let response = self.check(response).await?;
-        let file: ContentFile = response
-            .json()
-            .await
+        let fetched = self.check_fetched(fetched)?;
+        let file: ContentFile = serde_json::from_slice(&fetched.body)
             .map_err(|error| SyncError::Other(format!("解析文件内容失败：{error}")))?;
         let bytes = if file.encoding == "base64" {
             base64_engine()
@@ -699,27 +822,22 @@ impl SyncBackend for GitHubBackend {
 impl GitHubBackend {
     /// Contents API 对 >1 MiB 的文件只给 sha 不给内容，这里按 raw 再拉一次。
     async fn fetch_raw(&self, name: &str) -> Result<Vec<u8>, SyncError> {
-        self.spend()?;
         let url = self.with_ref(&self.file_url(name));
         let mut accept = reqwest::header::HeaderMap::new();
         accept.insert(
             reqwest::header::ACCEPT,
             reqwest::header::HeaderValue::from_static("application/vnd.github.raw"),
         );
-        let response = self
-            .send_retry(|| self.request(Method::GET, &url).headers(accept.clone()))
+        // 按块读取并在超限时立刻停下：Tree API 里的 size 与真正 GET 之间可能
+        // 变化，不能先缓冲整个响应体再检查上限。
+        let fetched = self
+            .get_fetched(
+                || self.request(Method::GET, &url).headers(accept.clone()),
+                MAX_FILE_BYTES,
+                SyncError::TooLarge,
+            )
             .await?;
-        let mut response = self.check(response).await?;
-        // 和 WebDAV 一样按块读取：Tree API 里的 size 与真正 GET 之间可能变化，
-        // 不能先缓冲整个响应体再检查上限。
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(network)? {
-            if bytes.len().saturating_add(chunk.len()) > MAX_FILE_BYTES {
-                return Err(SyncError::TooLarge);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        Ok(self.check_fetched(fetched)?.body)
     }
 }
 
@@ -1139,5 +1257,78 @@ mod tests {
         ] {
             assert!(!valid_branch(bad), "{bad} 应不合法");
         }
+    }
+
+    #[tokio::test]
+    async fn truncated_body_is_retried_and_recovers() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer);
+                let body = r#"{"private":true}"#;
+                let response = if attempt == 0 {
+                    // 第一次故意少发正文：Content-Length 比实际内容长，连接随后断开。
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{body}"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                if socket.write_all(response.as_bytes()).is_err() {
+                    return;
+                }
+                let _ = socket.shutdown(std::net::Shutdown::Write);
+            }
+        });
+
+        let backend = GitHubBackend::with_api(
+            GitHubConfig {
+                owner: "o".into(),
+                repo: "r".into(),
+                branch: None,
+                token: "t".into(),
+            },
+            &format!("http://{addr}"),
+        )
+        .unwrap();
+        let url = format!("http://{addr}/repos/o/r");
+        let fetched = backend
+            .get_fetched(
+                || backend.request(Method::GET, &url),
+                MAX_JSON_BYTES,
+                SyncError::TooLarge,
+            )
+            .await
+            .expect("响应体中途断开应重发并成功");
+        assert_eq!(fetched.status, StatusCode::OK);
+        assert_eq!(fetched.body, br#"{"private":true}"#);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/trees/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = backend(&server).list().await.unwrap_err();
+        assert!(
+            format!("{error:?}").contains("解析目录列表失败"),
+            "{error:?}"
+        );
+        server.verify().await;
     }
 }
